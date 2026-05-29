@@ -147,7 +147,10 @@ class SkyRLTrainBackend(AbstractBackend):
         self._inference_state_publisher: Callable[[str | None], None] | None = None
 
     def has_model(self, model_id: str) -> bool:
-        return model_id in self._model_ids_to_role
+        present = model_id in self._model_ids_to_role
+        if not present:
+            logger.warning(f"[debug-state] has_model({model_id})=False; current_keys={list(self._model_ids_to_role.keys())}")
+        return present
 
     def _get_role(self, model_id: str) -> str:
         try:
@@ -431,6 +434,7 @@ class SkyRLTrainBackend(AbstractBackend):
                 )
             self._dispatch.register_adapter("policy", model_id)
             self._model_ids_to_role[model_id] = model_role
+            logger.info(f"[debug-state] CREATED model_id={model_id} role={model_role}; current_keys={list(self._model_ids_to_role.keys())}")
             self._model_metadata[model_id] = types.ModelMetadata(adapter_index=0, lora_config=lora_config)
             logger.info(f"Registered additional LoRA adapter '{model_id}'")
             return
@@ -497,6 +501,8 @@ class SkyRLTrainBackend(AbstractBackend):
         return ResolvedPlacementGroup(pg)
 
     def delete_model(self, model_id: str) -> None:
+        import traceback as _tb
+        logger.info(f"[debug-state] delete_model({model_id}) ENTERED; current_keys={list(self._model_ids_to_role.keys())}; stack=\n" + "".join(_tb.format_stack()[-6:-1]))
         role = self._get_role(model_id)
 
         # Multi-LoRA: if more than one model is currently registered, drop just
@@ -522,6 +528,9 @@ class SkyRLTrainBackend(AbstractBackend):
             self._inference_router.shutdown()
             self._inference_router = None
         ray.shutdown()
+        import traceback as _tb_clear
+        logger.warning(f"[debug-state] _model_ids_to_role CLEARED via teardown branch; stack=\n" + "".join(_tb_clear.format_stack()[-6:-1]))
+        del _tb_clear
         self._model_ids_to_role = {}
         self._model_metadata = {}
         self._cfg = None
