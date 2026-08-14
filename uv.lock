@@ -45,6 +45,7 @@ conflicts = [[
 [manifest]
 overrides = [
     { name = "apache-tvm-ffi", marker = "sys_platform == 'linux'", specifier = "==0.1.10" },
+    { name = "fast-hadamard-transform", marker = "sys_platform == 'never'" },
     { name = "flashinfer-cubin", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.6.13" },
     { name = "flashinfer-jit-cache", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.6.13", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-python", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.6.13" },
