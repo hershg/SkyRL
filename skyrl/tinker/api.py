@@ -12,14 +12,17 @@ from uuid import uuid4
 
 import fastapi
 import psutil
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError as FastAPIRequestValidationError
 from fastapi.responses import RedirectResponse, StreamingResponse
+from google.protobuf.message import DecodeError
 from pydantic import (
     Base64Bytes,
     BaseModel,
     Discriminator,
     Field,
     Tag,
+    ValidationError,
     model_validator,
 )
 from sqlalchemy.exc import IntegrityError
@@ -43,6 +46,12 @@ from skyrl.tinker.db_models import (
 from skyrl.tinker.extra import (
     ExternalInferenceClient,
     SkyRLTrainInferenceForwardingClient,
+)
+from skyrl.tinker.proto_serialization import (
+    PROTO_CONTENT_TYPE,
+    PROTO_SERIALIZABLE_REQUEST_TYPES,
+    parse_forward_backward_request,
+    serialize_result,
 )
 from skyrl.utils.log import get_uvicorn_log_config, logger
 from skyrl.utils.storage import download_file
@@ -70,8 +79,8 @@ TERMINAL_STATUSES = (RequestStatus.COMPLETED, RequestStatus.FAILED)
 
 async def wait_for_future(
     waiters: dict[int, set[asyncio.Future]], request_id: int, timeout: float
-) -> tuple[RequestStatus, dict | None] | None:
-    """Wait for ``request_id`` to finish, returning its ``(status, result_data)``.
+) -> tuple[RequestStatus, types.RequestType, dict | None] | None:
+    """Wait for ``request_id`` to finish, returning its ``(status, request_type, result_data)``.
 
     Returns None if ``timeout`` elapses first, and raises KeyError if the request
     does not exist -- :func:`poll_futures` reports both.
@@ -118,15 +127,15 @@ async def poll_futures(
                     # The awaited ids go in as bound parameters, capped at 32766
                     # by SQLite (since 3.32) and 65535 by Postgres -- far above
                     # any plausible number of in-flight requests.
-                    statement = select(FutureDB.request_id, FutureDB.status, FutureDB.result_data).where(
-                        FutureDB.request_id.in_(awaited)
-                    )
+                    statement = select(
+                        FutureDB.request_id, FutureDB.status, FutureDB.request_type, FutureDB.result_data
+                    ).where(FutureDB.request_id.in_(awaited))
                     rows = (await session.exec(statement)).all()
 
                 # Pending requests are left alone to be picked up on a later tick.
-                outcomes: dict[int, tuple[RequestStatus, dict | None] | KeyError] = {
-                    request_id: (status, result_data)
-                    for request_id, status, result_data in rows
+                outcomes: dict[int, tuple[RequestStatus, types.RequestType, dict | None] | KeyError] = {
+                    request_id: (status, request_type, result_data)
+                    for request_id, status, request_type, result_data in rows
                     if status in TERMINAL_STATUSES
                 }
                 for request_id in set(awaited) - {request_id for request_id, *_ in rows}:
@@ -1049,17 +1058,41 @@ async def get_training_run(model_id: str, session: AsyncSession = Depends(get_se
     )
 
 
+async def _read_forward_backward_request(request: Request) -> tuple[ForwardBackwardRequest, bool]:
+    """Read a forward_backward body in either wire format.
+
+    tinker SDK >= 0.25.0 submits the body as protobuf and routes forward-only
+    passes here via the proto's ``forward_only`` flag instead of calling
+    ``/api/v1/forward``; older SDKs keep sending JSON with forward_only False.
+    """
+    body = await request.body()
+    if PROTO_CONTENT_TYPE in request.headers.get("content-type", "").lower():
+        try:
+            request_dict, forward_only = parse_forward_backward_request(body)
+        except (DecodeError, ValueError) as e:
+            raise HTTPException(status_code=422, detail=f"Invalid proto forward_backward body: {e}")
+    else:
+        request_dict, forward_only = None, False
+    try:
+        if request_dict is not None:
+            return ForwardBackwardRequest.model_validate(request_dict), forward_only
+        return ForwardBackwardRequest.model_validate_json(body), forward_only
+    except ValidationError as e:
+        raise FastAPIRequestValidationError(e.errors())
+
+
 @app.post("/api/v1/forward_backward", response_model=FutureResponse)
-async def forward_backward(request: ForwardBackwardRequest, session: AsyncSession = Depends(get_session)):
-    """Compute and accumulate gradients."""
-    await get_model(session, request.model_id)
+async def forward_backward(request: Request, session: AsyncSession = Depends(get_session)):
+    """Compute and accumulate gradients (or run forward-only when the proto body asks for it)."""
+    req, forward_only = await _read_forward_backward_request(request)
+    await get_model(session, req.model_id)
 
     request_id = await create_future(
         session=session,
-        request_type=types.RequestType.FORWARD_BACKWARD,
-        model_id=request.model_id,
-        request_data=request.forward_backward_input.to_types(),
-        seq_id=request.seq_id,
+        request_type=types.RequestType.FORWARD if forward_only else types.RequestType.FORWARD_BACKWARD,
+        model_id=req.model_id,
+        request_data=req.forward_backward_input.to_types(),
+        seq_id=req.seq_id,
     )
 
     await session.commit()
@@ -1302,8 +1335,16 @@ async def retrieve_future(request: RetrieveFutureRequest, req: Request):
     if row is None:
         raise HTTPException(status_code=408, detail="Timeout waiting for result")
 
-    status, result_data = row
+    status, request_type, result_data = row
     if status == RequestStatus.COMPLETED:
+        if (
+            types.RequestType(request_type) in PROTO_SERIALIZABLE_REQUEST_TYPES
+            and PROTO_CONTENT_TYPE in req.headers.get("accept", "").lower()
+        ):
+            return Response(
+                content=serialize_result(types.RequestType(request_type), result_data),
+                media_type=PROTO_CONTENT_TYPE,
+            )
         return result_data
 
     # Return 400 for handled errors (validation, etc.), 500 for unexpected failures

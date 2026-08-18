@@ -100,7 +100,7 @@ async def test_resolves_once_the_request_completes(waiters, sync_engine):
     asyncio.create_task(complete_soon())
     result = await wait_for_future(waiters, request_id, timeout=5)
 
-    assert result == (RequestStatus.COMPLETED, {"sequences": []})
+    assert result == (RequestStatus.COMPLETED, types.RequestType.SAMPLE, {"sequences": []})
 
 
 @pytest.mark.asyncio
@@ -108,7 +108,11 @@ async def test_surfaces_failed_status(waiters, sync_engine):
     request_id = insert_pending(sync_engine)[0]
     mark_completed(sync_engine, request_id, {"error": "boom"}, status=RequestStatus.FAILED)
 
-    assert await wait_for_future(waiters, request_id, timeout=5) == (RequestStatus.FAILED, {"error": "boom"})
+    assert await wait_for_future(waiters, request_id, timeout=5) == (
+        RequestStatus.FAILED,
+        types.RequestType.SAMPLE,
+        {"error": "boom"},
+    )
 
 
 @pytest.mark.asyncio
@@ -136,7 +140,7 @@ async def test_one_waiter_giving_up_does_not_strand_the_others(waiters, sync_eng
     assert await quick is None
     mark_completed(sync_engine, request_id, {"ok": True})
 
-    assert await patient == (RequestStatus.COMPLETED, {"ok": True})
+    assert await patient == (RequestStatus.COMPLETED, types.RequestType.SAMPLE, {"ok": True})
 
 
 @pytest.mark.asyncio
@@ -164,10 +168,13 @@ async def test_query_count_does_not_scale_with_waiters(waiters, sync_engine, asy
     assert 0 < len(statements) < 50
 
 
-def _stub_request(async_engine, waiters):
+def _stub_request(async_engine, waiters, headers=None):
     from types import SimpleNamespace
 
-    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db_engine=async_engine, future_waiters=waiters)))
+    return SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(db_engine=async_engine, future_waiters=waiters)),
+        headers=headers or {},
+    )
 
 
 @pytest.mark.asyncio
@@ -189,6 +196,32 @@ async def test_retrieve_future_returns_completed_result(waiters, async_engine, s
     )
 
     assert result == {"sequences": [1]}
+
+
+@pytest.mark.asyncio
+async def test_retrieve_future_serves_proto_when_accepted(waiters, async_engine, sync_engine):
+    from tinker import SampleResponse
+    from tinker.proto.response_conv import deserialize_proto_response
+
+    from skyrl.tinker import api
+
+    request_id = insert_pending(sync_engine)[0]
+    mark_completed(
+        sync_engine,
+        request_id,
+        types.SampleOutput(
+            sequences=[types.GeneratedSequence(stop_reason="stop", tokens=[1, 2], logprobs=[-0.5, -1.0])]
+        ).model_dump(),
+    )
+
+    result = await api.retrieve_future(
+        api.RetrieveFutureRequest(request_id=str(request_id)),
+        _stub_request(async_engine, waiters, headers={"accept": "application/x-protobuf, application/json"}),
+    )
+
+    assert result.media_type == "application/x-protobuf"
+    response = deserialize_proto_response(result.body, SampleResponse)
+    assert response.sequences[0].tokens == [1, 2]
 
 
 @pytest.mark.asyncio
