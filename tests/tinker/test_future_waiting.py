@@ -172,7 +172,13 @@ def _stub_request(async_engine, waiters, headers=None):
     from types import SimpleNamespace
 
     return SimpleNamespace(
-        app=SimpleNamespace(state=SimpleNamespace(db_engine=async_engine, future_waiters=waiters)),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                db_engine=async_engine,
+                external_future_store=None,
+                future_waiters=waiters,
+            )
+        ),
         headers=headers or {},
     )
 
