@@ -28,12 +28,15 @@ class ExternalFuture:
 class ExternalFutureStore:
     """Keeps forwarded sample futures off the database hot path."""
 
-    _PERSIST_WORKERS = 2
+    _PERSIST_BATCH_SIZE = 64
+    _PERSIST_QUEUE_SIZE = 2048
 
     def __init__(self, db_engine):
         self.db_engine = db_engine
         self._entries: dict[int, ExternalFuture] = {}
-        self._persist_queue: asyncio.Queue[ExternalFuture] = asyncio.Queue()
+        self._persist_queue: asyncio.Queue[ExternalFuture] = asyncio.Queue(
+            maxsize=self._PERSIST_QUEUE_SIZE
+        )
         self._persist_workers: list[asyncio.Task] = []
         self._persist_errors: list[Exception] = []
         self._next_request_id = -1
@@ -46,10 +49,7 @@ class ExternalFutureStore:
             minimum_request_id = (await session.exec(statement)).one()
         if minimum_request_id is not None:
             self._next_request_id = minimum_request_id - 1
-        self._persist_workers = [
-            asyncio.create_task(self._persist_loop())
-            for _ in range(self._PERSIST_WORKERS)
-        ]
+        self._persist_workers = [asyncio.create_task(self._persist_loop())]
 
     def create(self, model_id: str | None, request_data: BaseModel) -> int:
         request_id = self._next_request_id
@@ -102,33 +102,45 @@ class ExternalFutureStore:
 
     async def _persist_loop(self) -> None:
         while True:
-            entry = await self._persist_queue.get()
+            entries = [await self._persist_queue.get()]
+            while len(entries) < self._PERSIST_BATCH_SIZE:
+                try:
+                    entries.append(self._persist_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
             try:
-                await self._persist(entry)
+                await self._persist(entries)
             except Exception as error:
                 self._persist_errors.append(error)
                 logger.exception(
-                    "External future persistence failed request_id=%s", entry.request_id
+                    "External future persistence failed request_ids=%s..%s",
+                    entries[0].request_id,
+                    entries[-1].request_id,
                 )
             else:
-                entry.persisted = True
-                self._remove_finished_entry(entry)
+                for entry in entries:
+                    entry.persisted = True
+                    self._remove_finished_entry(entry)
             finally:
-                self._persist_queue.task_done()
+                for _ in entries:
+                    self._persist_queue.task_done()
 
-    async def _persist(self, entry: ExternalFuture) -> None:
+    async def _persist(self, entries: list[ExternalFuture]) -> None:
         async with AsyncSession(self.db_engine) as session:
-            session.add(
-                FutureDB(
-                    request_id=entry.request_id,
-                    request_type=types.RequestType.EXTERNAL,
-                    model_id=entry.model_id,
-                    request_data=entry.request_data.model_dump(mode="json"),
-                    result_data=entry.result_data,
-                    status=entry.status,
-                    created_at=entry.created_at,
-                    completed_at=entry.completed_at,
-                )
+            session.add_all(
+                [
+                    FutureDB(
+                        request_id=entry.request_id,
+                        request_type=types.RequestType.EXTERNAL,
+                        model_id=entry.model_id,
+                        request_data=entry.request_data.model_dump(mode="json"),
+                        result_data=entry.result_data,
+                        status=entry.status,
+                        created_at=entry.created_at,
+                        completed_at=entry.completed_at,
+                    )
+                    for entry in entries
+                ]
             )
             await session.commit()
 

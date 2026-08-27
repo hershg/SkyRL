@@ -8,6 +8,7 @@ from sqlmodel import SQLModel, func, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from skyrl.tinker import api, types
+from skyrl.tinker.config import EngineConfig
 from skyrl.tinker.db_models import (
     FutureDB,
     RequestStatus,
@@ -16,6 +17,9 @@ from skyrl.tinker.db_models import (
     get_async_database_url,
 )
 from skyrl.tinker.external_future_store import ExternalFutureStore
+from skyrl.tinker.extra.skyrl_train_inference_forwarding import (
+    SkyRLTrainInferenceForwardingClient,
+)
 
 
 def _sample_input(seq_id: int) -> types.SampleInput:
@@ -155,6 +159,43 @@ async def test_two_full_rollout_waves_complete_and_persist(future_store):
 
     assert persisted == 1024
     assert pending == 0
+
+
+@pytest.mark.asyncio
+async def test_forwarding_client_completes_in_memory_future(future_store, monkeypatch):
+    store, engine = future_store
+    request_id = store.create("model_a", _sample_input(1))
+    result = types.SampleOutput(
+        sequences=[
+            types.GeneratedSequence(
+                stop_reason="stop", tokens=[1, 2], logprobs=[-0.5, -1.0]
+            )
+        ]
+    )
+    client = SkyRLTrainInferenceForwardingClient(
+        EngineConfig(base_model="model_a"), engine, store
+    )
+
+    async def forward(*args, **kwargs):
+        return result
+
+    monkeypatch.setattr(client, "_forward_with_retry", forward)
+    try:
+        await client.call_and_store_result(
+            request_id,
+            SimpleNamespace(),
+            model_id="model_a",
+            checkpoint_id="",
+        )
+        completed = await store.wait(request_id, timeout=1)
+    finally:
+        await client.aclose()
+
+    assert completed == (
+        RequestStatus.COMPLETED,
+        types.RequestType.EXTERNAL,
+        result.model_dump(),
+    )
 
 
 @pytest.mark.asyncio
