@@ -75,7 +75,7 @@ uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
   trainer.max_tokens_per_microbatch=2048 \
   trainer.logprobs_chunk_size=2048 \
   trainer.epochs=1 \
-  trainer.max_training_steps=1 \
+  trainer.max_training_steps=2 \
   trainer.eval_before_train=false \
   trainer.eval_interval=-1 \
   trainer.ckpt_interval=1 \
