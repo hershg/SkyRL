@@ -110,7 +110,7 @@ uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
   generator.inference_engine.engine_init_kwargs.disable_custom_all_reduce=true \
   generator.inference_engine.engine_init_kwargs.linear_backend=triton \
   generator.inference_engine.engine_init_kwargs.moe_backend=triton \
-  'generator.inference_engine.engine_init_kwargs.lora_target_modules=["fused_qkv_a_proj","q_a_proj","q_b_proj","q_proj","kv_a_proj_with_mqa","kv_b_proj","o_proj"]' \
+  'generator.inference_engine.engine_init_kwargs.lora_target_modules=["fused_qkv_a_proj","q_a_proj","q_b_proj","q_proj","kv_a_proj_with_mqa","kv_b_proj","o_proj","gate_up_proj","down_proj","experts"]' \
   generator.inference_engine.engine_init_kwargs.trust_remote_code=true \
   environment.env_class=gsm8k \
   trainer.logger="${LOGGER}" \
