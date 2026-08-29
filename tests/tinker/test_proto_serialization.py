@@ -230,6 +230,13 @@ class _StubRequest:
 
 
 @pytest.mark.asyncio
+async def test_client_config_enables_forward_backward_compression():
+    config = await api.client_config()
+    sdk_config = sdk_types.ClientConfigResponse.model_validate(config.model_dump())
+    assert sdk_config.proto_compress_fwdbwd
+
+
+@pytest.mark.asyncio
 async def test_read_forward_backward_request_zstd_proto_body():
     """SDK >= 0.25 may send the proto body zstd-compressed (Content-Encoding: zstd)."""
     raw = encode_sdk_fwd_bwd_request(forward_only=True)
