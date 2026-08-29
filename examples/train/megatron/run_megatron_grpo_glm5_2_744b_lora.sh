@@ -20,7 +20,10 @@ LORA_SYNC_DIR="${LORA_SYNC_DIR:-$CKPT_DIR/lora-sync}"
 LOGGER="${LOGGER:-console}"
 
 TRAIN_FILE="${DATA_DIR}/train.parquet"
-test -f "${TRAIN_FILE}"
+if [[ ! -f "${TRAIN_FILE}" ]]; then
+  echo "Missing ${TRAIN_FILE}. Prepare it with: uv run examples/train/gsm8k/gsm8k_dataset.py --output_dir ${DATA_DIR}" >&2
+  exit 1
+fi
 mkdir -p "${CKPT_DIR}" "${LORA_SYNC_DIR}"
 
 POLICY_NUM_NODES=1

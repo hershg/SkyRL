@@ -9,6 +9,7 @@ uv run --isolated --extra dev --extra skyrl-train pytest tests/backends/skyrl_tr
 
 from typing import List
 
+import pytest
 import torch
 
 from skyrl.backends.skyrl_train.training_batch import TensorList, TrainingInputBatch
@@ -172,6 +173,14 @@ class TestTokenBasedBatchIterator:
         reordered = iterator.reorder_and_combine_items(output_batches)
 
         assert [output["sample"] for output in reordered] == list(range(batch.batch_size))
+
+    def test_reorder_and_combine_items_rejects_missing_microbatch(self):
+        batch = self._make_batch([10, 3, 8, 5])
+        iterator = TokenBasedBatchIterator(batch, max_tokens_per_microbatch=12)
+        output_batches = [[{"sample": index} for index in indices] for indices in iterator._microbatches[:-1]]
+
+        with pytest.raises(ValueError, match="Fewer microbatch outputs"):
+            iterator.reorder_and_combine_items(output_batches)
 
     def test_get_microbatch_iterator_factory(self):
         batch = self._make_batch([10, 10, 5, 5])

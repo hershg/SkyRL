@@ -336,17 +336,16 @@ class MegatronStrategy(DistributedStrategy):
             save_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
         )
 
+        # Finish any preceding write before starting a new checkpoint, including a
+        # synchronous save selected for a cloud destination.
+        self._finalize_async_calls()
+
         async_save = self.megatron_config.async_dist_ckpt_save
         if async_save and io.is_cloud_path(ckpt_dir):
             # local_work_dir uploads on context exit, which would race the still-running
             # background write. Async is only safe writing in-place to a local/shared FS.
             self.print(f"async_dist_ckpt_save unsupported for cloud path {ckpt_dir}; saving synchronously")
             async_save = False
-        if async_save:
-            # The queue holds one in-flight write; the prior checkpoint dir must be
-            # fully written before this save reuses it.
-            self._finalize_async_calls()
-
         with io.local_work_dir(ckpt_dir) as work_dir:
             async_save_request = dist_checkpointing.save(
                 sharded_state_dict=sharded_state_dict,

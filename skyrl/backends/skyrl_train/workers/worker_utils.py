@@ -426,6 +426,8 @@ class TokenBasedBatchIterator(BaseBatchIterator):
 
     def reorder_and_combine_items(self, batches: List[List[dict]]) -> List[dict]:
         """Restore per-sample microbatch outputs to input order."""
+        if len(batches) < len(self._microbatches):
+            raise ValueError("Fewer microbatch outputs than input microbatches")
         ordered = [None] * self.data.batch_size
         for original_indices, items in zip(self._microbatches, batches):
             if len(items) < len(original_indices):

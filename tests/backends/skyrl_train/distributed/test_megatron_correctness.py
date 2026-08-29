@@ -151,3 +151,42 @@ class TestAsyncCheckpointQueue:
             strategy._finalize_async_calls()
 
         strategy._async_calls.maybe_finalize_async_calls.assert_called_once_with(blocking=True)
+
+    def test_sync_save_waits_for_prior_async_save(self):
+        from skyrl.backends.skyrl_train.distributed.megatron.megatron_strategy import (
+            MegatronStrategy,
+        )
+        from skyrl.train.config.config import MegatronConfig
+
+        events = []
+        config = MegatronConfig()
+        config.async_dist_ckpt_save = True
+        strategy = MegatronStrategy(megatron_config=config)
+        strategy._async_calls = SimpleNamespace(
+            maybe_finalize_async_calls=lambda *, blocking: events.append(("finalize", blocking)),
+            close=lambda: events.append(("close",)),
+        )
+        strategy.get_rng_state = dict
+        strategy.is_rank_0 = lambda: False
+        strategy.print = MagicMock()
+        model = SimpleNamespace(actor_module=[SimpleNamespace(sharded_state_dict=dict)])
+        work_dir = MagicMock()
+        work_dir.__enter__.return_value = "/checkpoint"
+
+        def save_synchronously(**kwargs):
+            events.append(("save", kwargs["async_sharded_save"]))
+
+        module = "skyrl.backends.skyrl_train.distributed.megatron.megatron_strategy"
+        with (
+            patch(f"{module}.dist.barrier"),
+            patch(f"{module}.io.is_cloud_path", return_value=True),
+            patch(f"{module}.io.local_work_dir", return_value=work_dir),
+            patch(f"{module}.get_default_save_sharded_strategy"),
+            patch(f"{module}.FullyParallelSaveStrategyWrapper"),
+            patch(f"{module}.mpu.get_data_parallel_group"),
+            patch(f"{module}.dist_checkpointing.save", side_effect=save_synchronously),
+            patch(f"{module}.AsyncCallsQueue", return_value=MagicMock()),
+        ):
+            strategy.save_checkpoint(model, "/checkpoint", node_local_rank=1)
+
+        assert events == [("finalize", True), ("save", False), ("close",)]
