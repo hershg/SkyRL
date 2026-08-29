@@ -150,6 +150,4 @@ class TestAsyncCheckpointQueue:
         with patch("torch.cuda.is_available", return_value=False):
             strategy._finalize_async_calls()
 
-        strategy._async_calls.maybe_finalize_async_calls.assert_called_once_with(
-            blocking=True
-        )
+        strategy._async_calls.maybe_finalize_async_calls.assert_called_once_with(blocking=True)
