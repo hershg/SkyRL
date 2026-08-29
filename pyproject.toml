@@ -351,8 +351,9 @@ torchvision = [
 ]
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
 megatron-bridge = {git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge", rev = "37ee6c41f02a10c59ddd345fc3dca1d645f581e3", marker = "sys_platform == 'linux'"}
-# Match Bridge's MCore base plus the generic FA4 detection fix in NVIDIA/Megatron-LM#6964.
-megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "67b6ae70e6556fea6cc4f9df824b18d6544f8ac9", marker = "sys_platform == 'linux'"}
+# Match Bridge's MCore base plus the focused FA4 and DSA recompute fixes in
+# NVIDIA/Megatron-LM#6964 and NVIDIA/Megatron-LM#6793.
+megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "16512be1ac1ee440c8b869db4ad9ad5eafc1a056", marker = "sys_platform == 'linux'"}
 # NOTE (sumanthrh): This custom wheel of vllm-router includes a fix for /chat/completions endpoint: https://github.com/vllm-project/router/pull/162  on top of 0.1.14
 # TODO (sumanthrh): Remove this after 0.1.15 vllm-router release
 vllm-router = [
