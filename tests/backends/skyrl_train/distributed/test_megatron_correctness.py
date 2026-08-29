@@ -132,3 +132,24 @@ class TestSeedVariation:
             with patch("random.seed", side_effect=lambda s: captured.append(s)):
                 strategy.set_seed(42)
             assert captured[0] == expected_seed
+
+
+@pytest.mark.skipif(not _has_megatron, reason="megatron-core not installed")
+class TestAsyncCheckpointQueue:
+    """Verify SkyRL owns the checkpoint queue instead of a removed MCore module global."""
+
+    def test_strategy_finalizes_its_checkpoint_queue(self):
+        from skyrl.backends.skyrl_train.distributed.megatron.megatron_strategy import (
+            MegatronStrategy,
+        )
+        from skyrl.train.config.config import MegatronConfig
+
+        strategy = MegatronStrategy(megatron_config=MegatronConfig())
+        strategy._async_calls = MagicMock()
+
+        with patch("torch.cuda.is_available", return_value=False):
+            strategy._finalize_async_calls()
+
+        strategy._async_calls.maybe_finalize_async_calls.assert_called_once_with(
+            blocking=True
+        )
