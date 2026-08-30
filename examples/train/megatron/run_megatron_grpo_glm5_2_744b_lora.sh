@@ -44,6 +44,7 @@ uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
   trainer.policy.model.lora.alpha=${LORA_RANK} \
   'trainer.policy.model.lora.target_modules=["linear_q_down_proj","linear_q_up_proj","linear_kv_down_proj","linear_kv_up_proj","linear_proj","linear_fc1","linear_fc2"]' \
   trainer.policy.model.lora.lora_sync_path="${LORA_SYNC_DIR}" \
+  trainer.policy.model.lora.preserve_export_dtype=true \
   trainer.strategy=megatron \
   trainer.placement.colocate_all=false \
   trainer.placement.policy_num_nodes=${POLICY_NUM_NODES} \
