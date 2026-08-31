@@ -354,7 +354,7 @@ megatron-bridge = {git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge", rev =
 # Match Bridge's MCore base plus the focused FA4 and DSA recompute fixes in
 # NVIDIA/Megatron-LM#6964 and NVIDIA/Megatron-LM#6793. Replace this temporary
 # integration pin with an official NVIDIA commit once both fixes land.
-megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "16512be1ac1ee440c8b869db4ad9ad5eafc1a056", marker = "sys_platform == 'linux'"}
+megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "d98cbcd1f7e1836b275506000ad64e87a4265c94", marker = "sys_platform == 'linux'"}
 # NOTE (sumanthrh): This custom wheel of vllm-router includes a fix for /chat/completions endpoint: https://github.com/vllm-project/router/pull/162  on top of 0.1.14
 # TODO (sumanthrh): Remove this after 0.1.15 vllm-router release
 vllm-router = [
