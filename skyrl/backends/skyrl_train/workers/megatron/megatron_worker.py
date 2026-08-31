@@ -1606,6 +1606,27 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             return  # FFT path: no-op
         self.adapter_store.swap_to(model_id, self.actor_module, self.optimizer)
 
+    def offload_to_cpu(self, offload_optimizer: bool = True, offload_model: bool = True):
+        """Park the live adapter's grads before offloading.
+
+        The optimizer half of the offload frees the DDP grad buffers, dropping
+        any grads still waiting on an optim_step. Parked grads survive the
+        offload and any swap that happens while offloaded.
+        """
+        if offload_optimizer and self.adapter_store is not None and self.actor_module is not None:
+            self.adapter_store.park_grads(self.actor_module)
+        super().offload_to_cpu(offload_optimizer=offload_optimizer, offload_model=offload_model)
+
+    def backload_to_gpu(self, backload_optimizer: bool = True, backload_model: bool = True):
+        """Unpark the live adapter's grads after backloading.
+
+        The live adapter may differ from the parked one if a swap happened in
+        between.
+        """
+        super().backload_to_gpu(backload_optimizer=backload_optimizer, backload_model=backload_model)
+        if backload_optimizer and self.adapter_store is not None and self.actor_module is not None:
+            self.adapter_store.unpark_grads(self.actor_module)
+
     def adapter_store_state(self) -> dict:
         """Diagnostic: return current_id + registered model_ids. Cheap; useful
         for tests."""
