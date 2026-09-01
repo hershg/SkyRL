@@ -258,6 +258,10 @@ override-dependencies = [
     "flashinfer-python==0.6.14; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "flashinfer-jit-cache==0.6.14; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "flashinfer-cubin==0.6.14; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # flash-attn 2.8.3 still imports CuTe DSL APIs removed in CUTLASS 4.6.0.
+    # Keep the transitive quack-kernels dependency on the newest compatible
+    # release until the pinned FlashAttention wheel supports the 4.6 API.
+    "nvidia-cutlass-dsl[cu13]==4.5.1; sys_platform == 'linux'",
     # mamba-ssm 2.3.2.post1 pins tilelang==0.1.8 and apache-tvm-ffi<=0.1.9, while
     # vLLM 0.26.0 pins tilelang==0.1.9 and apache-tvm-ffi==0.1.10. Both overrides
     # hold these at the versions the lock already resolved to before mamba-ssm moved
