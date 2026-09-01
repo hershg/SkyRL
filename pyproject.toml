@@ -350,7 +350,7 @@ torchvision = [
     { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
 ]
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
-megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "21116eaba98cc7083b35fcfdf008eea3096b2d14", marker = "sys_platform == 'linux'"}
+megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "19ef437a31a2bd26ddf19d795173207ede491859", marker = "sys_platform == 'linux'"}
 # Match Bridge's MCore base plus the focused FA4 and DSA recompute fixes in
 # NVIDIA/Megatron-LM#6964 and NVIDIA/Megatron-LM#6793. Replace this temporary
 # integration pin with an official NVIDIA commit once both fixes land.
