@@ -12,10 +12,12 @@ For a prestarted multi-node Ray cluster, also set:
 SKYRL_GLM53_RAY_ADDRESS=auto
 """
 
+import asyncio
 import hashlib
 import os
 import shutil
 import uuid
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 import pytest
@@ -377,7 +379,7 @@ def _assert_logprobs_changed(before, after, response_mask):
     )
 
 
-def _init_perturbable_policy(cfg, client, policy_gpus):
+def _init_perturbable_policy(cfg, policy_gpus):
     original_policy_worker = _megatron_worker_mod.PolicyWorker
     _megatron_worker_mod.PolicyWorker = _PerturbablePolicyWorker
     try:
@@ -392,15 +394,26 @@ def _init_perturbable_policy(cfg, client, policy_gpus):
     finally:
         _megatron_worker_mod.PolicyWorker = original_policy_worker
 
-    ray.get(
-        policy.async_run_ray_method(
-            "pass_through",
-            "init_weight_sync_state",
-            client,
-            cfg.generator.inference_engine,
-        )
-    )
     return policy
+
+
+async def _create_inference_engine(stack, cfg, model):
+    with Timer("initialize_vllm"):
+        state = await asyncio.to_thread(
+            InferenceEngineState.create,
+            cfg=cfg,
+            model=model,
+            use_local=True,
+            colocate_all=False,
+            backend="vllm",
+            enable_lora=True,
+        )
+    return await stack.enter_async_context(state)
+
+
+async def _create_policy(cfg, policy_gpus):
+    with Timer("initialize_megatron"):
+        return await asyncio.to_thread(_init_perturbable_policy, cfg, policy_gpus)
 
 
 @pytest.mark.asyncio
@@ -423,21 +436,33 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
         tokenizer.pad_token = tokenizer.eos_token
 
     try:
-        async with InferenceEngineState.create(
-            cfg=cfg,
-            model=model,
-            use_local=True,
-            colocate_all=False,
-            backend="vllm",
-            enable_lora=True,
-        ) as engines:
+        async with AsyncExitStack() as stack:
+            with Timer("initialize_vllm_and_megatron_concurrently"):
+                init_results = await asyncio.gather(
+                    _create_inference_engine(stack, cfg, model),
+                    _create_policy(cfg, policy_gpus),
+                    return_exceptions=True,
+                )
+            for result in init_results:
+                if isinstance(result, BaseException):
+                    raise result
+            engines, policy = init_results
             client = engines.client
             adapter_loaded = False
             try:
                 base_responses, base_mask, base_logprobs, base_input = await _generate(
                     client, tokenizer, model
                 )
-                policy = _init_perturbable_policy(cfg, client, policy_gpus)
+
+                with Timer("initialize_weight_sync"):
+                    ray.get(
+                        policy.async_run_ray_method(
+                            "pass_through",
+                            "init_weight_sync_state",
+                            client,
+                            cfg.generator.inference_engine,
+                        )
+                    )
 
                 initial_megatron_logprobs = _get_megatron_logprobs(policy, base_input)
                 _assert_logprobs_match(
