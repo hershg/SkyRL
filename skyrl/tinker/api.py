@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -32,6 +33,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel, func, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from skyrl.env_vars import SKYRL_HTTP_CONNECTION_LIMIT
 from skyrl.tinker import types
 from skyrl.tinker.config import EngineConfig, add_model, config_to_argv
 from skyrl.tinker.db_models import (
@@ -68,8 +70,11 @@ API_SERVER_STARTUP_ARGS = ["-m", "skyrl.tinker.api"]
 # Timeout for graceful shutdown when engine crashes
 SHUTDOWN_TIMEOUT_SECONDS = 10
 
-# How long retrieve_future waits for a result before returning 408
-RETRIEVE_FUTURE_TIMEOUT_SECONDS = 300
+# How long retrieve_future waits for a result before returning 408. Large
+# rollout bursts can legitimately queue behind the inference engine for many
+# minutes; returning 408 makes the SDK retry the whole sample and duplicate
+# inference work.
+RETRIEVE_FUTURE_TIMEOUT_SECONDS = 2_048
 
 # How often poll_futures looks for newly finished requests. A single query
 # covers every waiter, so this can stay tight without the load scaling up with
@@ -740,14 +745,16 @@ class SamplingParams(BaseModel):
     top_k: int = -1
     top_p: float = 1
 
-    def to_types(self) -> types.SamplingParams:
+    def to_types(self, default_seed: int | None = None) -> types.SamplingParams:
         if self.max_tokens is None:
             raise HTTPException(status_code=400, detail="max_tokens is currently required")
         if self.max_tokens <= 0:
             raise HTTPException(status_code=400, detail="max_tokens must be a positive number")
 
         # Generate a random seed if not provided
-        seed = self.seed if self.seed is not None else random.randint(0, 2**31 - 1)
+        seed = self.seed if self.seed is not None else default_seed
+        if seed is None:
+            seed = random.randint(0, 2**31 - 1)
 
         # Determine if stop values are token IDs (int) or strings
         stop_tokens = None
@@ -928,6 +935,9 @@ class WeightsInfoResponse(BaseModel):
 
 class ClientConfigResponse(BaseModel):
     pjwt_auth_enabled: bool = False
+    sample_no_retries: bool = True
+    sample_enable_stuck_detection: bool = False
+    sample_max_concurrent_requests: int = 2048
 
 
 @app.post("/api/v1/client/config", response_model=ClientConfigResponse)
@@ -1425,10 +1435,15 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
             )
         await validate_sampler_checkpoint_once(req, model_id, checkpoint_id, session)
 
+    default_seed = None
+    if request.sampling_session_id is not None and request.seq_id is not None:
+        request_identity = f"{request.sampling_session_id}:{request.seq_id}".encode()
+        default_seed = int.from_bytes(hashlib.sha256(request_identity).digest()[:4], "big") % (2**31)
+
     sample_input = types.SampleInput(
         base_model=base_model,
         prompt=request.prompt.to_types(),
-        sampling_params=request.sampling_params.to_types(),
+        sampling_params=request.sampling_params.to_types(default_seed=default_seed),
         num_samples=request.num_samples,
         checkpoint_id=checkpoint_id,
         # A positive topk implies prompt logprobs: both are read off the same
@@ -1442,12 +1457,16 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
     if external_future_store is not None:
         # Every external inference mode has a store, so this branch covers all
         # forwarded samples; the DB path below is only for the internal engine.
-        request_id = external_future_store.create(model_id, sample_input)
-        external_future_store.spawn_forwarding_task(
-            req.app.state.external_inference_client.call_and_store_result(
-                request_id, request, model_id, checkpoint_id, base_model=base_model
+        try:
+            request_id, created = external_future_store.get_or_create(model_id, sample_input)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        if created:
+            external_future_store.spawn_forwarding_task(
+                req.app.state.external_inference_client.call_and_store_result(
+                    request_id, request, model_id, checkpoint_id, base_model=base_model
+                )
             )
-        )
     else:
         request_id = await create_future(
             session=session,
@@ -1456,7 +1475,6 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
             request_data=sample_input,
         )
         await session.commit()
-
     return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
 
 
@@ -1847,4 +1865,10 @@ if __name__ == "__main__":
     # Store config in app.state so lifespan can access it
     app.state.engine_config = engine_config
 
-    uvicorn.run(app, host=args.host, port=args.port, log_config=get_uvicorn_log_config())
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        backlog=SKYRL_HTTP_CONNECTION_LIMIT,
+        log_config=get_uvicorn_log_config(),
+    )
