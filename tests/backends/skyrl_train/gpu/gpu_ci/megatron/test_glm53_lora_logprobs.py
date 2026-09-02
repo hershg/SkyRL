@@ -305,6 +305,47 @@ async def _generate(client, tokenizer, model: str | None = None):
     responses = output["response_ids"]
     rollout_logprobs = output["response_logprobs"]
     assert rollout_logprobs is not None
+    response_mask, logprobs_t, training_input = _build_training_input(
+        tokenizer, prompt_token_ids, responses, rollout_logprobs
+    )
+    return responses, response_mask, logprobs_t, training_input
+
+
+async def _score_responses(client, tokenizer, responses, model):
+    prompt_token_ids = _get_prompt_token_ids(tokenizer)
+
+    async def score_response(prompt, response):
+        result = await client.sample(
+            {
+                "json": {
+                    "prompt": {"chunks": [{"tokens": prompt + response}]},
+                    "num_samples": 1,
+                    "sampling_params": {"temperature": 0.0, "max_tokens": 1},
+                    "include_prompt_logprobs": True,
+                    "model": model,
+                }
+            }
+        )
+        prompt_logprobs = result["prompt_logprobs"]
+        assert prompt_logprobs is not None
+        response_logprobs = prompt_logprobs[len(prompt) :]
+        assert all(logprob is not None for logprob in response_logprobs)
+        return response_logprobs
+
+    with Timer("score_fixed_responses_with_vllm"):
+        response_logprobs = await asyncio.gather(
+            *(
+                score_response(prompt, response)
+                for prompt, response in zip(prompt_token_ids, responses, strict=True)
+            )
+        )
+
+    return _build_training_input(
+        tokenizer, prompt_token_ids, responses, response_logprobs
+    )
+
+
+def _build_training_input(tokenizer, prompt_token_ids, responses, rollout_logprobs):
     rewards = [[0.0] * len(response) for response in responses]
     loss_masks = [[1] * len(response) for response in responses]
 
@@ -340,7 +381,7 @@ async def _generate(client, tokenizer, model: str | None = None):
         }
     )
     training_input.metadata = {"response_length": num_actions}
-    return responses, response_mask, logprobs_t, training_input
+    return response_mask, logprobs_t, training_input
 
 
 def _get_megatron_logprobs(policy, training_input):
@@ -453,6 +494,9 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 base_responses, base_mask, base_logprobs, base_input = await _generate(
                     client, tokenizer, model
                 )
+                base_mask, base_logprobs, base_input = await _score_responses(
+                    client, tokenizer, base_responses, model
+                )
 
                 with Timer("initialize_weight_sync"):
                     ray.get(
@@ -486,10 +530,9 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 await client.reset_prefix_cache()
 
                 adapter_name = resolve_policy_model_name(cfg)
-                lora_responses, lora_mask, lora_logprobs, lora_input = await _generate(
-                    client, tokenizer, adapter_name
+                lora_mask, lora_logprobs, lora_input = await _score_responses(
+                    client, tokenizer, base_responses, adapter_name
                 )
-                assert base_responses == lora_responses
                 assert torch.equal(base_mask, lora_mask)
                 _assert_logprobs_match(
                     "base vLLM vs initialized vLLM LoRA",
@@ -541,8 +584,12 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 adapter_loaded = True
                 await client.reset_prefix_cache()
 
-                _, updated_mask, updated_vllm_logprobs, updated_input = await _generate(
-                    client, tokenizer, adapter_name
+                (
+                    updated_mask,
+                    updated_vllm_logprobs,
+                    updated_input,
+                ) = await _score_responses(
+                    client, tokenizer, base_responses, adapter_name
                 )
                 updated_megatron_logprobs = _get_megatron_logprobs(
                     policy, updated_input
