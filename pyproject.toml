@@ -396,7 +396,7 @@ megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "f8e
 # own CI validates against. Bump the two together, reading the submodule rev with
 # `git ls-tree <bridge-rev> 3rdparty/Megatron-LM`. This one is on the Megatron-LM
 # main branch (https://github.com/NVIDIA/Megatron-LM/tree/main), dated 8/12/26.
-megatron-core = {git = "https://github.com/NVIDIA/Megatron-LM", rev = "14346b65a2d0790e451919858f7771078105c5f0", marker = "sys_platform == 'linux'"}
+megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "f4e272e72735485abd5a7621e33b56365cd9237b", marker = "sys_platform == 'linux'"}
 # NOTE (sumanthrh): This custom wheel of vllm-router includes a fix for /chat/completions endpoint: https://github.com/vllm-project/router/pull/162  on top of 0.1.14
 # TODO (sumanthrh): Remove this after 0.1.15 vllm-router release
 vllm-router = [
