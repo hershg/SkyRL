@@ -396,8 +396,8 @@ harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f
 # Current canonical Bridge main plus focused grouped-expert LoRA output reuse.
 megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "7598c7541c852b44f7626f7d4e18e231a444be49", marker = "sys_platform == 'linux'"}
 # MCore current main includes the upstream #6553 activation-offload storage optimization;
-# this pin adds only the focused absorbed-MLA offload integration required by GLM.
-megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "d4ddb7ddd57e3ef8fc2bdfb3f285d2e0ef817c30", marker = "sys_platform == 'linux'"}
+# this pin adds the focused absorbed-MLA offload integration and configurable fused DSA query blocks.
+megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "9d5d2a72f308505b1fa986dbbe41afb6d1cf5251", marker = "sys_platform == 'linux'"}
 # NOTE (sumanthrh): This custom wheel of vllm-router includes a fix for /chat/completions endpoint: https://github.com/vllm-project/router/pull/162  on top of 0.1.14
 # TODO (sumanthrh): Remove this after 0.1.15 vllm-router release
 vllm-router = [
