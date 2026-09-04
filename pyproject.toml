@@ -390,7 +390,7 @@ torchvision = [
 ]
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
 # Qualified Bridge pin plus #5906 and the grouped-expert LoRA output-reuse candidate.
-megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "49e58b4aa830f0d349de6082010d007d77d89ce2", marker = "sys_platform == 'linux'"}
+megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "73249e765b96755bff1b6519215141f1280f7c7c", marker = "sys_platform == 'linux'"}
 # megatron-core must match the `3rdparty/Megatron-LM` submodule pin of the
 # megatron-bridge rev above -- that is the only megatron-core commit Bridge's
 # own CI validates against. Bump the two together, reading the submodule rev with
