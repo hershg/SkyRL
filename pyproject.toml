@@ -393,14 +393,11 @@ torchvision = [
     { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
 ]
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
-# megatron-bridge main branch: latest as of 8/13/26
-megatron-bridge = {git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge", rev = "2b8cb21d90548a5796c748f1986c77fc1cfe2417", marker = "sys_platform == 'linux'"}
-# megatron-core must match the `3rdparty/Megatron-LM` submodule pin of the
-# megatron-bridge rev above -- that is the only megatron-core commit Bridge's
-# own CI validates against. Bump the two together, reading the submodule rev with
-# `git ls-tree <bridge-rev> 3rdparty/Megatron-LM`. This one is on the Megatron-LM
-# main branch (https://github.com/NVIDIA/Megatron-LM/tree/main), dated 8/12/26.
-megatron-core = {git = "https://github.com/NVIDIA/Megatron-LM", rev = "14346b65a2d0790e451919858f7771078105c5f0", marker = "sys_platform == 'linux'"}
+# Current canonical Bridge main plus focused grouped-expert LoRA output reuse.
+megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "7598c7541c852b44f7626f7d4e18e231a444be49", marker = "sys_platform == 'linux'"}
+# MCore current main includes the upstream #6553 activation-offload storage optimization;
+# this pin adds only the focused absorbed-MLA offload integration required by GLM.
+megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "d4ddb7ddd57e3ef8fc2bdfb3f285d2e0ef817c30", marker = "sys_platform == 'linux'"}
 # NOTE (sumanthrh): This custom wheel of vllm-router includes a fix for /chat/completions endpoint: https://github.com/vllm-project/router/pull/162  on top of 0.1.14
 # TODO (sumanthrh): Remove this after 0.1.15 vllm-router release
 vllm-router = [
