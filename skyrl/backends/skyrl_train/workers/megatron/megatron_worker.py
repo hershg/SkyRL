@@ -1386,7 +1386,24 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # whole accumulated window. Deferred out of forward_backward because the reduce
         # is not idempotent -- running it per call corrupts gradients once a window
         # spans more than one call.
+        def log_nonfinite_gradients(stage: str) -> None:
+            bad_gradients = []
+            for chunk in self.actor_module:
+                for name, param in chunk.named_parameters():
+                    grad = getattr(param, "main_grad", None)
+                    if grad is None:
+                        grad = param.grad
+                    if grad is not None and not bool(torch.isfinite(grad).all()):
+                        bad_gradients.append((name, tuple(grad.shape), str(grad.dtype)))
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            logger.warning(
+                f"[gradient-diagnostic] rank={rank} stage={stage} "
+                f"nonfinite={len(bad_gradients)} first={bad_gradients[:32]}"
+            )
+
+        log_nonfinite_gradients("before_pending_sync")
         self.model.run_pending_grad_sync()
+        log_nonfinite_gradients("after_pending_sync")
 
         grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 
