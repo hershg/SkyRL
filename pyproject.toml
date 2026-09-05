@@ -391,12 +391,9 @@ torchvision = [
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
 # Qualified Bridge pin plus the peak-memory fix from NVIDIA-NeMo/Megatron-Bridge#5906.
 megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "f8e430a655f6911f95f7cadfe976f88485c80c00", marker = "sys_platform == 'linux'"}
-# megatron-core must match the `3rdparty/Megatron-LM` submodule pin of the
-# megatron-bridge rev above -- that is the only megatron-core commit Bridge's
-# own CI validates against. Bump the two together, reading the submodule rev with
-# `git ls-tree <bridge-rev> 3rdparty/Megatron-LM`. This one is on the Megatron-LM
-# main branch (https://github.com/NVIDIA/Megatron-LM/tree/main), dated 8/12/26.
-megatron-core = {git = "https://github.com/NVIDIA/Megatron-LM", rev = "14346b65a2d0790e451919858f7771078105c5f0", marker = "sys_platform == 'linux'"}
+# This fork commit is based directly on the Megatron-LM submodule pin exercised
+# by the megatron-bridge rev above and adds only the TileLang target-width guard.
+megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "4c9ef63bdd6b3e35839d9771f769f61991a0c877", marker = "sys_platform == 'linux'"}
 # NOTE (sumanthrh): This custom wheel of vllm-router includes a fix for /chat/completions endpoint: https://github.com/vllm-project/router/pull/162  on top of 0.1.14
 # TODO (sumanthrh): Remove this after 0.1.15 vllm-router release
 vllm-router = [
