@@ -2180,7 +2180,7 @@ wheels = [
 [[package]]
 name = "flash-mla"
 version = "1.0.0+9edee0c"
-source = { git = "https://github.com/deepseek-ai/FlashMLA?rev=b7643bd54521f563b839b98289b5cd048c062ba2#b7643bd54521f563b839b98289b5cd048c062ba2" }
+source = { git = "https://github.com/hershg/FlashMLA.git?rev=41e81fefb0bd7b748efe63fa0fd02f4c59c6fc33#41e81fefb0bd7b748efe63fa0fd02f4c59c6fc33" }
 
 [[package]]
 name = "flashinfer-cubin"
@@ -9212,7 +9212,7 @@ requires-dist = [
     { name = "flash-attn", marker = "sys_platform == 'linux' and extra == 'skyrl-train'", specifier = "==2.8.3+cu.13.0.torch.2.11", index = "https://wheels.astral.sh/simple/cu130/" },
     { name = "flash-linear-attention", marker = "sys_platform == 'linux' and extra == 'fsdp'" },
     { name = "flash-linear-attention", marker = "sys_platform == 'linux' and extra == 'megatron'" },
-    { name = "flash-mla", marker = "sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/deepseek-ai/FlashMLA?rev=b7643bd54521f563b839b98289b5cd048c062ba2" },
+    { name = "flash-mla", marker = "sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/hershg/FlashMLA.git?rev=41e81fefb0bd7b748efe63fa0fd02f4c59c6fc33" },
     { name = "flashinfer-cubin", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'fsdp'", specifier = "==0.6.16.post3", index = "https://flashinfer.ai/whl/" },
     { name = "flashinfer-cubin", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.6.16.post3", index = "https://flashinfer.ai/whl/" },
     { name = "flashinfer-jit-cache", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'fsdp'", specifier = "==0.6.16.post3", index = "https://flashinfer.ai/whl/cu130" },
