@@ -35,6 +35,9 @@ from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
     get_moe_metrics,
     print_model_size,
 )
+from skyrl.backends.skyrl_train.distributed.megatron.named_gradients import (
+    NamedGradientRecorder,
+)
 from skyrl.backends.skyrl_train.distributed.megatron.optimizer import (
     get_megatron_optimizer,
     get_megatron_optimizer_param_scheduler,
@@ -1143,6 +1146,15 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 num_training_steps=num_training_steps,
             )
 
+            selectors = self.cfg.policy.optimizer_config.named_gradient_selectors
+            if selectors and getattr(self.provider, "mtp_num_layers", None):
+                raise NotImplementedError("Named-gradient metrics do not yet support MTP optimizers")
+            self._named_gradient_recorder = (
+                NamedGradientRecorder(self.optimizer, self.actor_module, selectors)
+                if selectors
+                else None
+            )
+
             if getattr(self.provider, "mtp_num_layers", None):
                 from skyrl.backends.skyrl_train.mtp.grad_clip import (
                     install_mtp_separate_grad_clip,
@@ -1487,7 +1499,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=status)
 
-    def optim_step(self) -> Optional[float]:
+    def optim_step(self, return_metrics: bool = False) -> Optional[float] | dict[str, float]:
         """
         Perform optimizer step.
 
@@ -1501,7 +1513,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         then cleared. See :meth:`MegatronModelWrapper.run_pending_grad_sync`.
 
         Returns:
-            The gradient norm (before scaling, after clipping), or None if unavailable.
+            The gradient norm, or an optimizer metrics map when ``return_metrics``
+            is true.
         """
         if self.optimizer is None:
             raise RuntimeError("optim_step called but policy.inference_only_init=True (no optimizer constructed)")
@@ -1512,7 +1525,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # spans more than one call.
         self.model.run_pending_grad_sync()
 
-        grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
+        named_metrics = {}
+        if self._named_gradient_recorder is None:
+            grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
+        else:
+            with self._named_gradient_recorder.capture(self.optimizer) as named_metrics:
+                grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 
         # Clear the DDP grad buffers for the next window. `optimizer.zero_grad()` inside
         # `optimizer_step` only drops `param.grad` / the fp32 main-param grads -- the
@@ -1528,6 +1546,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         if grad_norm is not None:
             grad_norm = grad_norm.detach().cpu().item() if hasattr(grad_norm, "item") else grad_norm
+        if return_metrics:
+            metrics = dict(named_metrics)
+            if grad_norm is not None:
+                metrics["skyrl.ai/grad_norm"] = grad_norm
+            return metrics
         return grad_norm
 
     def get_lr(self) -> Optional[float]:

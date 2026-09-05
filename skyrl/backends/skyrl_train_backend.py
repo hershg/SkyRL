@@ -1032,13 +1032,16 @@ class SkyRLTrainBackend(AbstractBackend):
         adam_params = request_data.adam_params
         self._dispatch.set_lr(role, adam_params.learning_rate, model_id=model_id)
 
-        grad_norm = self._dispatch.optim_step(role, model_id=model_id)
-        logger.info(f"optim_step: lr={adam_params.learning_rate}, grad_norm={grad_norm}")
-
-        metrics: dict[str, float] = {}
-        if grad_norm is not None:
-            metrics["skyrl.ai/grad_norm"] = float(grad_norm)
+        if self._cfg.trainer.strategy == "megatron":
+            metrics = self._dispatch.optim_step(role, model_id=model_id, return_metrics=True)
+            assert isinstance(metrics, dict)
+        else:
+            grad_norm = self._dispatch.optim_step(role, model_id=model_id)
+            metrics = {}
+            if grad_norm is not None:
+                metrics["skyrl.ai/grad_norm"] = float(grad_norm)
         metrics["skyrl.ai/learning_rate"] = adam_params.learning_rate
+        logger.info(f"optim_step: metrics={metrics}")
         return types.OptimStepOutput(metrics=metrics)
 
     def sample(

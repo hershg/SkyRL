@@ -421,7 +421,12 @@ class WorkerDispatch:
         self._save_memory_snapshot(model, "forward_backward")
         return WorkerOutput.cat(self._actor_groups[model].actor_infos, statuses)
 
-    def optim_step(self, model: str, model_id: Optional[str] = None) -> Optional[float]:
+    def optim_step(
+        self,
+        model: str,
+        model_id: Optional[str] = None,
+        return_metrics: bool = False,
+    ) -> Optional[float] | dict[str, float]:
         """Run optimizer step. For single-tenant training, the model should already be on GPU from forward_backward.
 
         For multi-tenant LoRA training, ``model_id`` is used to ensure the correct adapter is used.
@@ -432,11 +437,12 @@ class WorkerDispatch:
         """
         self._ensure_on_gpu(model, need_optimizer=True, need_model=True)
         self.ensure_active_adapter(model, model_id)
-        refs = self._actor_groups[model].async_run_ray_method("pass_through", "optim_step")
-        grad_norms = ray.get(refs)
+        args = (return_metrics,) if return_metrics else ()
+        refs = self._actor_groups[model].async_run_ray_method("pass_through", "optim_step", *args)
+        outputs = ray.get(refs)
 
         self._save_memory_snapshot(model, "optim_step")
-        return grad_norms[0]
+        return outputs[0]
 
     def set_lr(self, model: str, learning_rate: float, model_id: Optional[str] = None) -> None:
         """Set learning rate for model's optimizer.

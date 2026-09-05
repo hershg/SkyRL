@@ -200,6 +200,11 @@ class OptimizerConfig(BaseConfig):
     """L2 regularization strength for AdamW."""
     max_grad_norm: float = 1.0
     """Gradient clipping. The total L2 norm of the model gradients is scaled to this value."""
+    named_gradient_selectors: Dict[str, str] = field(default_factory=dict)
+    """Optional ``stable_name: parameter_glob`` entries for pre-clip L2 norm metrics.
+
+    At most eight non-overlapping selectors are accepted. Metrics are emitted as
+    ``skyrl.ai/named_grad_norm/<stable_name>``. Currently supported by Megatron."""
     offload_after_step: bool = True
     """Offload optimizer state to CPU after each full training step.
     Applies under colocation (``colocate_all``, or ``colocate_policy_ref`` for policy/ref), and is
@@ -211,6 +216,15 @@ class OptimizerConfig(BaseConfig):
     scheduler: str = "constant_with_warmup"
     """Learning rate scheduler. Intended to align with ``transformers.SchedulerType``:
     https://huggingface.co/docs/transformers/main/en/main_classes/optimizer_schedules#transformers.SchedulerType"""
+
+    def __post_init__(self) -> None:
+        if len(self.named_gradient_selectors) > 8:
+            raise ValueError("named_gradient_selectors accepts at most 8 entries")
+        for name, pattern in self.named_gradient_selectors.items():
+            if not name or not name.isascii() or any(not (char.isalnum() or char in "_.-") for char in name):
+                raise ValueError(f"Invalid named-gradient stable name: {name!r}")
+            if not isinstance(pattern, str) or not pattern:
+                raise ValueError(f"Named-gradient selector {name!r} must be a non-empty parameter glob")
 
 
 @dataclass
@@ -1787,6 +1801,12 @@ class SkyRLTrainConfig(BaseConfig):
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
 
     def __post_init__(self):
+
+        named_gradient_selectors = self.trainer.policy.optimizer_config.named_gradient_selectors
+        if named_gradient_selectors and self.trainer.strategy != "megatron":
+            raise ValueError("named_gradient_selectors requires trainer.strategy=megatron")
+        if named_gradient_selectors and self.trainer.mtp.enabled:
+            raise ValueError("named_gradient_selectors does not yet support trainer.mtp.enabled")
 
         # generator.max_input_length defaults to trainer.max_prompt_length
         if self.generator.max_input_length is None:
