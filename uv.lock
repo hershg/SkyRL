@@ -60,6 +60,19 @@ overrides = [
     { name = "xgrammar", specifier = "==0.2.3" },
 ]
 
+[[manifest.dependency-metadata]]
+name = "deep-gemm"
+version = "2.6.1+local"
+
+[[manifest.dependency-metadata]]
+name = "fast-hadamard-transform"
+version = "1.1.0"
+requires-dist = ["torch", "packaging", "ninja"]
+
+[[manifest.dependency-metadata]]
+name = "flash-mla"
+version = "1.0.0+9edee0c"
+
 [[package]]
 name = "absl-py"
 version = "2.5.0"
@@ -2163,6 +2176,11 @@ sdist = { url = "https://files.pythonhosted.org/packages/d2/76/c180949eae5161b9f
 wheels = [
     { url = "https://files.pythonhosted.org/packages/90/d2/2070e3cf2148c5cce99ca4876633c4b7b89ec085323600bd3d47aeacd306/flash_linear_attention-0.5.2-py3-none-any.whl", hash = "sha256:dcf405d81f5426393b59037097aa700d0f4a841465d5028d5aa543f4502f2400", size = 399590, upload-time = "2026-07-27T18:26:17.912Z" },
 ]
+
+[[package]]
+name = "flash-mla"
+version = "1.0.0+9edee0c"
+source = { git = "https://github.com/deepseek-ai/FlashMLA?rev=b7643bd54521f563b839b98289b5cd048c062ba2#b7643bd54521f563b839b98289b5cd048c062ba2" }
 
 [[package]]
 name = "flashinfer-cubin"
@@ -9032,6 +9050,7 @@ megatron = [
     { name = "fastapi" },
     { name = "flash-attn", marker = "sys_platform == 'linux'" },
     { name = "flash-linear-attention", marker = "sys_platform == 'linux'" },
+    { name = "flash-mla", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-cubin", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "flashinfer-jit-cache", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "flashinfer-python", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -9193,6 +9212,7 @@ requires-dist = [
     { name = "flash-attn", marker = "sys_platform == 'linux' and extra == 'skyrl-train'", specifier = "==2.8.3+cu.13.0.torch.2.11", index = "https://wheels.astral.sh/simple/cu130/" },
     { name = "flash-linear-attention", marker = "sys_platform == 'linux' and extra == 'fsdp'" },
     { name = "flash-linear-attention", marker = "sys_platform == 'linux' and extra == 'megatron'" },
+    { name = "flash-mla", marker = "sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/deepseek-ai/FlashMLA?rev=b7643bd54521f563b839b98289b5cd048c062ba2" },
     { name = "flashinfer-cubin", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'fsdp'", specifier = "==0.6.16.post3", index = "https://flashinfer.ai/whl/" },
     { name = "flashinfer-cubin", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==0.6.16.post3", index = "https://flashinfer.ai/whl/" },
     { name = "flashinfer-jit-cache", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'fsdp'", specifier = "==0.6.16.post3", index = "https://flashinfer.ai/whl/cu130" },
