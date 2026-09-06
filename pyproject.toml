@@ -397,7 +397,7 @@ harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f
 megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "7598c7541c852b44f7626f7d4e18e231a444be49", marker = "sys_platform == 'linux'"}
 # MCore current main includes the upstream #6553 activation-offload storage optimization;
 # this pin adds absorbed-MLA offload, configurable fused DSA query blocks, and direct-final query storage.
-megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "03ec0c947d579349c37ba547d57a6af37d5a71fc", marker = "sys_platform == 'linux'"}
+megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "ddc4729cedd3384cc87cdd6fbb149447a724375d", marker = "sys_platform == 'linux'"}
 # NOTE (sumanthrh): This custom wheel of vllm-router includes a fix for /chat/completions endpoint: https://github.com/vllm-project/router/pull/162  on top of 0.1.14
 # TODO (sumanthrh): Remove this after 0.1.15 vllm-router release
 vllm-router = [
