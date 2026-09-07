@@ -58,6 +58,7 @@ from tests.backends.skyrl_train.gpu.utils import (
     init_worker_with_type,
 )
 from tests.utils.glm53_parity_inputs import load_parity_inputs
+from tests.utils.glm53_scoring import score_fixed_responses
 
 MODEL = "zai-org/GLM-5.3-BF16"
 MODEL_REVISION = "304b8051cfb2b260b61ce0cbe330e02a98e73639"
@@ -1009,33 +1010,13 @@ async def _generate(client, tokenizer, model: str | None = None):
     return responses, response_mask, logprobs_t, training_input
 
 
-async def _score_responses(client, tokenizer, responses, model, prompt_token_ids):
-    async def score_response(prompt, response):
-        result = await client.sample(
-            {
-                "json": {
-                    "prompt": {"chunks": [{"tokens": prompt + response}]},
-                    "num_samples": 1,
-                    "sampling_params": {"temperature": 0.0, "max_tokens": 1},
-                    "include_prompt_logprobs": True,
-                    "model": model,
-                }
-            }
-        )
-        prompt_logprobs = result["prompt_logprobs"]
-        assert prompt_logprobs is not None
-        response_logprobs = prompt_logprobs[len(prompt) :]
-        assert all(logprob is not None for logprob in response_logprobs)
-        return response_logprobs
-
+async def _score_responses(
+    client, tokenizer, responses, model, prompt_token_ids, concurrent=True
+):
     with Timer("score_fixed_responses_with_vllm"):
-        response_logprobs = await asyncio.gather(
-            *(
-                score_response(prompt, response)
-                for prompt, response in zip(prompt_token_ids, responses, strict=True)
-            )
+        response_logprobs = await score_fixed_responses(
+            client, prompt_token_ids, responses, model, concurrent
         )
-
     return _build_training_input(
         tokenizer, prompt_token_ids, responses, response_logprobs
     )
@@ -1418,10 +1399,120 @@ async def _run_lora_update_matrix(
         _inspect_policy_boundary(policy, "restore_glm53_lora_b")
 
 
+async def _run_unchanged_score_probe(
+    client, tokenizer, policy, cfg, prompts, responses, base_input, lora_sync_path
+):
+    trainer_before = _inspect_policy_boundary(policy, "inspect_glm53_lora_parameters")
+    with Timer("repeatability_initial_publication"):
+        ray.get(
+            policy.async_run_ray_method(
+                "pass_through",
+                "broadcast_to_inference_engines",
+                client,
+                cfg.generator.inference_engine,
+            )
+        )
+    adapter_name = resolve_policy_model_name(cfg)
+    try:
+        _print_boundary_receipt(
+            "repeatability_export",
+            _inspect_policy_boundary(
+                policy, "inspect_glm53_exported_adapter", str(lora_sync_path)
+            ),
+        )
+        sampler_before = await _inspect_vllm_boundary(client)
+        _print_boundary_receipt("repeatability_sampler_before", sampler_before)
+        trainer_logprobs = _get_megatron_logprobs(policy, base_input)
+        mask = base_input["response_mask"].bool()
+        _print_boundary_receipt(
+            "repeatability_trainer",
+            {
+                "logprobs": trainer_logprobs[mask].tolist(),
+                "response_lengths": mask.sum(dim=1).tolist(),
+            },
+        )
+        samples = {"serial": [], "concurrent": []}
+        for repeat in range(3):
+            for mode in ("serial", "concurrent"):
+                await client.reset_prefix_cache()
+                with Timer(f"repeatability_{mode}_{repeat}"):
+                    current_mask, logprobs, current_input = await _score_responses(
+                        client,
+                        tokenizer,
+                        responses,
+                        adapter_name,
+                        prompts,
+                        concurrent=mode == "concurrent",
+                    )
+                assert torch.equal(base_input["sequences"], current_input["sequences"])
+                assert torch.equal(mask, current_mask.bool())
+                valid = logprobs[mask]
+                assert torch.isfinite(valid).all()
+                samples[mode].append(valid)
+                _print_boundary_receipt(
+                    f"repeatability_{mode}_{repeat}",
+                    {
+                        "logprobs": valid.tolist(),
+                        "response_lengths": mask.sum(dim=1).tolist(),
+                    },
+                )
+        trainer_after = _inspect_policy_boundary(
+            policy, "inspect_glm53_lora_parameters"
+        )
+        sampler_after = await _inspect_vllm_boundary(client)
+        assert trainer_before == trainer_after
+        assert sampler_before == sampler_after
+        _print_boundary_receipt("repeatability_sampler_after", sampler_after)
+        results = {}
+        for mode, values in samples.items():
+            pairs = []
+            for left in range(len(values)):
+                for right in range(left + 1, len(values)):
+                    error = (values[left] - values[right]).abs().float()
+                    pairs.append(
+                        {
+                            "left": left,
+                            "right": right,
+                            "tokens": error.numel(),
+                            "mean": error.mean().item(),
+                            "p99": torch.quantile(error, 0.99).item(),
+                            "max": error.max().item(),
+                        }
+                    )
+            results[mode] = pairs
+        _print_boundary_receipt(
+            "repeatability_result",
+            {
+                "scope": "unchanged-weight diagnostic only; no update or qualification",
+                "mean_limit": 0.0075,
+                "p99_limit": 0.075,
+                "pairs": results,
+            },
+        )
+        assert all(
+            pair["mean"] < 0.0075 and pair["p99"] < 0.075
+            for pairs in results.values()
+            for pair in pairs
+        ), "Unchanged scoring noise exceeds 10% of the existing update-error budgets"
+    finally:
+        await client.unload_lora_adapter(adapter_name)
+
+
 @pytest.mark.asyncio
 @pytest.mark.megatron
 @pytest.mark.b300
 async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixture):
+    await _run_glm53_lora_probe(repeatability_only=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.megatron
+@pytest.mark.b300
+async def test_glm53_unchanged_score_repeatability(glm53_ray_init_fixture):
+    await _run_glm53_lora_probe(repeatability_only=True)
+
+
+async def _run_glm53_lora_probe(repeatability_only):
     model = os.environ.get("SKYRL_GLM53_MODEL", MODEL)
     fixed_inputs = None
     if model != SMALL_DRY_RUN_MODEL:
@@ -1490,6 +1581,20 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                             cfg.generator.inference_engine,
                         )
                     )
+
+                if repeatability_only:
+                    await _run_unchanged_score_probe(
+                        client,
+                        tokenizer,
+                        policy,
+                        cfg,
+                        prompt_token_ids,
+                        base_responses,
+                        base_input,
+                        lora_sync_path,
+                    )
+                    completed = True
+                    return
 
                 initial_megatron_logprobs = _get_megatron_logprobs(policy, base_input)
                 _assert_logprobs_match(
