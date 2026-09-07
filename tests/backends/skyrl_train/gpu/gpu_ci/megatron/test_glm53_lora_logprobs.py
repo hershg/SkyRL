@@ -47,7 +47,10 @@ from skyrl.backends.skyrl_train.workers.megatron.megatron_worker import (
     MegatronPolicyWorkerBase,
 )
 from skyrl.train.config import SamplingParams, SkyRLLoraConfig, SkyRLTrainConfig
-from skyrl.train.dataset.preprocess import convert_prompts_responses_to_batch_tensors
+from skyrl.train.dataset.preprocess import (
+    convert_prompts_responses_to_batch_tensors,
+    make_router_padding_mask,
+)
 from skyrl.train.utils.utils import validate_cfg
 from skyrl.utils.tok import get_tokenizer
 from tests.backends.skyrl_train.gpu.gpu_ci.conftest import ray_init
@@ -76,6 +79,7 @@ MIN_DIRECT_UPDATE_COSINE = 0.8
 MIN_DIRECT_UPDATE_SCALE = 0.5
 MAX_DIRECT_UPDATE_SCALE = 1.5
 MAX_DIRECT_UPDATE_RELATIVE_MEAN_ERROR = 0.5
+ROUTER_REPLAY = os.environ.get("SKYRL_GLM53_ROUTER_REPLAY", "0") == "1"
 
 TEST_PROMPTS = [
     "What is 2 + 3? Answer with only the number.",
@@ -595,6 +599,7 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
     megatron.moe_grouped_gemm = True
     megatron.moe_router_score_function = "sigmoid"
     megatron.lora_config.merge_lora = False
+    megatron.moe_enable_routing_replay = ROUTER_REPLAY
     megatron.ddp_config.average_in_collective = False
     megatron.transformer_config_kwargs = {
         "dsa_kernel_backend": "tilelang",
@@ -614,6 +619,8 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
         "recompute_num_layers": 1,
         "recompute_modules": [],
     }
+    if ROUTER_REPLAY:
+        megatron.transformer_config_kwargs["moe_router_fusion"] = False
     if megatron.pipeline_model_parallel_size == 2:
         # GLM's DSA top-k indices are shared in four-layer groups. Each pipeline
         # stage must therefore start on a layer that computes its own indices.
@@ -645,7 +652,8 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
     inference.tensor_parallel_size = inference_tp
     inference.pipeline_parallel_size = 1
     inference.data_parallel_size = 1
-    inference.distributed_executor_backend = "ray"
+    inference.distributed_executor_backend = "mp" if ROUTER_REPLAY else "ray"
+    inference.enable_return_routed_experts = ROUTER_REPLAY
     inference.weight_sync_backend = "nccl"
     inference.enforce_eager = False
     inference.gpu_memory_utilization = 0.8
@@ -719,8 +727,15 @@ async def _generate(client, tokenizer, model: str | None = None):
     responses = output["response_ids"]
     rollout_logprobs = output["response_logprobs"]
     assert rollout_logprobs is not None
+    rollout_expert_indices = output["rollout_expert_indices"]
+    if ROUTER_REPLAY:
+        assert rollout_expert_indices is not None
     response_mask, logprobs_t, training_input = _build_training_input(
-        tokenizer, prompt_token_ids, responses, rollout_logprobs
+        tokenizer,
+        prompt_token_ids,
+        responses,
+        rollout_logprobs,
+        rollout_expert_indices=rollout_expert_indices,
     )
     return responses, response_mask, logprobs_t, training_input
 
@@ -759,19 +774,32 @@ async def _score_responses(client, tokenizer, responses, model):
     )
 
 
-def _build_training_input(tokenizer, prompt_token_ids, responses, rollout_logprobs):
+def _build_training_input(
+    tokenizer,
+    prompt_token_ids,
+    responses,
+    rollout_logprobs,
+    rollout_expert_indices=None,
+):
     rewards = [[0.0] * len(response) for response in responses]
     loss_masks = [[1] * len(response) for response in responses]
 
-    sequences, attention_mask, response_mask, rewards_t, loss_mask_t, logprobs_t, _ = (
-        convert_prompts_responses_to_batch_tensors(
-            pad_token_id=tokenizer.pad_token_id,
-            prompts=prompt_token_ids,
-            responses=responses,
-            rewards=rewards,
-            loss_masks=loss_masks,
-            logprobs=rollout_logprobs,
-        )
+    (
+        sequences,
+        attention_mask,
+        response_mask,
+        rewards_t,
+        loss_mask_t,
+        logprobs_t,
+        route_indices_t,
+    ) = convert_prompts_responses_to_batch_tensors(
+        pad_token_id=tokenizer.pad_token_id,
+        prompts=prompt_token_ids,
+        responses=responses,
+        rewards=rewards,
+        loss_masks=loss_masks,
+        logprobs=rollout_logprobs,
+        rollout_expert_indices=rollout_expert_indices,
     )
     assert logprobs_t is not None
     num_actions = response_mask.shape[1]
@@ -784,7 +812,15 @@ def _build_training_input(tokenizer, prompt_token_ids, responses, rollout_logpro
             "rewards": rewards_t,
             "loss_mask": loss_mask_t,
             "rollout_logprobs": logprobs_t,
-            "rollout_expert_indices": None,
+            "rollout_expert_indices": route_indices_t,
+            "router_padding_mask": (
+                make_router_padding_mask(
+                    attention_mask,
+                    [len(indices) for indices in rollout_expert_indices],
+                )
+                if rollout_expert_indices is not None
+                else None
+            ),
             "action_log_probs": torch.zeros(
                 (batch_size, num_actions), dtype=torch.float32
             ),
@@ -838,6 +874,68 @@ def _assert_logprobs_changed(before, after, response_mask):
     assert mean_difference > MIN_UPDATED_LOGPROB_DIFF, (
         f"dummy LoRA update changed mean logprob by only {mean_difference:.6f}"
     )
+
+
+def _get_direct_update_metrics(label, sampler_delta, trainer_delta):
+    delta_error = (sampler_delta - trainer_delta).abs()
+    trainer_mean = trainer_delta.abs().mean().item()
+    mean_error = delta_error.mean().item()
+    p99_error = torch.quantile(delta_error.float(), 0.99).item()
+    max_error = delta_error.max().item()
+    sampler_mean = sampler_delta.abs().mean().item()
+    relative_mean_error = mean_error / trainer_mean
+    cosine = torch.nn.functional.cosine_similarity(
+        sampler_delta.float().unsqueeze(0),
+        trainer_delta.float().unsqueeze(0),
+    ).item()
+    scale = (
+        torch.dot(sampler_delta.float(), trainer_delta.float())
+        / torch.dot(trainer_delta.float(), trainer_delta.float())
+    ).item()
+    metrics = {
+        "mean": mean_error,
+        "p99": p99_error,
+        "max": max_error,
+        "sampler_mean": sampler_mean,
+        "trainer_mean": trainer_mean,
+        "relative_mean": relative_mean_error,
+        "cosine": cosine,
+        "scale": scale,
+    }
+    print(
+        f"{label}: tokens={delta_error.numel()}, "
+        f"mean_diff={mean_error:.6f}, p99_diff={p99_error:.6f}, "
+        f"max_diff={max_error:.6f}, sampler_mean={sampler_mean:.6f}, "
+        f"trainer_mean={trainer_mean:.6f}, "
+        f"relative_mean_error={relative_mean_error:.6f}, "
+        f"cosine={cosine:.6f}, scale={scale:.6f}"
+    )
+    top_count = min(10, delta_error.numel())
+    top_errors, top_indices = torch.topk(delta_error.float(), top_count)
+    print(
+        f"{label} top outliers: "
+        + ", ".join(
+            f"valid_token={index.item()} error={error.item():.6f} "
+            f"sampler={sampler_delta[index].item():.6f} "
+            f"trainer={trainer_delta[index].item():.6f}"
+            for error, index in zip(top_errors, top_indices, strict=True)
+        )
+    )
+    assert torch.isfinite(delta_error).all()
+    return metrics
+
+
+def _assert_direct_update_contract(metrics, model):
+    minimum_trainer_mean = (
+        1e-2 if model == SMALL_DRY_RUN_MODEL else MIN_DIRECT_UPDATE_MEAN
+    )
+    assert metrics["trainer_mean"] > minimum_trainer_mean
+    assert metrics["cosine"] > MIN_DIRECT_UPDATE_COSINE
+    assert MIN_DIRECT_UPDATE_SCALE < metrics["scale"] < MAX_DIRECT_UPDATE_SCALE
+    assert metrics["relative_mean"] < MAX_DIRECT_UPDATE_RELATIVE_MEAN_ERROR
+    assert metrics["mean"] < 0.075
+    assert metrics["p99"] < 0.75
+    assert metrics["max"] < 5.0
 
 
 def _init_perturbable_policy(cfg, policy_nodes, policy_gpus_per_node):
@@ -931,12 +1029,16 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
             client = engines.client
             adapter_loaded = False
             try:
-                base_responses, base_mask, base_logprobs, base_input = await _generate(
-                    client, tokenizer, model
-                )
+                (
+                    base_responses,
+                    generated_mask,
+                    _,
+                    router_replay_input,
+                ) = await _generate(client, tokenizer, model)
                 base_mask, base_logprobs, base_input = await _score_responses(
                     client, tokenizer, base_responses, model
                 )
+                assert torch.equal(generated_mask, base_mask)
 
                 with Timer("initialize_weight_sync"):
                     ray.get(
@@ -1025,6 +1127,17 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     lora_mask,
                     MEGATRON_MEAN_DIFF_THRESHOLD,
                 )
+                replay_initial_logprobs = None
+                if ROUTER_REPLAY:
+                    replay_initial_logprobs = _get_megatron_logprobs(
+                        policy, router_replay_input
+                    )
+                    _get_logprob_difference(
+                        "initialized vLLM LoRA vs Megatron router replay",
+                        lora_logprobs,
+                        replay_initial_logprobs,
+                        lora_mask,
+                    )
 
                 noise_std = (
                     FINAL_DENSE_LORA_NOISE_STD
@@ -1106,6 +1219,11 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     }
 
                 updated_logprobs = _get_megatron_logprobs(policy, lora_input)
+                updated_replay_logprobs = None
+                if ROUTER_REPLAY:
+                    updated_replay_logprobs = _get_megatron_logprobs(
+                        policy, router_replay_input
+                    )
                 _print_boundary_receipt(
                     "trainer_updated",
                     _inspect_policy_boundary(policy, "inspect_glm53_lora_parameters"),
@@ -1154,39 +1272,29 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 trainer_delta = (
                     updated_megatron_logprobs[valid] - lora_megatron_logprobs[valid]
                 )
-                delta_error = (sampler_delta - trainer_delta).abs()
-                cosine = torch.nn.functional.cosine_similarity(
-                    sampler_delta.float().unsqueeze(0),
-                    trainer_delta.float().unsqueeze(0),
-                ).item()
-                scale = (
-                    torch.dot(sampler_delta.float(), trainer_delta.float())
-                    / torch.dot(trainer_delta.float(), trainer_delta.float())
-                ).item()
-                mean_error = delta_error.mean().item()
-                trainer_mean = trainer_delta.abs().mean().item()
-                relative_mean_error = mean_error / trainer_mean
-                print(
-                    "direct update delta parity: "
-                    f"tokens={delta_error.numel()}, "
-                    f"mean_diff={mean_error:.6f}, "
-                    f"p99_diff={torch.quantile(delta_error.float(), 0.99).item():.6f}, "
-                    f"max_diff={delta_error.max().item():.6f}, "
-                    f"sampler_mean={sampler_delta.abs().mean().item():.6f}, "
-                    f"trainer_mean={trainer_mean:.6f}, "
-                    f"relative_mean_error={relative_mean_error:.6f}, "
-                    f"cosine={cosine:.6f}, scale={scale:.6f}"
+                native_metrics = _get_direct_update_metrics(
+                    "native direct update delta parity",
+                    sampler_delta,
+                    trainer_delta,
                 )
-                minimum_trainer_mean = (
-                    1e-2 if model == SMALL_DRY_RUN_MODEL else MIN_DIRECT_UPDATE_MEAN
-                )
-                assert trainer_mean > minimum_trainer_mean
-                assert cosine > MIN_DIRECT_UPDATE_COSINE
-                assert MIN_DIRECT_UPDATE_SCALE < scale < MAX_DIRECT_UPDATE_SCALE
-                assert relative_mean_error < MAX_DIRECT_UPDATE_RELATIVE_MEAN_ERROR
-                assert mean_error < 0.075
-                assert torch.quantile(delta_error.float(), 0.99).item() < 0.75
-                assert delta_error.max().item() < 5.0
+                if ROUTER_REPLAY:
+                    assert replay_initial_logprobs is not None
+                    assert updated_replay_logprobs is not None
+                    replay_delta = (
+                        updated_replay_logprobs[valid] - replay_initial_logprobs[valid]
+                    )
+                    replay_metrics = _get_direct_update_metrics(
+                        "router-replayed direct update delta parity",
+                        sampler_delta,
+                        replay_delta,
+                    )
+                    _assert_direct_update_contract(replay_metrics, model)
+                    assert replay_metrics["p99"] < native_metrics["p99"], (
+                        "Router replay passed its absolute budget but did not reduce "
+                        "the native route-sensitive p99 error"
+                    )
+                else:
+                    _assert_direct_update_contract(native_metrics, model)
                 _get_logprob_difference(
                     "dummy-updated vLLM LoRA vs Megatron LoRA",
                     updated_vllm_logprobs,
