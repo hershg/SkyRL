@@ -94,10 +94,17 @@ VLLM_LORA_TARGET_MODULES = [
 
 
 class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
-    def add_expert_lora_b_noise(self, seed: int, std: float) -> dict[str, float | int]:
+    def add_model_coordinate_lora_b_noise(
+        self, seed: int, std: float
+    ) -> dict[str, float | int]:
+        from megatron.core import parallel_state
         from megatron.core.utils import unwrap_model
 
         rank = torch.distributed.get_rank()
+        tensor_rank = parallel_state.get_tensor_model_parallel_rank()
+        expert_rank = parallel_state.get_expert_model_parallel_rank()
+        pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+        context_rank = parallel_state.get_context_parallel_rank()
         updated_parameters = 0
         updated_elements = 0
         delta_norm = 0.0
@@ -107,14 +114,13 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
             for chunk_index, chunk in enumerate(self.actor_module):
                 model = unwrap_model(chunk)
                 for name, parameter in model.named_parameters():
-                    if not (
-                        parameter.requires_grad
-                        and "experts" in name
-                        and "linear_out.weight" in name
-                    ):
+                    if not (parameter.requires_grad and "linear_out.weight" in name):
                         continue
                     digest = hashlib.sha256(
-                        f"{rank}:{chunk_index}:{name}".encode()
+                        (
+                            f"{tensor_rank}:{expert_rank}:{pipeline_rank}:"
+                            f"{chunk_index}:{name}"
+                        ).encode()
                     ).digest()
                     parameter_seed = seed + int.from_bytes(digest[:8], "little")
                     generator = torch.Generator(device=parameter.device)
@@ -137,6 +143,10 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
         assert updated_parameters > 0, "noise update found no trainable LoRA parameters"
         return {
             "rank": rank,
+            "tensor_rank": tensor_rank,
+            "expert_rank": expert_rank,
+            "pipeline_rank": pipeline_rank,
+            "context_rank": context_rank,
             "updated_parameters": updated_parameters,
             "updated_elements": updated_elements,
             "delta_norm": delta_norm,
@@ -155,22 +165,26 @@ def glm53_ray_init_fixture():
         yield
 
 
-def _get_test_topology(model: str) -> tuple[int, int]:
+def _get_test_topology(model: str) -> tuple[int, int, int]:
     if model == SMALL_DRY_RUN_MODEL:
-        return 1, 1
-    return POLICY_GPUS, INFERENCE_TP
+        return 1, 1, 1
+    return (
+        int(os.environ.get("SKYRL_GLM53_POLICY_NODES", "1")),
+        POLICY_GPUS,
+        INFERENCE_TP,
+    )
 
 
 def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
-    policy_gpus, inference_tp = _get_test_topology(model)
+    policy_nodes, policy_gpus_per_node, inference_tp = _get_test_topology(model)
     cfg = SkyRLTrainConfig()
     cfg.trainer.strategy = "megatron"
     cfg.trainer.logger = "console"
     cfg.trainer.algorithm.use_kl_loss = False
     cfg.trainer.algorithm.loss_reduction = "sequence_mean"
     cfg.trainer.placement.colocate_all = False
-    cfg.trainer.placement.policy_num_nodes = 1
-    cfg.trainer.placement.policy_num_gpus_per_node = policy_gpus
+    cfg.trainer.placement.policy_num_nodes = policy_nodes
+    cfg.trainer.placement.policy_num_gpus_per_node = policy_gpus_per_node
     cfg.trainer.policy.model.path = model
     cfg.trainer.policy.language_model_only = True
     cfg.trainer.ref.language_model_only = True
@@ -189,9 +203,23 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
     )
 
     megatron = cfg.trainer.policy.megatron_config
-    megatron.tensor_model_parallel_size = policy_gpus
-    megatron.pipeline_model_parallel_size = 1
-    megatron.context_parallel_size = 1
+    megatron.tensor_model_parallel_size = policy_gpus_per_node
+    megatron.pipeline_model_parallel_size = int(
+        os.environ.get("SKYRL_GLM53_PIPELINE_PARALLEL_SIZE", "1")
+    )
+    megatron.context_parallel_size = int(
+        os.environ.get("SKYRL_GLM53_CONTEXT_PARALLEL_SIZE", "1")
+    )
+    model_parallel_world_size = (
+        megatron.tensor_model_parallel_size
+        * megatron.pipeline_model_parallel_size
+        * megatron.context_parallel_size
+    )
+    assert policy_nodes * policy_gpus_per_node == model_parallel_world_size, (
+        "The diagnostic requires exactly one data-parallel replica: "
+        f"workers={policy_nodes * policy_gpus_per_node}, "
+        f"TPxPPxCP={model_parallel_world_size}"
+    )
     megatron.expert_model_parallel_size = 1 if model == SMALL_DRY_RUN_MODEL else 8
     megatron.expert_tensor_parallel_size = 1
     megatron.moe_token_dispatcher_type = "alltoall"
@@ -428,7 +456,7 @@ def _assert_logprobs_changed(before, after, response_mask):
     )
 
 
-def _init_perturbable_policy(cfg, policy_gpus):
+def _init_perturbable_policy(cfg, policy_nodes, policy_gpus_per_node):
     original_policy_worker = _megatron_worker_mod.PolicyWorker
     _megatron_worker_mod.PolicyWorker = _PerturbablePolicyWorker
     try:
@@ -436,8 +464,8 @@ def _init_perturbable_policy(cfg, policy_gpus):
             "policy",
             shared_pg=None,
             colocate_all=False,
-            num_nodes=1,
-            num_gpus_per_node=policy_gpus,
+            num_nodes=policy_nodes,
+            num_gpus_per_node=policy_gpus_per_node,
             cfg=cfg,
         )
     finally:
@@ -460,9 +488,11 @@ async def _create_inference_engine(stack, cfg, model):
     return await stack.enter_async_context(state)
 
 
-async def _create_policy(cfg, policy_gpus):
+async def _create_policy(cfg, policy_nodes, policy_gpus_per_node):
     with Timer("initialize_megatron"):
-        return await asyncio.to_thread(_init_perturbable_policy, cfg, policy_gpus)
+        return await asyncio.to_thread(
+            _init_perturbable_policy, cfg, policy_nodes, policy_gpus_per_node
+        )
 
 
 @pytest.mark.asyncio
@@ -470,7 +500,8 @@ async def _create_policy(cfg, policy_gpus):
 @pytest.mark.b300
 async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixture):
     model = os.environ.get("SKYRL_GLM53_MODEL", MODEL)
-    policy_gpus, inference_tp = _get_test_topology(model)
+    policy_nodes, policy_gpus_per_node, inference_tp = _get_test_topology(model)
+    policy_gpus = policy_nodes * policy_gpus_per_node
     shared_dir = Path(os.environ["SKYRL_GLM53_SHARED_DIR"])
     lora_sync_path = shared_dir / f"glm53-lora-parity-{uuid.uuid4().hex}"
     lora_sync_path.mkdir(parents=True)
@@ -490,7 +521,7 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
             with Timer("initialize_vllm_and_megatron_concurrently"):
                 init_results = await asyncio.gather(
                     _create_inference_engine(stack, cfg, model),
-                    _create_policy(cfg, policy_gpus),
+                    _create_policy(cfg, policy_nodes, policy_gpus_per_node),
                     return_exceptions=True,
                 )
             for result in init_results:
@@ -564,7 +595,7 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     update_receipts = ray.get(
                         policy.async_run_ray_method(
                             "pass_through",
-                            "add_expert_lora_b_noise",
+                            "add_model_coordinate_lora_b_noise",
                             LORA_NOISE_SEED,
                             LORA_NOISE_STD,
                         )
@@ -576,6 +607,35 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 assert {receipt["rank"] for receipt in update_receipts} == set(
                     range(policy_gpus)
                 )
+                receipts_by_model_coordinate = {}
+                for receipt in update_receipts:
+                    coordinate = (
+                        receipt["tensor_rank"],
+                        receipt["expert_rank"],
+                        receipt["pipeline_rank"],
+                    )
+                    receipts_by_model_coordinate.setdefault(coordinate, []).append(
+                        receipt
+                    )
+                for replicas in receipts_by_model_coordinate.values():
+                    assert (
+                        len(replicas)
+                        == cfg.trainer.policy.megatron_config.context_parallel_size
+                    )
+                    assert {
+                        (
+                            receipt["updated_parameters"],
+                            receipt["updated_elements"],
+                            receipt["delta_norm"],
+                        )
+                        for receipt in replicas
+                    } == {
+                        (
+                            replicas[0]["updated_parameters"],
+                            replicas[0]["updated_elements"],
+                            replicas[0]["delta_norm"],
+                        )
+                    }
 
                 updated_logprobs = _get_megatron_logprobs(policy, lora_input)
                 _assert_logprobs_changed(
@@ -606,6 +666,33 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 updated_megatron_logprobs = _get_megatron_logprobs(
                     policy, updated_input
                 )
+                valid = updated_mask.bool()
+                sampler_delta = updated_vllm_logprobs[valid] - lora_logprobs[valid]
+                trainer_delta = (
+                    updated_megatron_logprobs[valid] - lora_megatron_logprobs[valid]
+                )
+                delta_error = (sampler_delta - trainer_delta).abs()
+                cosine = torch.nn.functional.cosine_similarity(
+                    sampler_delta.float().unsqueeze(0),
+                    trainer_delta.float().unsqueeze(0),
+                ).item()
+                scale = (
+                    torch.dot(sampler_delta.float(), trainer_delta.float())
+                    / torch.dot(trainer_delta.float(), trainer_delta.float())
+                ).item()
+                print(
+                    "direct update delta parity: "
+                    f"tokens={delta_error.numel()}, "
+                    f"mean_diff={delta_error.mean().item():.6f}, "
+                    f"p99_diff={torch.quantile(delta_error.float(), 0.99).item():.6f}, "
+                    f"max_diff={delta_error.max().item():.6f}, "
+                    f"sampler_mean={sampler_delta.abs().mean().item():.6f}, "
+                    f"trainer_mean={trainer_delta.abs().mean().item():.6f}, "
+                    f"cosine={cosine:.6f}, scale={scale:.6f}"
+                )
+                assert delta_error.mean().item() < 0.075
+                assert torch.quantile(delta_error.float(), 0.99).item() < 0.75
+                assert delta_error.max().item() < 5.0
                 _assert_logprobs_match(
                     "dummy-updated vLLM LoRA vs Megatron LoRA",
                     updated_vllm_logprobs,
