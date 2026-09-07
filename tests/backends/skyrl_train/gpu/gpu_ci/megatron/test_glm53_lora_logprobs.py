@@ -15,6 +15,7 @@ SKYRL_GLM53_RAY_ADDRESS=auto
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -308,6 +309,29 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
                 ],
             }
         return receipt
+
+    def inspect_glm53_kv_scales(self) -> dict:
+        scales = []
+        for name, module in sorted(
+            self.model_runner.compilation_config.static_forward_context.items()
+        ):
+            if not hasattr(module, "_k_scale"):
+                continue
+            k_scale = module._k_scale.item()
+            v_scale = module._v_scale.item()
+            assert math.isfinite(k_scale)
+            assert math.isfinite(v_scale)
+            scales.append(
+                {
+                    "name": name,
+                    "kv_cache_dtype": str(module.kv_cache_dtype),
+                    "calculate_kv_scales": module.calculate_kv_scales,
+                    "k_scale": k_scale,
+                    "v_scale": v_scale,
+                }
+            )
+        assert scales
+        return {"hostname": socket.gethostname(), "scales": scales}
 
     def check_glm53_attention_lora_kernels(self) -> dict:
         from vllm.lora.layers import LoRAMapping
@@ -718,9 +742,16 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
     inference.max_num_batched_tokens = max_sequence_length
     inference.enable_prefix_caching = False
     inference.enable_chunked_prefill = True
+    kv_cache_dtype = os.environ.get("SKYRL_GLM53_KV_CACHE_DTYPE", "fp8")
+    assert kv_cache_dtype in {"auto", "fp8"}
+    calculate_kv_scales = os.environ.get(
+        "SKYRL_GLM53_CALCULATE_KV_SCALES", "0"
+    )
+    assert calculate_kv_scales in {"0", "1"}
     inference.engine_init_kwargs = {
         "max_model_len": 32768,
-        "kv_cache_dtype": "fp8",
+        "kv_cache_dtype": kv_cache_dtype,
+        "calculate_kv_scales": calculate_kv_scales == "1",
         "disable_custom_all_reduce": True,
         "linear_backend": "triton",
         "moe_backend": "triton",
@@ -953,6 +984,13 @@ async def _inspect_vllm_boundary(client):
     )
 
 
+async def _inspect_vllm_kv_scales(client):
+    return await client._call_all_servers(
+        "/collective_rpc",
+        {"method": "inspect_glm53_kv_scales", "kwargs": {}},
+    )
+
+
 async def _check_vllm_attention_kernels(client):
     return await client._call_all_servers(
         "/collective_rpc",
@@ -1001,6 +1039,9 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 )
                 base_mask, base_logprobs, base_input = await _score_responses(
                     client, tokenizer, base_responses, model
+                )
+                _print_boundary_receipt(
+                    "vllm_kv_scales", await _inspect_vllm_kv_scales(client)
                 )
 
                 with Timer("initialize_weight_sync"):
