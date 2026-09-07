@@ -486,6 +486,7 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    completed = False
     try:
         async with AsyncExitStack() as stack:
             with Timer("initialize_vllm_and_megatron_concurrently"):
@@ -617,5 +618,9 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
             finally:
                 if adapter_loaded:
                     await client.unload_lora_adapter(resolve_policy_model_name(cfg))
+        completed = True
     finally:
-        shutil.rmtree(lora_sync_path)
+        if completed:
+            shutil.rmtree(lora_sync_path)
+        else:
+            print(f"preserved failed adapter evidence at {lora_sync_path}")
