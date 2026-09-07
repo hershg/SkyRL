@@ -59,8 +59,13 @@ MAX_GENERATE_LENGTH = 128
 MEGATRON_MEAN_DIFF_THRESHOLD = 5e-2
 VLLM_MEAN_DIFF_THRESHOLD = 3e-1
 LORA_NOISE_SEED = 42
-LORA_NOISE_STD = 1e-3
+LORA_NOISE_STD = 1e-2
 MIN_UPDATED_LOGPROB_DIFF = 1e-5
+MIN_DIRECT_UPDATE_MEAN = 0.1
+MIN_DIRECT_UPDATE_COSINE = 0.8
+MIN_DIRECT_UPDATE_SCALE = 0.5
+MAX_DIRECT_UPDATE_SCALE = 1.5
+MAX_DIRECT_UPDATE_RELATIVE_MEAN_ERROR = 0.5
 
 TEST_PROMPTS = [
     "What is 2 + 3? Answer with only the number.",
@@ -684,17 +689,25 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     torch.dot(sampler_delta.float(), trainer_delta.float())
                     / torch.dot(trainer_delta.float(), trainer_delta.float())
                 ).item()
+                mean_error = delta_error.mean().item()
+                trainer_mean = trainer_delta.abs().mean().item()
+                relative_mean_error = mean_error / trainer_mean
                 print(
                     "direct update delta parity: "
                     f"tokens={delta_error.numel()}, "
-                    f"mean_diff={delta_error.mean().item():.6f}, "
+                    f"mean_diff={mean_error:.6f}, "
                     f"p99_diff={torch.quantile(delta_error.float(), 0.99).item():.6f}, "
                     f"max_diff={delta_error.max().item():.6f}, "
                     f"sampler_mean={sampler_delta.abs().mean().item():.6f}, "
-                    f"trainer_mean={trainer_delta.abs().mean().item():.6f}, "
+                    f"trainer_mean={trainer_mean:.6f}, "
+                    f"relative_mean_error={relative_mean_error:.6f}, "
                     f"cosine={cosine:.6f}, scale={scale:.6f}"
                 )
-                assert delta_error.mean().item() < 0.075
+                assert trainer_mean > MIN_DIRECT_UPDATE_MEAN
+                assert cosine > MIN_DIRECT_UPDATE_COSINE
+                assert MIN_DIRECT_UPDATE_SCALE < scale < MAX_DIRECT_UPDATE_SCALE
+                assert relative_mean_error < MAX_DIRECT_UPDATE_RELATIVE_MEAN_ERROR
+                assert mean_error < 0.075
                 assert torch.quantile(delta_error.float(), 0.99).item() < 0.75
                 assert delta_error.max().item() < 5.0
                 _assert_logprobs_match(
