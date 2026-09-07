@@ -29,6 +29,7 @@ import numpy as np
 import pytest
 import ray
 import torch
+from huggingface_hub import snapshot_download
 
 from skyrl.backends.skyrl_train.distributed.dispatch import (
     WorkerOutput,
@@ -60,6 +61,10 @@ from skyrl.train.dataset.preprocess import (
 from skyrl.train.utils.utils import validate_cfg
 from skyrl.utils.tok import get_tokenizer
 from tests.backends.skyrl_train.gpu.gpu_ci.conftest import ray_init
+from tests.backends.skyrl_train.gpu.gpu_ci.megatron.glm53_fixed_responses import (
+    load_fixed_responses,
+    save_fixed_responses,
+)
 from tests.backends.skyrl_train.gpu.utils import (
     InferenceEngineState,
     Timer,
@@ -542,7 +547,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                     digest = hashlib.sha256(parameter_key.encode()).digest()
                     parameter_seed = seed + int.from_bytes(digest[:8], "little")
                     update_fingerprint.update(
-                        (f"{parameter_key}:{tuple(parameter.shape)}:" f"{parameter.dtype}:{parameter_seed}").encode()
+                        (f"{parameter_key}:{tuple(parameter.shape)}:{parameter.dtype}:{parameter_seed}").encode()
                     )
                     generator = torch.Generator(device=parameter.device)
                     generator.manual_seed(parameter_seed % (2**63 - 1))
@@ -1109,6 +1114,11 @@ async def _inspect_vllm_boundary(client):
 @pytest.mark.b300
 async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixture):
     model = os.environ.get("SKYRL_GLM53_MODEL", MODEL)
+    model_revision = os.environ.get("SKYRL_GLM53_MODEL_REVISION")
+    if model_revision:
+        assert re.fullmatch(r"[0-9a-f]{40}", model_revision)
+        model = snapshot_download(model, revision=model_revision, local_files_only=True)
+        print(json.dumps({"model_snapshot": model, "model_revision": model_revision}))
     update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
     policy_nodes, policy_gpus_per_node, inference_tp = _get_test_topology(model)
     policy_gpus = policy_nodes * policy_gpus_per_node
@@ -1124,6 +1134,13 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
     tokenizer = get_tokenizer(model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    fixed_response_path = os.environ.get("SKYRL_GLM53_FIXED_RESPONSES")
+    fixed_responses = (
+        load_fixed_responses(Path(fixed_response_path), _get_prompt_token_ids(tokenizer))
+        if fixed_response_path
+        else None
+    )
 
     completed = False
     try:
@@ -1141,14 +1158,26 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
             client = engines.client
             adapter_loaded = False
             try:
-                (
-                    base_responses,
-                    generated_mask,
-                    _,
-                    _,
-                ) = await _generate(client, tokenizer, model)
+                generated_mask = None
+                if fixed_responses is None:
+                    base_responses, generated_mask, _, _ = await _generate(client, tokenizer, model)
+                else:
+                    base_responses = fixed_responses
+                datum_path = shared_dir / f"fixed-responses-{uuid.uuid4().hex}.json"
+                save_fixed_responses(datum_path, _get_prompt_token_ids(tokenizer), base_responses)
+                print(
+                    json.dumps(
+                        {
+                            "fixed_response_artifact": str(datum_path),
+                            "sha256": hashlib.sha256(datum_path.read_bytes()).hexdigest(),
+                            "response_tokens": sum(map(len, base_responses)),
+                            "reused": fixed_responses is not None,
+                        }
+                    )
+                )
                 base_mask, base_logprobs, base_input = await _score_responses(client, tokenizer, base_responses, model)
-                assert torch.equal(generated_mask, base_mask)
+                if generated_mask is not None:
+                    assert torch.equal(generated_mask, base_mask)
 
                 with Timer("initialize_weight_sync"):
                     ray.get(
