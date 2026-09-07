@@ -136,6 +136,24 @@ def _get_weight_receipt(weight) -> list[dict] | dict | None:
     return _get_sampled_tensor_receipt(weight)
 
 
+def _get_expert_weight_receipt(weight) -> list[dict] | dict | None:
+    def add_expert_slices(tensor: torch.Tensor) -> dict:
+        receipt = _get_sampled_tensor_receipt(tensor)
+        if tensor.ndim >= 3:
+            expert_indices = sorted({0, tensor.shape[0] // 2, tensor.shape[0] - 1})
+            receipt["representative_experts"] = {
+                str(index): _get_sampled_tensor_receipt(tensor[index])
+                for index in expert_indices
+            }
+        return receipt
+
+    if weight is None:
+        return None
+    if isinstance(weight, (list, tuple)):
+        return [add_expert_slices(tensor) for tensor in weight]
+    return add_expert_slices(weight)
+
+
 def _get_final_layer_names(names: list[str], marker: str) -> list[str]:
     matched = []
     for name in names:
@@ -146,6 +164,31 @@ def _get_final_layer_names(names: list[str], marker: str) -> list[str]:
         return []
     final_layer = max(layer for layer, _ in matched)
     return sorted(name for layer, name in matched if layer == final_layer)
+
+
+def _get_representative_expert_names(names: list[str]) -> list[str]:
+    final_layer_names = _get_final_layer_names(names, ".mlp.experts")
+    names_by_expert: dict[int, list[str]] = {}
+    for name in final_layer_names:
+        expert_match = re.search(r"\.experts\.(\d+)\.", name)
+        if expert_match is not None:
+            names_by_expert.setdefault(int(expert_match.group(1)), []).append(name)
+    if names_by_expert:
+        expert_ids = sorted(names_by_expert)
+        representative_ids = {
+            expert_ids[0],
+            expert_ids[len(expert_ids) // 2],
+            expert_ids[-1],
+        }
+        return sorted(
+            name
+            for expert_id in representative_ids
+            for name in names_by_expert[expert_id]
+        )
+    if len(final_layer_names) <= 12:
+        return final_layer_names
+    indices = torch.linspace(0, len(final_layer_names) - 1, steps=12).long()
+    return [final_layer_names[index] for index in indices]
 
 
 class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
@@ -173,7 +216,7 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
         receipt["cached_adapter"] = {
             name: {
                 "lora_a": _get_weight_receipt(adapter.loras[name].lora_a),
-                "lora_b": _get_weight_receipt(adapter.loras[name].lora_b),
+                "lora_b": _get_expert_weight_receipt(adapter.loras[name].lora_b),
                 "scaling": adapter.loras[name].scaling,
             }
             for name in cached_names
@@ -185,6 +228,7 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
         receipt["kernel_buffers"] = {}
         for name in module_names:
             module = adapter_manager.modules[name]
+            expert_map = module.base_layer.routed_experts.expert_map
             receipt["kernel_buffers"][name] = {
                 "module_type": type(module).__name__,
                 "ep_rank": module.ep_rank,
@@ -193,20 +237,25 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
                 "tp_rank": module.tp_rank,
                 "tp_size": module.tp_size,
                 "enable_moe_shared_loras": module.enable_moe_shared_loras,
+                "expert_map": (
+                    expert_map.detach().cpu().tolist()
+                    if expert_map is not None
+                    else None
+                ),
                 "w13_lora_a": [
-                    _get_sampled_tensor_receipt(tensor[slot])
+                    _get_expert_weight_receipt(tensor[slot])
                     for tensor in module.w13_lora_a_stacked
                 ],
                 "w13_lora_b": [
-                    _get_sampled_tensor_receipt(tensor[slot])
+                    _get_expert_weight_receipt(tensor[slot])
                     for tensor in module.w13_lora_b_stacked
                 ],
                 "w2_lora_a": [
-                    _get_sampled_tensor_receipt(tensor[slot])
+                    _get_expert_weight_receipt(tensor[slot])
                     for tensor in module.w2_lora_a_stacked
                 ],
                 "w2_lora_b": [
-                    _get_sampled_tensor_receipt(tensor[slot])
+                    _get_expert_weight_receipt(tensor[slot])
                     for tensor in module.w2_lora_b_stacked
                 ],
             }
@@ -266,12 +315,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                 for dimension in shape:
                     numel *= dimension
                 total_bytes += numel * dtype_sizes[dtype]
-            final_expert_names = _get_final_layer_names(keys, ".mlp.experts")
-            if len(final_expert_names) > 12:
-                indices = torch.linspace(
-                    0, len(final_expert_names) - 1, steps=12
-                ).long()
-                final_expert_names = [final_expert_names[index] for index in indices]
+            final_expert_names = _get_representative_expert_names(keys)
             receipt.update(
                 {
                     "key_count": len(keys),
@@ -1009,7 +1053,10 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     f"relative_mean_error={relative_mean_error:.6f}, "
                     f"cosine={cosine:.6f}, scale={scale:.6f}"
                 )
-                assert trainer_mean > MIN_DIRECT_UPDATE_MEAN
+                minimum_trainer_mean = (
+                    1e-2 if model == SMALL_DRY_RUN_MODEL else MIN_DIRECT_UPDATE_MEAN
+                )
+                assert trainer_mean > minimum_trainer_mean
                 assert cosine > MIN_DIRECT_UPDATE_COSINE
                 assert MIN_DIRECT_UPDATE_SCALE < scale < MAX_DIRECT_UPDATE_SCALE
                 assert relative_mean_error < MAX_DIRECT_UPDATE_RELATIVE_MEAN_ERROR
