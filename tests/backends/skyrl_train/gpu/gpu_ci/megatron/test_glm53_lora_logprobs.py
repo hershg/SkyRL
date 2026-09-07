@@ -246,6 +246,10 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
         "recompute_num_layers": 1,
         "recompute_modules": [],
     }
+    if megatron.pipeline_model_parallel_size == 2:
+        # GLM's DSA top-k indices are shared in four-layer groups. Each pipeline
+        # stage must therefore start on a layer that computes its own indices.
+        megatron.transformer_config_kwargs["num_layers_in_first_pipeline_stage"] = 38
     if model == SMALL_DRY_RUN_MODEL:
         megatron.transformer_config_kwargs = {
             "calculate_per_token_loss": True,
