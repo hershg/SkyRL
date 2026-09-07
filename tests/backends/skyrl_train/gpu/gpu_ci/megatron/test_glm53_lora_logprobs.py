@@ -261,8 +261,6 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
         module_names = _get_final_layer_names(
             list(adapter_manager.modules), module_marker
         )
-        if final_expert_fc2:
-            module_names = [name for name in module_names if ".down_proj" in name]
         receipt["kernel_buffers"] = {}
         for name in module_names:
             module = adapter_manager.modules[name]
