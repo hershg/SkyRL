@@ -14,9 +14,11 @@ SKYRL_GLM53_RAY_ADDRESS=auto
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import shutil
+import socket
 import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -32,6 +34,9 @@ from skyrl.backends.skyrl_train.distributed.dispatch import (
 from skyrl.backends.skyrl_train.inference_servers.base import InferenceEngineInput
 from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
     get_sampling_params_for_backend,
+)
+from skyrl.backends.skyrl_train.inference_servers.new_inference_worker_wrap import (
+    NewInferenceWorkerWrap,
 )
 from skyrl.backends.skyrl_train.inference_servers.utils import resolve_policy_model_name
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
@@ -99,7 +104,189 @@ VLLM_LORA_TARGET_MODULES = [
 ]
 
 
+def _get_sampled_tensor_receipt(tensor: torch.Tensor) -> dict:
+    flat = tensor.detach().reshape(-1)
+    sample_count = min(64, flat.numel())
+    if sample_count:
+        indices = torch.linspace(
+            0,
+            flat.numel() - 1,
+            steps=sample_count,
+            device=flat.device,
+        ).long()
+        sample = flat.index_select(0, indices).float().cpu()
+    else:
+        sample = torch.empty(0, dtype=torch.float32)
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "numel": tensor.numel(),
+        "sample_sha256": hashlib.sha256(sample.numpy().tobytes()).hexdigest(),
+        "sample_mean": sample.mean().item() if sample_count else 0.0,
+        "sample_l2": torch.linalg.vector_norm(sample).item() if sample_count else 0.0,
+        "sample_values": sample[:8].tolist(),
+    }
+
+
+def _get_weight_receipt(weight) -> list[dict] | dict | None:
+    if weight is None:
+        return None
+    if isinstance(weight, (list, tuple)):
+        return [_get_sampled_tensor_receipt(tensor) for tensor in weight]
+    return _get_sampled_tensor_receipt(weight)
+
+
+def _get_final_layer_names(names: list[str], marker: str) -> list[str]:
+    matched = []
+    for name in names:
+        layer_match = re.search(r"\.layers\.(\d+)\.", name)
+        if marker in name and layer_match is not None:
+            matched.append((int(layer_match.group(1)), name))
+    if not matched:
+        return []
+    final_layer = max(layer for layer, _ in matched)
+    return sorted(name for layer, name in matched if layer == final_layer)
+
+
+class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
+    def inspect_glm53_lora_buffers(self) -> dict:
+        worker_manager = self.model_runner.lora_manager
+        adapter_manager = worker_manager._adapter_manager
+        adapter_ids = sorted(adapter_manager.list_adapters())
+        receipt = {
+            "hostname": socket.gethostname(),
+            "adapter_ids": adapter_ids,
+            "slot_layout": adapter_manager.lora_index_to_id,
+            "enable_mixed_moe_lora_format": adapter_manager._enable_mixed_moe_lora_format,
+            "enable_moe_shared_loras": adapter_manager._enable_moe_shared_loras,
+            "is_3d_moe_model": adapter_manager._is_3d_moe_model,
+            "use_ep": adapter_manager._use_ep,
+        }
+        if len(adapter_ids) != 1:
+            return receipt
+
+        adapter_id = adapter_ids[0]
+        slot = adapter_manager.lora_index_to_id.index(adapter_id)
+        adapter = adapter_manager.get_adapter(adapter_id)
+        assert adapter is not None
+        cached_names = _get_final_layer_names(list(adapter.loras), ".mlp.experts")
+        receipt["cached_adapter"] = {
+            name: {
+                "lora_a": _get_weight_receipt(adapter.loras[name].lora_a),
+                "lora_b": _get_weight_receipt(adapter.loras[name].lora_b),
+                "scaling": adapter.loras[name].scaling,
+            }
+            for name in cached_names
+        }
+
+        module_names = _get_final_layer_names(
+            list(adapter_manager.modules), ".mlp.experts"
+        )
+        receipt["kernel_buffers"] = {}
+        for name in module_names:
+            module = adapter_manager.modules[name]
+            receipt["kernel_buffers"][name] = {
+                "module_type": type(module).__name__,
+                "ep_rank": module.ep_rank,
+                "global_num_experts": module.global_num_experts,
+                "local_num_experts": module.local_num_experts,
+                "tp_rank": module.tp_rank,
+                "tp_size": module.tp_size,
+                "enable_moe_shared_loras": module.enable_moe_shared_loras,
+                "w13_lora_a": [
+                    _get_sampled_tensor_receipt(tensor[slot])
+                    for tensor in module.w13_lora_a_stacked
+                ],
+                "w13_lora_b": [
+                    _get_sampled_tensor_receipt(tensor[slot])
+                    for tensor in module.w13_lora_b_stacked
+                ],
+                "w2_lora_a": [
+                    _get_sampled_tensor_receipt(tensor[slot])
+                    for tensor in module.w2_lora_a_stacked
+                ],
+                "w2_lora_b": [
+                    _get_sampled_tensor_receipt(tensor[slot])
+                    for tensor in module.w2_lora_b_stacked
+                ],
+            }
+        return receipt
+
+
 class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
+    def inspect_glm53_lora_parameters(self) -> dict:
+        from megatron.core import parallel_state
+        from megatron.core.utils import unwrap_model
+
+        selected = {}
+        for chunk in self.actor_module:
+            model = unwrap_model(chunk)
+            names = _get_final_layer_names(
+                [name for name, _ in model.named_parameters()], ".mlp.experts."
+            )
+            parameters = dict(model.named_parameters())
+            for name in names:
+                if "linear_out.weight" in name:
+                    selected[name] = _get_sampled_tensor_receipt(parameters[name])
+        return {
+            "hostname": socket.gethostname(),
+            "rank": torch.distributed.get_rank(),
+            "tensor_rank": parallel_state.get_tensor_model_parallel_rank(),
+            "expert_rank": parallel_state.get_expert_model_parallel_rank(),
+            "pipeline_rank": parallel_state.get_pipeline_model_parallel_rank(),
+            "context_rank": parallel_state.get_context_parallel_rank(),
+            "parameters": selected,
+        }
+
+    def inspect_glm53_exported_adapter(self, lora_sync_path: str) -> dict:
+        from safetensors import safe_open
+
+        rank = torch.distributed.get_rank()
+        path = Path(lora_sync_path) / "adapter_model.safetensors"
+        receipt = {
+            "hostname": socket.gethostname(),
+            "rank": rank,
+            "path": str(path),
+            "exists": path.exists(),
+        }
+        if rank != 0 or not path.exists():
+            return receipt
+
+        dtype_sizes = {"F32": 4, "BF16": 2, "F16": 2, "F64": 8}
+        with safe_open(path, framework="pt", device="cpu") as adapter:
+            keys = list(adapter.keys())
+            schema = []
+            total_bytes = 0
+            for name in keys:
+                tensor_slice = adapter.get_slice(name)
+                shape = list(tensor_slice.get_shape())
+                dtype = tensor_slice.get_dtype()
+                schema.append((name, shape, dtype))
+                numel = 1
+                for dimension in shape:
+                    numel *= dimension
+                total_bytes += numel * dtype_sizes[dtype]
+            final_expert_names = _get_final_layer_names(keys, ".mlp.experts")
+            if len(final_expert_names) > 12:
+                indices = torch.linspace(
+                    0, len(final_expert_names) - 1, steps=12
+                ).long()
+                final_expert_names = [final_expert_names[index] for index in indices]
+            receipt.update(
+                {
+                    "key_count": len(keys),
+                    "total_bytes": total_bytes,
+                    "schema_sha256": hashlib.sha256(
+                        json.dumps(schema, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    "representative_tensors": {
+                        name: _get_sampled_tensor_receipt(adapter.get_tensor(name))
+                        for name in final_expert_names
+                    },
+                }
+            )
+        return receipt
+
     def add_shard_symmetric_lora_b_noise(
         self, seed: int, std: float
     ) -> dict[str, float | int | str]:
@@ -143,7 +330,8 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                         if (
                             not is_routed_expert
                             or parallel_state.get_pipeline_model_parallel_rank()
-                            != parallel_state.get_pipeline_model_parallel_world_size() - 1
+                            != parallel_state.get_pipeline_model_parallel_world_size()
+                            - 1
                             or layer_match is None
                             or int(layer_match.group(1)) != final_local_layer
                         ):
@@ -184,7 +372,9 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
             )
             assert (updated_parameters > 0) == is_final_pipeline_stage
         else:
-            assert updated_parameters > 0, "noise update found no trainable LoRA parameters"
+            assert updated_parameters > 0, (
+                "noise update found no trainable LoRA parameters"
+            )
         return {
             "rank": rank,
             "tensor_rank": tensor_rank,
@@ -344,6 +534,9 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
             "disable_custom_all_reduce": True,
             "trust_remote_code": True,
         }
+    inference.engine_init_kwargs["worker_extension_cls"] = (
+        f"{__name__}._InspectableInferenceWorkerWrap"
+    )
 
     cfg.generator.sampling_params = SamplingParams(
         max_generate_length=MAX_GENERATE_LENGTH,
@@ -545,6 +738,21 @@ async def _create_policy(cfg, policy_nodes, policy_gpus_per_node):
         )
 
 
+def _print_boundary_receipt(label: str, receipt) -> None:
+    print(f"GLM53_LORA_BOUNDARY {label} {json.dumps(receipt, sort_keys=True)}")
+
+
+def _inspect_policy_boundary(policy, method: str, *args):
+    return ray.get(policy.async_run_ray_method("pass_through", method, *args))
+
+
+async def _inspect_vllm_boundary(client):
+    return await client._call_all_servers(
+        "/collective_rpc",
+        {"method": "inspect_glm53_lora_buffers", "kwargs": {}},
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.megatron
 @pytest.mark.b300
@@ -606,6 +814,10 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     base_mask,
                     MEGATRON_MEAN_DIFF_THRESHOLD,
                 )
+                _print_boundary_receipt(
+                    "trainer_initial",
+                    _inspect_policy_boundary(policy, "inspect_glm53_lora_parameters"),
+                )
 
                 with Timer("publish_initialized_lora"):
                     ray.get(
@@ -618,6 +830,17 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     )
                 adapter_loaded = True
                 await client.reset_prefix_cache()
+                _print_boundary_receipt(
+                    "export_initial",
+                    _inspect_policy_boundary(
+                        policy,
+                        "inspect_glm53_exported_adapter",
+                        str(lora_sync_path),
+                    ),
+                )
+                _print_boundary_receipt(
+                    "vllm_initial", await _inspect_vllm_boundary(client)
+                )
 
                 adapter_name = resolve_policy_model_name(cfg)
                 lora_mask, lora_logprobs, lora_input = await _score_responses(
@@ -715,6 +938,10 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     }
 
                 updated_logprobs = _get_megatron_logprobs(policy, lora_input)
+                _print_boundary_receipt(
+                    "trainer_updated",
+                    _inspect_policy_boundary(policy, "inspect_glm53_lora_parameters"),
+                )
                 _assert_logprobs_changed(
                     lora_megatron_logprobs, updated_logprobs, lora_mask
                 )
@@ -732,6 +959,17 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     )
                 adapter_loaded = True
                 await client.reset_prefix_cache()
+                _print_boundary_receipt(
+                    "export_updated",
+                    _inspect_policy_boundary(
+                        policy,
+                        "inspect_glm53_exported_adapter",
+                        str(lora_sync_path),
+                    ),
+                )
+                _print_boundary_receipt(
+                    "vllm_updated", await _inspect_vllm_boundary(client)
+                )
 
                 (
                     updated_mask,
