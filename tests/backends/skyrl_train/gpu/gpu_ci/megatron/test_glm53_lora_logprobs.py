@@ -319,19 +319,29 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
                 continue
             k_scale = module._k_scale.item()
             v_scale = module._v_scale.item()
+            k_scale_float = module._k_scale_float
+            v_scale_float = module._v_scale_float
             assert math.isfinite(k_scale)
             assert math.isfinite(v_scale)
+            assert math.isfinite(k_scale_float)
+            assert math.isfinite(v_scale_float)
             scales.append(
                 {
                     "name": name,
+                    "attention_backend": module.attn_backend.get_name(),
                     "kv_cache_dtype": str(module.kv_cache_dtype),
-                    "calculate_kv_scales": module.calculate_kv_scales,
                     "k_scale": k_scale,
                     "v_scale": v_scale,
+                    "k_scale_float": k_scale_float,
+                    "v_scale_float": v_scale_float,
                 }
             )
         assert scales
-        return {"hostname": socket.gethostname(), "scales": scales}
+        return {
+            "hostname": socket.gethostname(),
+            "runtime_cache_dtype": str(self.model_runner.cache_config.cache_dtype),
+            "scales": scales,
+        }
 
     def check_glm53_attention_lora_kernels(self) -> dict:
         from vllm.lora.layers import LoRAMapping
