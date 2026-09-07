@@ -461,7 +461,15 @@ class VLLMServerActor(ServerActorProtocol):
                     lora_path=lora_path,
                     load_inplace=True,
                 )
+                load_started = time.monotonic()
                 await models.engine_client.add_lora(lora_request)
+                load_seconds = time.monotonic() - load_started
+                logger.info(
+                    "vLLM LoRA load complete: name={}, path={}, seconds={:.3f}",
+                    lora_name,
+                    lora_path,
+                    load_seconds,
+                )
                 lora_request.load_inplace = False
                 models.lora_requests[lora_name] = lora_request
 

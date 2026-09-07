@@ -1,5 +1,6 @@
 import os
 import shutil
+import time
 from collections import defaultdict
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -1473,11 +1474,42 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         )
         from safetensors.torch import save_file
 
+        rank = torch.distributed.get_rank()
+        publication_started = time.monotonic()
+        export_seconds = 0.0
+        host_cast_seconds = 0.0
         adapter_state = {}
-        for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=True, show_progress=False):
-            adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
+        adapter_weights = iter(self.bridge.export_adapter_weights(self.actor_module, cpu=True, show_progress=False))
+        while True:
+            export_started = time.monotonic()
+            try:
+                name, tensor = next(adapter_weights)
+            except StopIteration:
+                export_seconds += time.monotonic() - export_started
+                break
+            export_seconds += time.monotonic() - export_started
 
-        if torch.distributed.get_rank() == 0:
+            host_cast_started = time.monotonic()
+            adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
+            host_cast_seconds += time.monotonic() - host_cast_started
+
+        exported_bytes = sum(tensor.numel() * tensor.element_size() for tensor in adapter_state.values())
+        logger.info(
+            "LoRA publication export complete: rank={}, tensors={}, bytes={}, "
+            "export_seconds={:.3f}, host_cast_seconds={:.3f}",
+            rank,
+            len(adapter_state),
+            exported_bytes,
+            export_seconds,
+            host_cast_seconds,
+        )
+
+        layout_seconds = 0.0
+        serialization_seconds = 0.0
+        inference_load_seconds = 0.0
+        serialized_bytes = 0
+        if rank == 0:
+            layout_started = time.monotonic()
             os.makedirs(lora_sync_path, exist_ok=True)
 
             # Rewrite fused-MoE expert LoRA into vLLM's flat PEFT layout so
@@ -1499,23 +1531,47 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 target_modules=target_modules,
                 base_model_name_or_path=base_model_name_or_path,
             )
+            layout_seconds = time.monotonic() - layout_started
+            serialized_bytes = sum(tensor.numel() * tensor.element_size() for tensor in adapter_state.values())
 
+            serialization_started = time.monotonic()
             save_file(adapter_state, os.path.join(lora_sync_path, "adapter_model.safetensors"))
             with open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
                 json.dump(adapter_config, f, ensure_ascii=False, indent=4)
+            serialization_seconds = time.monotonic() - serialization_started
 
             # Send LoRA disk loading request to inference engine.
             from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
                 RemoteInferenceClient,
             )
 
+            inference_load_started = time.monotonic()
             if isinstance(inference_engine_client, RemoteInferenceClient):
                 await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
             else:
                 lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
                 await inference_engine_client.update_named_weights(lora_request)
+            inference_load_seconds = time.monotonic() - inference_load_started
 
+        barrier_started = time.monotonic()
         torch.distributed.barrier()
+        barrier_seconds = time.monotonic() - barrier_started
+        logger.info(
+            "LoRA publication complete: rank={}, exported_bytes={}, serialized_bytes={}, "
+            "export_seconds={:.3f}, host_cast_seconds={:.3f}, layout_seconds={:.3f}, "
+            "serialization_seconds={:.3f}, inference_load_seconds={:.3f}, "
+            "barrier_seconds={:.3f}, total_seconds={:.3f}",
+            rank,
+            exported_bytes,
+            serialized_bytes,
+            export_seconds,
+            host_cast_seconds,
+            layout_seconds,
+            serialization_seconds,
+            inference_load_seconds,
+            barrier_seconds,
+            time.monotonic() - publication_started,
+        )
 
     async def broadcast_to_inference_engines(
         self,
