@@ -66,6 +66,8 @@ MEGATRON_MEAN_DIFF_THRESHOLD = 5e-2
 VLLM_MEAN_DIFF_THRESHOLD = 3e-1
 LORA_NOISE_SEED = 42
 LORA_NOISE_STD = 1e-2
+FINAL_DENSE_LORA_NOISE_STD = 0.75
+MAX_FULL_HASH_NUMEL = 1_000_000
 MIN_UPDATED_LOGPROB_DIFF = 1e-5
 MIN_DIRECT_UPDATE_MEAN = 0.1
 MIN_DIRECT_UPDATE_COSINE = 0.8
@@ -123,7 +125,7 @@ def _get_sampled_tensor_receipt(tensor: torch.Tensor) -> dict:
         sample = flat.index_select(0, indices).float().cpu()
     else:
         sample = torch.empty(0, dtype=torch.float32)
-    return {
+    receipt = {
         "shape": list(tensor.shape),
         "dtype": str(tensor.dtype),
         "numel": tensor.numel(),
@@ -132,6 +134,12 @@ def _get_sampled_tensor_receipt(tensor: torch.Tensor) -> dict:
         "sample_l2": torch.linalg.vector_norm(sample).item() if sample_count else 0.0,
         "sample_values": sample[:8].tolist(),
     }
+    if tensor.numel() <= MAX_FULL_HASH_NUMEL:
+        tensor_bytes = tensor.detach().contiguous().view(torch.uint8).cpu()
+        receipt["full_sha256"] = hashlib.sha256(
+            tensor_bytes.numpy().tobytes()
+        ).hexdigest()
+    return receipt
 
 
 def test_sample_indices_stay_in_bounds_above_float32_integer_range():
@@ -481,6 +489,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
             "pipeline_rank": pipeline_rank,
             "context_rank": context_rank,
             "update_scope": update_scope,
+            "noise_std": std,
             "updated_parameters": updated_parameters,
             "updated_elements": updated_elements,
             "delta_norm": delta_norm,
@@ -976,13 +985,18 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     MEGATRON_MEAN_DIFF_THRESHOLD,
                 )
 
+                noise_std = (
+                    FINAL_DENSE_LORA_NOISE_STD
+                    if update_scope == "final_dense"
+                    else LORA_NOISE_STD
+                )
                 with Timer("apply_dummy_lora_update"):
                     update_receipts = ray.get(
                         policy.async_run_ray_method(
                             "pass_through",
                             "add_shard_symmetric_lora_b_noise",
                             LORA_NOISE_SEED,
-                            LORA_NOISE_STD,
+                            noise_std,
                         )
                     )
                 for receipt in update_receipts:
