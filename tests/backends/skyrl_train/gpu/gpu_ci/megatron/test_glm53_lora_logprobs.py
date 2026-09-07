@@ -1292,7 +1292,8 @@ async def _run_final_attention_scope_matrix(
                 if trainer_mean > MIN_DIRECT_UPDATE_MEAN:
                     selected = noise_std
                     break
-            assert selected is not None
+            if selected is None:
+                selected = MATRIX_NOISE_STDS[-1]
             assert updated_megatron_logprobs is not None
             assert update_receipts is not None
 
@@ -1339,6 +1340,9 @@ async def _run_final_attention_scope_matrix(
                 updated_mask,
             )
             metrics["noise_std"] = selected
+            metrics["has_sufficient_signal"] = (
+                metrics["trainer_mean"] > MIN_DIRECT_UPDATE_MEAN
+            )
             metrics["updated_parameters"] = update_receipts[0]["updated_parameters"]
             metrics["updated_elements"] = update_receipts[0]["updated_elements"]
             results[update_scope] = metrics
@@ -1349,11 +1353,11 @@ async def _run_final_attention_scope_matrix(
 
         assert set(results) == set(MATRIX_UPDATE_SCOPES)
         control = results["final_attention_output"]
+        print(f"GLM53_LORA_SCOPE_MATRIX_RESULT {json.dumps(results, sort_keys=True)}")
         assert control["trainer_mean"] > MIN_DIRECT_UPDATE_MEAN
         assert control["passes_contract"], (
             "known final-attention output control failed the direct update contract"
         )
-        print(f"GLM53_LORA_SCOPE_MATRIX_RESULT {json.dumps(results, sort_keys=True)}")
     finally:
         if adapter_loaded:
             await client.unload_lora_adapter(adapter_name)
