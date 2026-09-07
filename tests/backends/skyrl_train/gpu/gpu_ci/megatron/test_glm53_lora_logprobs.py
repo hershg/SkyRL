@@ -51,7 +51,7 @@ from tests.backends.skyrl_train.gpu.utils import (
     init_worker_with_type,
 )
 
-MODEL = "zai-org/GLM-5.3"
+MODEL = "zai-org/GLM-5.3-BF16"
 SMALL_DRY_RUN_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 POLICY_GPUS = 8
 INFERENCE_TP = 8
