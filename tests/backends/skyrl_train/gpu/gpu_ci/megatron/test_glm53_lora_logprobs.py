@@ -65,6 +65,11 @@ from tests.backends.skyrl_train.gpu.gpu_ci.megatron.glm53_fixed_responses import
     load_fixed_responses,
     save_fixed_responses,
 )
+from tests.backends.skyrl_train.gpu.gpu_ci.megatron.glm53_generation_probes import (
+    assert_generation_logprob_budget,
+    build_long_prefill_prompts,
+    get_generation_logprob_metrics,
+)
 from tests.backends.skyrl_train.gpu.utils import (
     InferenceEngineState,
     Timer,
@@ -755,8 +760,10 @@ def _get_prompt_token_ids(tokenizer) -> list[list[int]]:
     )
 
 
-async def _generate(client, tokenizer, model: str | None = None):
-    prompt_token_ids = _get_prompt_token_ids(tokenizer)
+async def _generate(client, tokenizer, model: str | None = None, prompt_token_ids=None):
+    generation_probe = prompt_token_ids is not None
+    if prompt_token_ids is None:
+        prompt_token_ids = _get_prompt_token_ids(tokenizer)
     sampling_params = get_sampling_params_for_backend(
         "vllm",
         SamplingParams(
@@ -769,6 +776,8 @@ async def _generate(client, tokenizer, model: str | None = None):
         ),
     )
 
+    if generation_probe:
+        sampling_params["min_tokens"] = 32
     with Timer("generate_with_vllm"):
         output = await client.generate(
             InferenceEngineInput(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params),
@@ -776,6 +785,8 @@ async def _generate(client, tokenizer, model: str | None = None):
         )
 
     responses = output["response_ids"]
+    if generation_probe:
+        assert all(32 <= len(response) <= MAX_GENERATE_LENGTH for response in responses)
     rollout_logprobs = output["response_logprobs"]
     assert rollout_logprobs is not None
     rollout_expert_indices = output["rollout_expert_indices"]
@@ -789,6 +800,50 @@ async def _generate(client, tokenizer, model: str | None = None):
         rollout_expert_indices=rollout_expert_indices,
     )
     return responses, response_mask, logprobs_t, training_input
+
+
+async def _check_updated_generation_paths(client, tokenizer, policy, model, shared_dir):
+    assert ROUTER_REPLAY
+    long_prompts = build_long_prefill_prompts(tokenizer, TEST_PROMPTS, 320)
+    chunked_prompts = build_long_prefill_prompts(tokenizer, TEST_PROMPTS, 2000)
+    assert sum(map(len, chunked_prompts)) > 32768
+    for label, prompts in (
+        ("short", _get_prompt_token_ids(tokenizer)),
+        ("long", long_prompts),
+        ("chunked", chunked_prompts),
+    ):
+        with Timer(f"updated_{label}_prefill_and_decode"):
+            _, mask, sampler, data = await _generate(client, tokenizer, model, prompts)
+            native = _get_megatron_logprobs(policy, data)
+            replay = _get_megatron_logprobs(policy, data, replay=True)
+        path = shared_dir / f"generation-{label}-{uuid.uuid4().hex}.npz"
+        arrays = {
+            "sequences": data["sequences"].cpu().numpy(),
+            "attention_mask": data["attention_mask"].cpu().numpy(),
+            "response_mask": mask.cpu().numpy(),
+            "sampler": sampler.float().cpu().numpy(),
+            "trainer": native.float().cpu().numpy(),
+            "replay": replay.float().cpu().numpy(),
+            "routes": data["rollout_expert_indices"].cpu().numpy(),
+            "router_padding_mask": data["router_padding_mask"].cpu().numpy(),
+        }
+        _save_numpy_snapshot(path, **arrays)
+        metrics = {
+            key: get_generation_logprob_metrics(arrays["sampler"], arrays[key], arrays["response_mask"])
+            for key in ("trainer", "replay")
+        }
+        print(
+            json.dumps(
+                {
+                    "generation_probe": label,
+                    "prompt_lengths": [len(p) for p in prompts],
+                    "artifact": str(path),
+                    "metrics": metrics,
+                }
+            ),
+            flush=True,
+        )
+        assert_generation_logprob_budget(metrics["replay"])
 
 
 async def _score_responses(client, tokenizer, responses, model):
@@ -1421,6 +1476,8 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     updated_megatron_logprobs,
                     updated_mask,
                 )
+                if os.environ.get("SKYRL_GLM53_GENERATION_PROBES", "0") == "1":
+                    await _check_updated_generation_paths(client, tokenizer, policy, adapter_name, shared_dir)
             finally:
                 if adapter_loaded:
                     await client.unload_lora_adapter(resolve_policy_model_name(cfg))
