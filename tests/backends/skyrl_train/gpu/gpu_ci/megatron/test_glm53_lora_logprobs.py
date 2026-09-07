@@ -101,7 +101,7 @@ VLLM_LORA_TARGET_MODULES = [
 class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
     def add_model_coordinate_lora_b_noise(
         self, seed: int, std: float
-    ) -> dict[str, float | int]:
+    ) -> dict[str, float | int | str]:
         from megatron.core import parallel_state
         from megatron.core.utils import unwrap_model
 
@@ -113,6 +113,8 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
         updated_parameters = 0
         updated_elements = 0
         delta_norm = 0.0
+        update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
+        assert update_scope in {"all", "expert", "nonexpert"}
         assert self._is_lora
 
         with torch.no_grad():
@@ -120,6 +122,11 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                 model = unwrap_model(chunk)
                 for name, parameter in model.named_parameters():
                     if not (parameter.requires_grad and "linear_out.weight" in name):
+                        continue
+                    is_expert = "experts" in name
+                    if update_scope == "expert" and not is_expert:
+                        continue
+                    if update_scope == "nonexpert" and is_expert:
                         continue
                     digest = hashlib.sha256(
                         (
@@ -152,6 +159,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
             "expert_rank": expert_rank,
             "pipeline_rank": pipeline_rank,
             "context_rank": context_rank,
+            "update_scope": update_scope,
             "updated_parameters": updated_parameters,
             "updated_elements": updated_elements,
             "delta_norm": delta_norm,
