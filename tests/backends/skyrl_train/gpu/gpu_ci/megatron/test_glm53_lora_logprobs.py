@@ -66,7 +66,7 @@ MEGATRON_MEAN_DIFF_THRESHOLD = 5e-2
 VLLM_MEAN_DIFF_THRESHOLD = 3e-1
 LORA_NOISE_SEED = 42
 LORA_NOISE_STD = 1e-2
-FINAL_DENSE_LORA_NOISE_STD = 0.75
+FINAL_DENSE_LORA_NOISE_STD = 3.0
 MAX_FULL_HASH_NUMEL = 1_000_000
 MIN_UPDATED_LOGPROB_DIFF = 1e-5
 MIN_DIRECT_UPDATE_MEAN = 0.1
@@ -617,6 +617,9 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
 
     inference = cfg.generator.inference_engine
     inference.backend = "vllm"
+    inference.fully_sharded_loras = (
+        os.environ.get("SKYRL_GLM53_FULLY_SHARDED_LORAS", "0") == "1"
+    )
     inference.run_engines_locally = True
     inference.language_model_only = True
     inference.num_engines = 1
@@ -961,6 +964,19 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     for server_receipt in vllm_initial_receipt.values()
                     for worker_receipt in server_receipt["body"]["results"]
                 } == {update_scope}
+                if update_scope == "final_dense":
+                    expected_fully_sharded = (
+                        os.environ.get("SKYRL_GLM53_FULLY_SHARDED_LORAS", "0") == "1"
+                    )
+                    module_types = {
+                        module_receipt["module_type"]
+                        for server_receipt in vllm_initial_receipt.values()
+                        for worker_receipt in server_receipt["body"]["results"]
+                        for module_receipt in worker_receipt["kernel_buffers"].values()
+                    }
+                    assert {
+                        "ShardedLoRA" in module_type for module_type in module_types
+                    } == {expected_fully_sharded}
                 _print_boundary_receipt("vllm_initial", vllm_initial_receipt)
 
                 adapter_name = resolve_policy_model_name(cfg)
