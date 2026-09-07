@@ -38,3 +38,17 @@ def assert_generation_logprob_budget(metrics):
     assert metrics["max"] < 5.0
     assert abs(metrics["signed_mean"]) < 0.05
     assert max(abs(value) for value in metrics["sequence_signed_means"]) < 0.05
+
+
+def compare_generation_scoring_paths(arrays):
+    comparisons = {
+        "trainer": ("sampler", "trainer"),
+        "replay": ("sampler", "replay"),
+        "decode_vs_teacher_forced": ("sampler", "teacher_forced_sampler"),
+        "teacher_forced_vs_trainer": ("teacher_forced_sampler", "trainer"),
+        "teacher_forced_vs_replay": ("teacher_forced_sampler", "teacher_forced_replay"),
+    }
+    return {
+        label: get_generation_logprob_metrics(arrays[left], arrays[right], arrays["response_mask"])
+        for label, (left, right) in comparisons.items()
+    }

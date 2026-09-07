@@ -68,7 +68,7 @@ from tests.backends.skyrl_train.gpu.gpu_ci.megatron.glm53_fixed_responses import
 from tests.backends.skyrl_train.gpu.gpu_ci.megatron.glm53_generation_probes import (
     assert_generation_logprob_budget,
     build_long_prefill_prompts,
-    get_generation_logprob_metrics,
+    compare_generation_scoring_paths,
 )
 from tests.backends.skyrl_train.gpu.utils import (
     InferenceEngineState,
@@ -802,21 +802,27 @@ async def _generate(client, tokenizer, model: str | None = None, prompt_token_id
     return responses, response_mask, logprobs_t, training_input
 
 
-async def _check_updated_generation_paths(client, tokenizer, policy, model, shared_dir):
+async def _check_generation_paths(client, tokenizer, policy, model, shared_dir, phase):
     assert ROUTER_REPLAY
-    long_prompts = build_long_prefill_prompts(tokenizer, TEST_PROMPTS, 320)
-    chunked_prompts = build_long_prefill_prompts(tokenizer, TEST_PROMPTS, 2000)
-    assert sum(map(len, chunked_prompts)) > 32768
-    for label, prompts in (
-        ("short", _get_prompt_token_ids(tokenizer)),
-        ("long", long_prompts),
-        ("chunked", chunked_prompts),
-    ):
-        with Timer(f"updated_{label}_prefill_and_decode"):
-            _, mask, sampler, data = await _generate(client, tokenizer, model, prompts)
+    cases = [("short", _get_prompt_token_ids(tokenizer))]
+    if phase == "updated":
+        long_prompts = build_long_prefill_prompts(tokenizer, TEST_PROMPTS, 320)
+        chunked_prompts = build_long_prefill_prompts(tokenizer, TEST_PROMPTS, 2000)
+        assert sum(map(len, chunked_prompts)) > 32768
+        cases.extend([("long", long_prompts), ("chunked", chunked_prompts)])
+    for label, prompts in cases:
+        with Timer(f"{phase}_{label}_prefill_and_decode"):
+            responses, mask, sampler, data = await _generate(client, tokenizer, model, prompts)
             native = _get_megatron_logprobs(policy, data)
             replay = _get_megatron_logprobs(policy, data, replay=True)
-        path = shared_dir / f"generation-{label}-{uuid.uuid4().hex}.npz"
+            scored_mask, scored_sampler, scored_data = await _score_responses(
+                client, tokenizer, responses, model, prompts, f"{phase}_{label}_generation"
+            )
+            assert torch.equal(mask, scored_mask)
+            assert torch.equal(data["sequences"], scored_data["sequences"])
+            assert torch.equal(data["attention_mask"], scored_data["attention_mask"])
+            scored_replay = _get_megatron_logprobs(policy, scored_data, replay=True)
+        path = shared_dir / f"generation-{phase}-{label}-{uuid.uuid4().hex}.npz"
         arrays = {
             "sequences": data["sequences"].cpu().numpy(),
             "attention_mask": data["attention_mask"].cpu().numpy(),
@@ -826,16 +832,18 @@ async def _check_updated_generation_paths(client, tokenizer, policy, model, shar
             "replay": replay.float().cpu().numpy(),
             "routes": data["rollout_expert_indices"].cpu().numpy(),
             "router_padding_mask": data["router_padding_mask"].cpu().numpy(),
+            "teacher_forced_sampler": scored_sampler.float().cpu().numpy(),
+            "teacher_forced_replay": scored_replay.float().cpu().numpy(),
+            "teacher_forced_routes": scored_data["rollout_expert_indices"].cpu().numpy(),
+            "teacher_forced_router_padding_mask": scored_data["router_padding_mask"].cpu().numpy(),
         }
         _save_numpy_snapshot(path, **arrays)
-        metrics = {
-            key: get_generation_logprob_metrics(arrays["sampler"], arrays[key], arrays["response_mask"])
-            for key in ("trainer", "replay")
-        }
+        metrics = compare_generation_scoring_paths(arrays)
         print(
             json.dumps(
                 {
                     "generation_probe": label,
+                    "phase": phase,
                     "prompt_lengths": [len(p) for p in prompts],
                     "artifact": str(path),
                     "metrics": metrics,
@@ -846,8 +854,9 @@ async def _check_updated_generation_paths(client, tokenizer, policy, model, shar
         assert_generation_logprob_budget(metrics["replay"])
 
 
-async def _score_responses(client, tokenizer, responses, model):
-    prompt_token_ids = _get_prompt_token_ids(tokenizer)
+async def _score_responses(client, tokenizer, responses, model, prompt_token_ids=None, score_context="fixed"):
+    if prompt_token_ids is None:
+        prompt_token_ids = _get_prompt_token_ids(tokenizer)
 
     async def score_response(prompt, response):
         if ROUTER_REPLAY:
@@ -883,6 +892,7 @@ async def _score_responses(client, tokenizer, responses, model):
                 json.dumps(
                     {
                         "route_score_artifact": str(artifact),
+                        "score_context": score_context,
                         "model": model,
                         "route_shape": list(routes.shape),
                         "route_bytes": routes.nbytes,
@@ -1255,6 +1265,8 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 trainer_initial_receipts = _inspect_policy_boundary(policy, "inspect_glm53_lora_parameters")
                 assert {receipt["update_scope"] for receipt in trainer_initial_receipts} == {update_scope}
                 _print_boundary_receipt("trainer_initial", trainer_initial_receipts)
+                if os.environ.get("SKYRL_GLM53_GENERATION_PROBES", "0") == "1":
+                    await _check_generation_paths(client, tokenizer, policy, model, shared_dir, "base")
 
                 with Timer("publish_initialized_lora"):
                     ray.get(
@@ -1324,6 +1336,8 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     )
 
                 noise_std = FINAL_DENSE_LORA_NOISE_STD if update_scope == "final_dense" else LORA_NOISE_STD
+                if os.environ.get("SKYRL_GLM53_GENERATION_PROBES", "0") == "1":
+                    await _check_generation_paths(client, tokenizer, policy, adapter_name, shared_dir, "initialized")
                 with Timer("apply_dummy_lora_update"):
                     update_receipts = ray.get(
                         policy.async_run_ray_method(
@@ -1477,7 +1491,7 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     updated_mask,
                 )
                 if os.environ.get("SKYRL_GLM53_GENERATION_PROBES", "0") == "1":
-                    await _check_updated_generation_paths(client, tokenizer, policy, adapter_name, shared_dir)
+                    await _check_generation_paths(client, tokenizer, policy, adapter_name, shared_dir, "updated")
             finally:
                 if adapter_loaded:
                     await client.unload_lora_adapter(resolve_policy_model_name(cfg))
