@@ -208,6 +208,9 @@ def _get_representative_expert_names(names: list[str]) -> list[str]:
 
 class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
     def inspect_glm53_lora_buffers(self) -> dict:
+        update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
+        final_dense = update_scope == "final_dense"
+        module_marker = ".self_attn.o_proj" if final_dense else ".mlp.experts"
         worker_manager = self.model_runner.lora_manager
         adapter_manager = worker_manager._adapter_manager
         adapter_ids = sorted(adapter_manager.list_adapters())
@@ -227,22 +230,35 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
         slot = adapter_manager.lora_index_to_id.index(adapter_id)
         adapter = adapter_manager.get_adapter(adapter_id)
         assert adapter is not None
-        cached_names = _get_final_layer_names(list(adapter.loras), ".mlp.experts")
+        cached_names = _get_final_layer_names(list(adapter.loras), module_marker)
         receipt["cached_adapter"] = {
             name: {
                 "lora_a": _get_weight_receipt(adapter.loras[name].lora_a),
-                "lora_b": _get_expert_weight_receipt(adapter.loras[name].lora_b),
+                "lora_b": (
+                    _get_weight_receipt(adapter.loras[name].lora_b)
+                    if final_dense
+                    else _get_expert_weight_receipt(adapter.loras[name].lora_b)
+                ),
                 "scaling": adapter.loras[name].scaling,
             }
             for name in cached_names
         }
 
         module_names = _get_final_layer_names(
-            list(adapter_manager.modules), ".mlp.experts"
+            list(adapter_manager.modules), module_marker
         )
         receipt["kernel_buffers"] = {}
         for name in module_names:
             module = adapter_manager.modules[name]
+            if final_dense:
+                receipt["kernel_buffers"][name] = {
+                    "module_type": type(module).__name__,
+                    "tp_rank": module.tp_rank,
+                    "tp_size": module.tp_size,
+                    "lora_a": _get_weight_receipt(module.lora_a_stacked[0][slot, 0]),
+                    "lora_b": _get_weight_receipt(module.lora_b_stacked[0][slot, 0]),
+                }
+                continue
             expert_map = module.base_layer.routed_experts.expert_map
             receipt["kernel_buffers"][name] = {
                 "module_type": type(module).__name__,
@@ -282,11 +298,17 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
         from megatron.core import parallel_state
         from megatron.core.utils import unwrap_model
 
+        update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
+        marker = (
+            ".self_attention.linear_proj."
+            if update_scope == "final_dense"
+            else ".mlp.experts."
+        )
         selected = {}
         for chunk in self.actor_module:
             model = unwrap_model(chunk)
             names = _get_final_layer_names(
-                [name for name, _ in model.named_parameters()], ".mlp.experts."
+                [name for name, _ in model.named_parameters()], marker
             )
             parameters = dict(model.named_parameters())
             for name in names:
@@ -330,7 +352,12 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                 for dimension in shape:
                     numel *= dimension
                 total_bytes += numel * dtype_sizes[dtype]
-            final_expert_names = _get_representative_expert_names(keys)
+            update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
+            selected_names = (
+                _get_final_layer_names(keys, ".self_attn.o_proj")
+                if update_scope == "final_dense"
+                else _get_representative_expert_names(keys)
+            )
             receipt.update(
                 {
                     "key_count": len(keys),
@@ -340,7 +367,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                     ).hexdigest(),
                     "representative_tensors": {
                         name: _get_sampled_tensor_receipt(adapter.get_tensor(name))
-                        for name in final_expert_names
+                        for name in selected_names
                     },
                 }
             )
@@ -362,7 +389,13 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
         delta_norm = 0.0
         update_fingerprint = hashlib.sha256()
         update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
-        assert update_scope in {"all", "expert", "nonexpert", "final_expert"}
+        assert update_scope in {
+            "all",
+            "expert",
+            "nonexpert",
+            "final_expert",
+            "final_dense",
+        }
         assert self._is_lora
 
         with torch.no_grad():
@@ -384,10 +417,15 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                         continue
                     if update_scope == "nonexpert" and is_expert:
                         continue
-                    if update_scope == "final_expert":
+                    if update_scope in {"final_expert", "final_dense"}:
                         layer_match = re.search(r"decoder\.layers\.(\d+)\.", name)
+                        expected_module = (
+                            is_routed_expert
+                            if update_scope == "final_expert"
+                            else ".self_attention.linear_proj." in name
+                        )
                         if (
-                            not is_routed_expert
+                            not expected_module
                             or parallel_state.get_pipeline_model_parallel_rank()
                             != parallel_state.get_pipeline_model_parallel_world_size()
                             - 1
@@ -424,7 +462,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                         noise, dtype=torch.float32
                     ).item()
 
-        if update_scope == "final_expert":
+        if update_scope in {"final_expert", "final_dense"}:
             is_final_pipeline_stage = (
                 pipeline_rank
                 == parallel_state.get_pipeline_model_parallel_world_size() - 1
@@ -935,7 +973,7 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
                 for receipt in update_receipts:
                     should_update = (
-                        update_scope != "final_expert"
+                        update_scope not in {"final_expert", "final_dense"}
                         or receipt["pipeline_rank"]
                         == cfg.trainer.policy.megatron_config.pipeline_model_parallel_size
                         - 1
