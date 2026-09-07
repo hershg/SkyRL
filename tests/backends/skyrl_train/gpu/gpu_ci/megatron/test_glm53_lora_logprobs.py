@@ -73,6 +73,14 @@ MIN_DIRECT_UPDATE_COSINE = 0.8
 MIN_DIRECT_UPDATE_SCALE = 0.5
 MAX_DIRECT_UPDATE_SCALE = 1.5
 MAX_DIRECT_UPDATE_RELATIVE_MEAN_ERROR = 0.5
+MATRIX_UPDATE_SCOPES = (
+    "final_attention_output",
+    "final_attention_q_down",
+    "final_attention_q_up",
+    "final_attention_kv_down",
+    "final_attention_without_kv_up",
+)
+MATRIX_NOISE_STDS = (5e-2, 2.5e-1, 1.25)
 
 TEST_PROMPTS = [
     "What is 2 + 3? Answer with only the number.",
@@ -96,6 +104,19 @@ GLM53_LORA_TARGET_RECIPES = {
         for module in MEGATRON_LORA_TARGET_MODULES
         if module != "linear_kv_up_proj"
     ],
+}
+
+FINAL_ATTENTION_SCOPE_MODULES = {
+    "final_attention_output": ("linear_proj",),
+    "final_attention_q_down": ("linear_q_down_proj",),
+    "final_attention_q_up": ("linear_q_up_proj",),
+    "final_attention_kv_down": ("linear_kv_down_proj",),
+    "final_attention_without_kv_up": (
+        "linear_q_down_proj",
+        "linear_q_up_proj",
+        "linear_kv_down_proj",
+        "linear_proj",
+    ),
 }
 
 # vLLM needs the full registry to initialize LoRA context during MoE graph warmup.
@@ -261,6 +282,44 @@ def test_attention_without_kv_up_recipe_is_explicit_and_narrow(monkeypatch):
         "linear_kv_down_proj",
         "linear_proj",
     ]
+
+
+def _is_final_attention_scope_parameter(
+    name: str, final_layer: int | None, update_scope: str
+) -> bool:
+    modules = FINAL_ATTENTION_SCOPE_MODULES.get(update_scope)
+    if modules is None or final_layer is None:
+        return False
+    return any(
+        name
+        == (
+            f"decoder.layers.{final_layer}.self_attention."
+            f"{module}.adapter.linear_out.weight"
+        )
+        for module in modules
+    )
+
+
+def test_final_attention_scope_selection_is_exact():
+    final_layer = 77
+    prefix = f"decoder.layers.{final_layer}.self_attention"
+
+    for scope, modules in FINAL_ATTENTION_SCOPE_MODULES.items():
+        for module in modules:
+            name = f"{prefix}.{module}.adapter.linear_out.weight"
+            assert _is_final_attention_scope_parameter(name, final_layer, scope)
+
+    kv_up = f"{prefix}.linear_kv_up_proj.adapter.linear_out.weight"
+    assert not any(
+        _is_final_attention_scope_parameter(kv_up, final_layer, scope)
+        for scope in MATRIX_UPDATE_SCOPES
+    )
+    wrong_layer = (
+        "decoder.layers.76.self_attention.linear_proj.adapter.linear_out.weight"
+    )
+    assert not _is_final_attention_scope_parameter(
+        wrong_layer, final_layer, "final_attention_output"
+    )
 
 
 class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
@@ -558,8 +617,58 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
             )
         return receipt
 
+    def snapshot_glm53_lora_b(self) -> dict[str, int | str]:
+        from megatron.core.utils import unwrap_model
+
+        assert not hasattr(self, "_glm53_lora_b_snapshot"), (
+            "GLM 5.3 LoRA-B snapshot already exists"
+        )
+        snapshot = {}
+        elements = 0
+        for chunk_index, chunk in enumerate(self.actor_module):
+            model = unwrap_model(chunk)
+            for name, parameter in model.named_parameters():
+                if parameter.requires_grad and "linear_out.weight" in name:
+                    snapshot[(chunk_index, name)] = parameter.detach().clone()
+                    elements += parameter.numel()
+        assert snapshot, "no trainable LoRA-B parameters found to snapshot"
+        self._glm53_lora_b_snapshot = snapshot
+        return {
+            "hostname": socket.gethostname(),
+            "rank": torch.distributed.get_rank(),
+            "parameter_count": len(snapshot),
+            "element_count": elements,
+        }
+
+    def restore_glm53_lora_b(self) -> dict[str, int | str]:
+        from megatron.core.utils import unwrap_model
+
+        snapshot = getattr(self, "_glm53_lora_b_snapshot", None)
+        assert snapshot is not None, "GLM 5.3 LoRA-B snapshot does not exist"
+        restored = set()
+        elements = 0
+        with torch.no_grad():
+            for chunk_index, chunk in enumerate(self.actor_module):
+                model = unwrap_model(chunk)
+                for name, parameter in model.named_parameters():
+                    key = (chunk_index, name)
+                    if key not in snapshot:
+                        continue
+                    parameter.copy_(snapshot[key])
+                    restored.add(key)
+                    elements += parameter.numel()
+        assert restored == set(snapshot), (
+            "failed to restore every snapshotted GLM 5.3 LoRA-B parameter"
+        )
+        return {
+            "hostname": socket.gethostname(),
+            "rank": torch.distributed.get_rank(),
+            "parameter_count": len(restored),
+            "element_count": elements,
+        }
+
     def add_shard_symmetric_lora_b_noise(
-        self, seed: int, std: float
+        self, seed: int, std: float, update_scope: str | None = None
     ) -> dict[str, float | int | str]:
         from megatron.core import parallel_state
         from megatron.core.utils import unwrap_model
@@ -573,14 +682,19 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
         updated_elements = 0
         delta_norm = 0.0
         update_fingerprint = hashlib.sha256()
-        update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
-        assert update_scope in {
-            "all",
-            "expert",
-            "nonexpert",
-            "final_attention_output",
-            "final_expert",
-        }
+        resolved_update_scope = update_scope or os.environ.get(
+            "SKYRL_GLM53_UPDATE_SCOPE", "all"
+        )
+        assert (
+            resolved_update_scope
+            in {
+                "all",
+                "expert",
+                "nonexpert",
+                "final_expert",
+            }
+            | FINAL_ATTENTION_SCOPE_MODULES.keys()
+        )
         assert self._is_lora
 
         with torch.no_grad():
@@ -598,16 +712,18 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                         continue
                     is_routed_expert = ".mlp.experts." in name
                     is_expert = is_routed_expert or ".mlp.shared_experts." in name
-                    if update_scope == "expert" and not is_expert:
+                    if resolved_update_scope == "expert" and not is_expert:
                         continue
-                    if update_scope == "nonexpert" and is_expert:
+                    if resolved_update_scope == "nonexpert" and is_expert:
                         continue
-                    if update_scope == "final_attention_output" and name != (
-                        f"decoder.layers.{final_local_layer}.self_attention."
-                        "linear_proj.adapter.linear_out.weight"
+                    if (
+                        resolved_update_scope in FINAL_ATTENTION_SCOPE_MODULES
+                        and not _is_final_attention_scope_parameter(
+                            name, final_local_layer, resolved_update_scope
+                        )
                     ):
                         continue
-                    if update_scope == "final_expert":
+                    if resolved_update_scope == "final_expert":
                         layer_match = re.search(r"decoder\.layers\.(\d+)\.", name)
                         if (
                             not is_routed_expert
@@ -647,7 +763,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                         noise, dtype=torch.float32
                     ).item()
 
-        if update_scope == "final_expert":
+        if resolved_update_scope == "final_expert":
             is_final_pipeline_stage = (
                 pipeline_rank
                 == parallel_state.get_pipeline_model_parallel_world_size() - 1
@@ -663,7 +779,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
             "expert_rank": expert_rank,
             "pipeline_rank": pipeline_rank,
             "context_rank": context_rank,
-            "update_scope": update_scope,
+            "update_scope": resolved_update_scope,
             "updated_parameters": updated_parameters,
             "updated_elements": updated_elements,
             "delta_norm": delta_norm,
@@ -1050,6 +1166,200 @@ async def _check_vllm_attention_kernels(client):
     )
 
 
+def _direct_update_metrics(
+    baseline_vllm_logprobs,
+    baseline_megatron_logprobs,
+    updated_vllm_logprobs,
+    updated_megatron_logprobs,
+    response_mask,
+) -> dict[str, float | int | bool]:
+    valid = response_mask.bool()
+    sampler_delta = updated_vllm_logprobs[valid] - baseline_vllm_logprobs[valid]
+    trainer_delta = updated_megatron_logprobs[valid] - baseline_megatron_logprobs[valid]
+    delta_error = (sampler_delta - trainer_delta).abs()
+    assert torch.isfinite(sampler_delta).all()
+    assert torch.isfinite(trainer_delta).all()
+    assert torch.isfinite(delta_error).all()
+    trainer_mean = trainer_delta.abs().mean().item()
+    denominator = torch.dot(trainer_delta.float(), trainer_delta.float())
+    assert denominator.item() > 0
+    mean_error = delta_error.mean().item()
+    metrics = {
+        "tokens": delta_error.numel(),
+        "mean_error": mean_error,
+        "p99_error": torch.quantile(delta_error.float(), 0.99).item(),
+        "max_error": delta_error.max().item(),
+        "sampler_mean": sampler_delta.abs().mean().item(),
+        "trainer_mean": trainer_mean,
+        "relative_mean_error": mean_error / trainer_mean,
+        "cosine": torch.nn.functional.cosine_similarity(
+            sampler_delta.float().unsqueeze(0),
+            trainer_delta.float().unsqueeze(0),
+        ).item(),
+        "scale": (
+            torch.dot(sampler_delta.float(), trainer_delta.float()) / denominator
+        ).item(),
+    }
+    metrics["passes_contract"] = (
+        metrics["cosine"] > MIN_DIRECT_UPDATE_COSINE
+        and MIN_DIRECT_UPDATE_SCALE < metrics["scale"] < MAX_DIRECT_UPDATE_SCALE
+        and metrics["relative_mean_error"] < MAX_DIRECT_UPDATE_RELATIVE_MEAN_ERROR
+        and metrics["mean_error"] < 0.075
+        and metrics["p99_error"] < 0.75
+        and metrics["max_error"] < 5.0
+    )
+    return metrics
+
+
+def _validate_matrix_update_receipts(receipts, policy_gpus: int, update_scope: str):
+    assert {receipt["rank"] for receipt in receipts} == set(range(policy_gpus))
+    assert {receipt["update_scope"] for receipt in receipts} == {update_scope}
+    assert all(receipt["updated_parameters"] > 0 for receipt in receipts)
+    assert all(receipt["updated_elements"] > 0 for receipt in receipts)
+    assert all(receipt["delta_norm"] > 0 for receipt in receipts)
+    assert (
+        len(
+            {
+                (
+                    receipt["updated_parameters"],
+                    receipt["updated_elements"],
+                    receipt["delta_norm"],
+                    receipt["update_fingerprint"],
+                )
+                for receipt in receipts
+            }
+        )
+        == 1
+    ), "matrix perturbation must preserve all distributed replicas"
+
+
+async def _run_final_attention_scope_matrix(
+    *,
+    client,
+    tokenizer,
+    policy,
+    cfg,
+    model,
+    base_responses,
+    adapter_name,
+    lora_mask,
+    lora_logprobs,
+    lora_megatron_logprobs,
+    lora_input,
+    lora_sync_path,
+    policy_gpus,
+):
+    snapshot_receipts = _inspect_policy_boundary(policy, "snapshot_glm53_lora_b")
+    assert {receipt["rank"] for receipt in snapshot_receipts} == set(range(policy_gpus))
+    assert all(receipt["parameter_count"] > 0 for receipt in snapshot_receipts)
+    results = {}
+    adapter_loaded = True
+    try:
+        for update_scope in MATRIX_UPDATE_SCOPES:
+            selected = None
+            updated_megatron_logprobs = None
+            update_receipts = None
+            for noise_std in MATRIX_NOISE_STDS:
+                restore_receipts = _inspect_policy_boundary(
+                    policy, "restore_glm53_lora_b"
+                )
+                assert {receipt["rank"] for receipt in restore_receipts} == set(
+                    range(policy_gpus)
+                )
+                with Timer(f"apply_matrix_update_{update_scope}_{noise_std}"):
+                    update_receipts = _inspect_policy_boundary(
+                        policy,
+                        "add_shard_symmetric_lora_b_noise",
+                        LORA_NOISE_SEED,
+                        noise_std,
+                        update_scope,
+                    )
+                _validate_matrix_update_receipts(
+                    update_receipts, policy_gpus, update_scope
+                )
+                updated_megatron_logprobs = _get_megatron_logprobs(policy, lora_input)
+                trainer_delta = (
+                    updated_megatron_logprobs[lora_mask.bool()]
+                    - lora_megatron_logprobs[lora_mask.bool()]
+                )
+                trainer_mean = trainer_delta.abs().mean().item()
+                assert torch.isfinite(trainer_delta).all()
+                print(
+                    "GLM53_LORA_SCOPE_SIGNAL "
+                    f"scope={update_scope} std={noise_std} "
+                    f"trainer_mean={trainer_mean:.6f}"
+                )
+                if trainer_mean > MIN_DIRECT_UPDATE_MEAN:
+                    selected = noise_std
+                    break
+            assert selected is not None
+            assert updated_megatron_logprobs is not None
+            assert update_receipts is not None
+
+            if adapter_loaded:
+                await client.unload_lora_adapter(adapter_name)
+                adapter_loaded = False
+            with Timer(f"publish_matrix_update_{update_scope}"):
+                ray.get(
+                    policy.async_run_ray_method(
+                        "pass_through",
+                        "broadcast_to_inference_engines",
+                        client,
+                        cfg.generator.inference_engine,
+                    )
+                )
+            adapter_loaded = True
+            await client.reset_prefix_cache()
+            _print_boundary_receipt(
+                f"export_matrix_{update_scope}",
+                _inspect_policy_boundary(
+                    policy,
+                    "inspect_glm53_exported_adapter",
+                    str(lora_sync_path),
+                ),
+            )
+            _print_boundary_receipt(
+                f"vllm_matrix_{update_scope}", await _inspect_vllm_boundary(client)
+            )
+            _print_boundary_receipt(
+                f"vllm_attention_kernel_matrix_{update_scope}",
+                await _check_vllm_attention_kernels(client),
+            )
+
+            updated_mask, updated_vllm_logprobs, updated_input = await _score_responses(
+                client, tokenizer, base_responses, adapter_name
+            )
+            assert torch.equal(lora_mask, updated_mask)
+            rescored_megatron_logprobs = _get_megatron_logprobs(policy, updated_input)
+            metrics = _direct_update_metrics(
+                lora_logprobs,
+                lora_megatron_logprobs,
+                updated_vllm_logprobs,
+                rescored_megatron_logprobs,
+                updated_mask,
+            )
+            metrics["noise_std"] = selected
+            metrics["updated_parameters"] = update_receipts[0]["updated_parameters"]
+            metrics["updated_elements"] = update_receipts[0]["updated_elements"]
+            results[update_scope] = metrics
+            print(
+                "GLM53_LORA_SCOPE_MATRIX "
+                f"{update_scope} {json.dumps(metrics, sort_keys=True)}"
+            )
+
+        assert set(results) == set(MATRIX_UPDATE_SCOPES)
+        control = results["final_attention_output"]
+        assert control["trainer_mean"] > MIN_DIRECT_UPDATE_MEAN
+        assert control["passes_contract"], (
+            "known final-attention output control failed the direct update contract"
+        )
+        print(f"GLM53_LORA_SCOPE_MATRIX_RESULT {json.dumps(results, sort_keys=True)}")
+    finally:
+        if adapter_loaded:
+            await client.unload_lora_adapter(adapter_name)
+        _inspect_policy_boundary(policy, "restore_glm53_lora_b")
+
+
 @pytest.mark.asyncio
 @pytest.mark.megatron
 @pytest.mark.b300
@@ -1163,6 +1473,28 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     lora_mask,
                     MEGATRON_MEAN_DIFF_THRESHOLD,
                 )
+
+                scope_matrix = os.environ.get("SKYRL_GLM53_SCOPE_MATRIX", "0")
+                assert scope_matrix in {"0", "1"}
+                if scope_matrix == "1":
+                    adapter_loaded = False
+                    await _run_final_attention_scope_matrix(
+                        client=client,
+                        tokenizer=tokenizer,
+                        policy=policy,
+                        cfg=cfg,
+                        model=model,
+                        base_responses=base_responses,
+                        adapter_name=adapter_name,
+                        lora_mask=lora_mask,
+                        lora_logprobs=lora_logprobs,
+                        lora_megatron_logprobs=lora_megatron_logprobs,
+                        lora_input=lora_input,
+                        lora_sync_path=lora_sync_path,
+                        policy_gpus=policy_gpus,
+                    )
+                    completed = True
+                    return
 
                 lora_noise_std = float(
                     os.environ.get("SKYRL_GLM53_LORA_NOISE_STD", LORA_NOISE_STD)
