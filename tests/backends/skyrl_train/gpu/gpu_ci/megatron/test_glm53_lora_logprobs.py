@@ -254,7 +254,7 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
         }
 
     cfg.trainer.flash_attn = False
-    cfg.trainer.remove_microbatch_padding = False
+    cfg.trainer.remove_microbatch_padding = megatron.context_parallel_size > 1
     cfg.trainer.fused_lm_head_logprob = True
     max_sequence_length = 1024 if model == SMALL_DRY_RUN_MODEL else 32768
     cfg.trainer.max_tokens_per_microbatch = max_sequence_length
