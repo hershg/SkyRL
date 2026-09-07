@@ -39,6 +39,7 @@ from skyrl.backends.skyrl_train.inference_servers.common import (
 from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     CLAMPED_LOGPROB,
     build_logprobs_content,
+    build_prompt_logprobs,
     pack_routed_experts,
 )
 from skyrl.backends.skyrl_train.inference_servers.protocols import ServerActorProtocol
@@ -527,6 +528,9 @@ class VLLMServerActor(ServerActorProtocol):
                 routed_experts = pack_routed_experts(resp.routed_experts)
 
             payload = {
+                "prompt_logprobs": build_prompt_logprobs(
+                    token_ids, final_res.prompt_logprobs
+                ),
                 "choices": [
                     {
                         "token_ids": token_ids_out,

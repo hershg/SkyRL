@@ -22,7 +22,10 @@ import socket
 import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
+import numpy as np
 import pytest
 import ray
 import torch
@@ -34,6 +37,9 @@ from skyrl.backends.skyrl_train.distributed.dispatch import (
 from skyrl.backends.skyrl_train.inference_servers.base import InferenceEngineInput
 from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
     get_sampling_params_for_backend,
+)
+from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
+    decode_packed_routed_experts,
 )
 from skyrl.backends.skyrl_train.inference_servers.new_inference_worker_wrap import (
     NewInferenceWorkerWrap,
@@ -744,6 +750,53 @@ async def _score_responses(client, tokenizer, responses, model):
     prompt_token_ids = _get_prompt_token_ids(tokenizer)
 
     async def score_response(prompt, response):
+        if ROUTER_REPLAY:
+            async with httpx.AsyncClient(timeout=120) as scoring_client:
+                result = await scoring_client.post(
+                    f"{client.proxy_url}/skyrl/v1/generate",
+                    json={
+                        "token_ids": prompt + response,
+                        "model": model,
+                        "sampling_params": {
+                            "temperature": 0.0,
+                            "max_tokens": 1,
+                            "prompt_logprobs": 0,
+                            "output_kind": 2,
+                        },
+                    },
+                )
+                result.raise_for_status()
+                payload = result.json()
+            scores = payload["prompt_logprobs"]
+            routes = decode_packed_routed_experts(
+                payload["choices"][0]["routed_experts"]
+            )
+            assert len(scores) == len(prompt) + len(response)
+            assert len(routes) == len(scores)
+            artifact = (
+                Path(os.environ["SKYRL_GLM53_SHARED_DIR"])
+                / f"route-score-{uuid.uuid4().hex}.npz"
+            )
+            np.savez(
+                artifact,
+                token_ids=np.asarray(prompt + response),
+                prompt_length=np.asarray(len(prompt)),
+                response_logprobs=np.asarray(scores[len(prompt) :]),
+                routes=routes,
+            )
+            print(
+                json.dumps(
+                    {
+                        "route_score_artifact": str(artifact),
+                        "model": model,
+                        "route_shape": list(routes.shape),
+                        "route_bytes": routes.nbytes,
+                        "route_sha256": hashlib.sha256(routes.tobytes()).hexdigest(),
+                    }
+                ),
+                flush=True,
+            )
+            return scores[len(prompt) :], routes
         result = await client.sample(
             {
                 "json": {
@@ -759,10 +812,10 @@ async def _score_responses(client, tokenizer, responses, model):
         assert prompt_logprobs is not None
         response_logprobs = prompt_logprobs[len(prompt) :]
         assert all(logprob is not None for logprob in response_logprobs)
-        return response_logprobs
+        return response_logprobs, None
 
     with Timer("score_fixed_responses_with_vllm"):
-        response_logprobs = await asyncio.gather(
+        score_results = await asyncio.gather(
             *(
                 score_response(prompt, response)
                 for prompt, response in zip(prompt_token_ids, responses, strict=True)
@@ -770,7 +823,13 @@ async def _score_responses(client, tokenizer, responses, model):
         )
 
     return _build_training_input(
-        tokenizer, prompt_token_ids, responses, response_logprobs
+        tokenizer,
+        prompt_token_ids,
+        responses,
+        [result[0] for result in score_results],
+        rollout_expert_indices=[result[1] for result in score_results]
+        if ROUTER_REPLAY
+        else None,
     )
 
 
@@ -834,11 +893,48 @@ def _build_training_input(
     return response_mask, logprobs_t, training_input
 
 
-def _get_megatron_logprobs(policy, training_input):
+def _get_megatron_logprobs(policy, training_input, replay=False):
+    if not replay and training_input["rollout_expert_indices"] is not None:
+        native_input = TrainingInputBatch(dict(training_input.items()))
+        native_input.metadata = training_input.metadata
+        native_input["rollout_expert_indices"] = None
+        native_input["router_padding_mask"] = None
+        training_input = native_input
     refs = policy.async_run_ray_method("mesh", "forward", data=training_input)
     results = ray.get(refs)
     output = WorkerOutput.cat(policy.actor_infos, results)
     return loss_fn_outputs_to_tensor(output.loss_fn_outputs, key="logprobs")
+
+
+def test_native_forward_does_not_consume_or_erase_replay_routes(monkeypatch):
+    data = TrainingInputBatch(
+        {
+            "sequences": torch.tensor([[1, 2]]),
+            "rollout_expert_indices": torch.zeros((1, 2, 1, 2), dtype=torch.int32),
+            "router_padding_mask": torch.zeros((1, 2), dtype=torch.bool),
+        }
+    )
+    data.metadata = {"response_length": 1}
+    policy = SimpleNamespace(
+        actor_infos=[], async_run_ray_method=lambda *args, data: data
+    )
+    monkeypatch.setattr(ray, "get", lambda value: value)
+    monkeypatch.setattr(
+        WorkerOutput,
+        "cat",
+        lambda infos, results: SimpleNamespace(loss_fn_outputs=results),
+    )
+    monkeypatch.setattr(
+        f"{__name__}.loss_fn_outputs_to_tensor", lambda outputs, key: outputs
+    )
+    native = _get_megatron_logprobs(policy, data)
+    replay = _get_megatron_logprobs(policy, data, replay=True)
+    assert native["rollout_expert_indices"] is None
+    assert native["router_padding_mask"] is None
+    assert replay["rollout_expert_indices"] is data["rollout_expert_indices"]
+    assert replay["router_padding_mask"] is data["router_padding_mask"]
+    assert native.metadata == replay.metadata
+    assert torch.equal(native["sequences"], replay["sequences"])
 
 
 def _get_logprob_difference(label, expected, actual, response_mask):
@@ -1033,7 +1129,7 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     base_responses,
                     generated_mask,
                     _,
-                    router_replay_input,
+                    _,
                 ) = await _generate(client, tokenizer, model)
                 base_mask, base_logprobs, base_input = await _score_responses(
                     client, tokenizer, base_responses, model
@@ -1130,7 +1226,7 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 replay_initial_logprobs = None
                 if ROUTER_REPLAY:
                     replay_initial_logprobs = _get_megatron_logprobs(
-                        policy, router_replay_input
+                        policy, lora_input, replay=True
                     )
                     _get_logprob_difference(
                         "initialized vLLM LoRA vs Megatron router replay",
@@ -1220,10 +1316,6 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
 
                 updated_logprobs = _get_megatron_logprobs(policy, lora_input)
                 updated_replay_logprobs = None
-                if ROUTER_REPLAY:
-                    updated_replay_logprobs = _get_megatron_logprobs(
-                        policy, router_replay_input
-                    )
                 _print_boundary_receipt(
                     "trainer_updated",
                     _inspect_policy_boundary(policy, "inspect_glm53_lora_parameters"),
@@ -1267,6 +1359,10 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 updated_megatron_logprobs = _get_megatron_logprobs(
                     policy, updated_input
                 )
+                if ROUTER_REPLAY:
+                    updated_replay_logprobs = _get_megatron_logprobs(
+                        policy, updated_input, replay=True
+                    )
                 valid = updated_mask.bool()
                 sampler_delta = updated_vllm_logprobs[valid] - lora_logprobs[valid]
                 trainer_delta = (

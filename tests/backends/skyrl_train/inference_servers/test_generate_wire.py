@@ -12,6 +12,7 @@ import torch
 from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     CLAMPED_LOGPROB,
     build_logprobs_content,
+    build_prompt_logprobs,
     decode_packed_routed_experts,
     pack_routed_experts,
 )
@@ -20,6 +21,27 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
 @dataclass
 class _Logprob:
     logprob: float
+
+
+def test_prompt_scores_preserve_token_alignment_and_first_null():
+    scores = build_prompt_logprobs(
+        [8, 9, 10], [None, {9: _Logprob(-0.5), 8: _Logprob(-4)}, {10: _Logprob(-1)}]
+    )
+    assert scores == [None, -0.5, -1]
+    assert orjson.loads(orjson.dumps(scores)) == scores
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_prompt_scores_reject_nonfinite_values(value):
+    with pytest.raises(ValueError, match="Non-finite"):
+        build_prompt_logprobs([8, 9], [None, {9: _Logprob(value)}])
+
+
+def test_prompt_scores_reject_missing_positions():
+    with pytest.raises(ValueError):
+        build_prompt_logprobs([8, 9], [None])
+    with pytest.raises(KeyError):
+        build_prompt_logprobs([8, 9], [None, {10: _Logprob(-1)}])
 
 
 @pytest.mark.parametrize(
@@ -39,10 +61,20 @@ def test_bad_logprob_is_clamped(entry):
 
 def test_finite_logprobs_pass_through_and_count_only_bad_tokens():
     token_ids = [10, 11, 12, 13]
-    resp = [{10: _Logprob(-0.25)}, {11: _Logprob(float("-inf"))}, None, {13: _Logprob(-12.3456789)}]
+    resp = [
+        {10: _Logprob(-0.25)},
+        {11: _Logprob(float("-inf"))},
+        None,
+        {13: _Logprob(-12.3456789)},
+    ]
     content, num_clamped = build_logprobs_content(token_ids, resp)
     # Length must match token_ids: callers assert len(logprobs) == len(response_ids).
-    assert [e["logprob"] for e in content] == [-0.25, CLAMPED_LOGPROB, CLAMPED_LOGPROB, -12.3456789]
+    assert [e["logprob"] for e in content] == [
+        -0.25,
+        CLAMPED_LOGPROB,
+        CLAMPED_LOGPROB,
+        -12.3456789,
+    ]
     assert num_clamped == 2
 
 
@@ -60,7 +92,10 @@ def test_empty_logprobs_input():
 
 def test_null_logprob_entry_is_clamped_not_raised():
     # An entry present but None must take the floor rather than raise AttributeError.
-    assert build_logprobs_content([7], [{7: None}]) == ([{"logprob": CLAMPED_LOGPROB}], 1)
+    assert build_logprobs_content([7], [{7: None}]) == (
+        [{"logprob": CLAMPED_LOGPROB}],
+        1,
+    )
 
 
 @pytest.mark.parametrize(
@@ -148,12 +183,16 @@ def test_pack_moves_device_tensors_to_host():
 
 @pytest.mark.parametrize("shape", [[1, 1, 1], [np.int64(1), np.int32(1), 1]])
 def test_decode_accepts_numpy_integer_dims(shape):
-    assert decode_packed_routed_experts({"data": "AQ==", "shape": shape, "dtype": "uint8"}).shape == (1, 1, 1)
+    assert decode_packed_routed_experts(
+        {"data": "AQ==", "shape": shape, "dtype": "uint8"}
+    ).shape == (1, 1, 1)
 
 
 def test_decode_rejects_incorrect_byte_count():
     with pytest.raises(ValueError, match="bytes"):
-        decode_packed_routed_experts({"data": "AQ==", "shape": [2, 1, 1], "dtype": "uint8"})
+        decode_packed_routed_experts(
+            {"data": "AQ==", "shape": [2, 1, 1], "dtype": "uint8"}
+        )
 
 
 @pytest.mark.parametrize(

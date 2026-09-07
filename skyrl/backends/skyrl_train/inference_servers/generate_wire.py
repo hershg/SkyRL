@@ -56,6 +56,24 @@ def build_logprobs_content(
     return content, num_clamped
 
 
+def build_prompt_logprobs(token_ids, prompt_logprobs):
+    """Preserve scored-token alignment and reject invalid diagnostic scores."""
+    if prompt_logprobs is None:
+        return None
+    values = []
+    for index, (token_id, entries) in enumerate(
+        zip(token_ids, prompt_logprobs, strict=True)
+    ):
+        if index == 0 and entries is None:
+            values.append(None)
+            continue
+        value = entries[token_id].logprob
+        if not math.isfinite(value):
+            raise ValueError(f"Non-finite prompt logprob at token {index}")
+        values.append(value)
+    return values
+
+
 def _to_host_array(routed_experts: Any) -> Any:
     """Bring a framework tensor into host memory, leaving anything else alone.
 
@@ -93,14 +111,19 @@ def decode_packed_routed_experts(payload: dict[str, Any]) -> RoutedExpertIndices
     # bool is a subclass of int, so it needs an explicit rejection; np.integer is
     # accepted for in-process callers, since orjson only ever yields plain ints.
     if len(shape) != 3 or any(
-        not isinstance(dim, (int, np.integer)) or isinstance(dim, bool) or dim < 0 for dim in shape
+        not isinstance(dim, (int, np.integer)) or isinstance(dim, bool) or dim < 0
+        for dim in shape
     ):
         raise ValueError(f"invalid packed routed_experts shape: {shape}")
     expected_size = math.prod(shape) * dtype.itemsize
     if len(data) != expected_size:
-        raise ValueError(f"packed routed_experts has {len(data)} bytes, expected {expected_size}")
+        raise ValueError(
+            f"packed routed_experts has {len(data)} bytes, expected {expected_size}"
+        )
     decoded = np.frombuffer(data, dtype=dtype).reshape(shape)
     compact = compact_routed_expert_indices(decoded)
     if compact.dtype != dtype:
-        raise ValueError(f"packed routed_experts uses non-canonical dtype {dtype.name}; expected {compact.dtype.name}")
+        raise ValueError(
+            f"packed routed_experts uses non-canonical dtype {dtype.name}; expected {compact.dtype.name}"
+        )
     return compact
