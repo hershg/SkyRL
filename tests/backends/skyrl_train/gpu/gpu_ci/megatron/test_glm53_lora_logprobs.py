@@ -94,7 +94,9 @@ VLLM_LORA_TARGET_MODULES = [
 
 
 class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
-    def add_expert_lora_b_noise(self, seed: int, std: float) -> dict[str, float | int]:
+    def add_non_expert_lora_b_noise(
+        self, seed: int, std: float
+    ) -> dict[str, float | int]:
         from megatron.core.utils import unwrap_model
 
         rank = torch.distributed.get_rank()
@@ -109,7 +111,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                 for name, parameter in model.named_parameters():
                     if not (
                         parameter.requires_grad
-                        and "experts" in name
+                        and "experts" not in name
                         and "linear_out.weight" in name
                     ):
                         continue
@@ -563,7 +565,7 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     update_receipts = ray.get(
                         policy.async_run_ray_method(
                             "pass_through",
-                            "add_expert_lora_b_noise",
+                            "add_non_expert_lora_b_noise",
                             LORA_NOISE_SEED,
                             LORA_NOISE_STD,
                         )
