@@ -94,9 +94,10 @@ VLLM_LORA_TARGET_MODULES = [
 
 
 class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
-    def add_lora_noise(self, seed: int, std: float) -> dict[str, float | int]:
+    def add_expert_lora_b_noise(self, seed: int, std: float) -> dict[str, float | int]:
         from megatron.core.utils import unwrap_model
 
+        rank = torch.distributed.get_rank()
         updated_parameters = 0
         updated_elements = 0
         delta_norm = 0.0
@@ -106,9 +107,15 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
             for chunk_index, chunk in enumerate(self.actor_module):
                 model = unwrap_model(chunk)
                 for name, parameter in model.named_parameters():
-                    if not parameter.requires_grad:
+                    if not (
+                        parameter.requires_grad
+                        and "experts" in name
+                        and "linear_out.weight" in name
+                    ):
                         continue
-                    digest = hashlib.sha256(f"{chunk_index}:{name}".encode()).digest()
+                    digest = hashlib.sha256(
+                        f"{rank}:{chunk_index}:{name}".encode()
+                    ).digest()
                     parameter_seed = seed + int.from_bytes(digest[:8], "little")
                     generator = torch.Generator(device=parameter.device)
                     generator.manual_seed(parameter_seed % (2**63 - 1))
@@ -129,6 +136,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
 
         assert updated_parameters > 0, "noise update found no trainable LoRA parameters"
         return {
+            "rank": rank,
             "updated_parameters": updated_parameters,
             "updated_elements": updated_elements,
             "delta_norm": delta_norm,
@@ -555,7 +563,7 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     update_receipts = ray.get(
                         policy.async_run_ray_method(
                             "pass_through",
-                            "add_lora_noise",
+                            "add_expert_lora_b_noise",
                             LORA_NOISE_SEED,
                             LORA_NOISE_STD,
                         )
@@ -564,6 +572,9 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     assert receipt["updated_parameters"] > 0
                     assert receipt["updated_elements"] > 0
                     assert receipt["delta_norm"] > 0
+                assert {receipt["rank"] for receipt in update_receipts} == set(
+                    range(policy_gpus)
+                )
 
                 updated_logprobs = _get_megatron_logprobs(policy, lora_input)
                 _assert_logprobs_changed(
