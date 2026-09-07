@@ -492,7 +492,13 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
         delta_norm = 0.0
         update_fingerprint = hashlib.sha256()
         update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
-        assert update_scope in {"all", "expert", "nonexpert", "final_expert"}
+        assert update_scope in {
+            "all",
+            "expert",
+            "nonexpert",
+            "final_attention_output",
+            "final_expert",
+        }
         assert self._is_lora
 
         with torch.no_grad():
@@ -513,6 +519,11 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                     if update_scope == "expert" and not is_expert:
                         continue
                     if update_scope == "nonexpert" and is_expert:
+                        continue
+                    if update_scope == "final_attention_output" and name != (
+                        f"decoder.layers.{final_local_layer}.self_attention."
+                        "linear_proj.adapter.linear_out.weight"
+                    ):
                         continue
                     if update_scope == "final_expert":
                         layer_match = re.search(r"decoder\.layers\.(\d+)\.", name)
