@@ -89,6 +89,15 @@ MEGATRON_LORA_TARGET_MODULES = [
     "linear_proj",
 ]
 
+GLM53_LORA_TARGET_RECIPES = {
+    "attention": MEGATRON_LORA_TARGET_MODULES,
+    "attention_without_kv_up": [
+        module
+        for module in MEGATRON_LORA_TARGET_MODULES
+        if module != "linear_kv_up_proj"
+    ],
+}
+
 # vLLM needs the full registry to initialize LoRA context during MoE graph warmup.
 VLLM_SUPPORTED_LORA_TARGET_MODULES = [
     "fused_qkv_a_proj",
@@ -229,6 +238,31 @@ def _get_final_layer_names(names: list[str], marker: str) -> list[str]:
     return sorted(name for layer, name in matched if layer == final_layer)
 
 
+def _get_megatron_lora_target_modules(model: str) -> str | list[str]:
+    if model == SMALL_DRY_RUN_MODEL:
+        return "all-linear"
+    recipe = os.environ.get("SKYRL_GLM53_LORA_TARGET_RECIPE", "attention")
+    assert recipe in GLM53_LORA_TARGET_RECIPES, (
+        f"unsupported GLM 5.3 LoRA target recipe: {recipe}"
+    )
+    return GLM53_LORA_TARGET_RECIPES[recipe]
+
+
+def test_attention_without_kv_up_recipe_is_explicit_and_narrow(monkeypatch):
+    monkeypatch.setenv("SKYRL_GLM53_LORA_TARGET_RECIPE", "attention_without_kv_up")
+
+    targets = _get_megatron_lora_target_modules(MODEL)
+
+    assert isinstance(targets, list)
+    assert "linear_kv_up_proj" not in targets
+    assert targets == [
+        "linear_q_down_proj",
+        "linear_q_up_proj",
+        "linear_kv_down_proj",
+        "linear_proj",
+    ]
+
+
 class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
     def inspect_glm53_lora_buffers(self) -> dict:
         worker_manager = self.model_runner.lora_manager
@@ -250,6 +284,10 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
         slot = adapter_manager.lora_index_to_id.index(adapter_id)
         adapter = adapter_manager.get_adapter(adapter_id)
         assert adapter is not None
+        target_recipe = os.environ.get("SKYRL_GLM53_LORA_TARGET_RECIPE", "attention")
+        if target_recipe == "attention_without_kv_up":
+            assert all(".kv_b_proj" not in name for name in adapter.loras)
+        receipt["target_recipe"] = target_recipe
         cached_names = _get_final_layer_names(list(adapter.loras), ".self_attn.")
         receipt["cached_adapter"] = {
             name: {
@@ -260,9 +298,7 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
             for name in cached_names
         }
 
-        module_names = _get_final_layer_names(
-            list(adapter_manager.modules), ".self_attn."
-        )
+        module_names = _get_final_layer_names(list(adapter.loras), ".self_attn.")
         receipt["kernel_buffers"] = {}
         for name in module_names:
             module = adapter_manager.modules[name]
@@ -351,9 +387,9 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
         assert len(adapter_ids) == 1
         adapter_id = adapter_ids[0]
         slot = adapter_manager.lora_index_to_id.index(adapter_id)
-        module_names = _get_final_layer_names(
-            list(adapter_manager.modules), ".self_attn."
-        )
+        adapter = adapter_manager.get_adapter(adapter_id)
+        assert adapter is not None
+        module_names = _get_final_layer_names(list(adapter.loras), ".self_attn.")
         assert module_names
 
         num_tokens = 17
@@ -500,10 +536,17 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                     numel *= dimension
                 total_bytes += numel * dtype_sizes[dtype]
             final_attention_names = _get_final_layer_names(keys, ".self_attn.")
+            target_recipe = os.environ.get(
+                "SKYRL_GLM53_LORA_TARGET_RECIPE", "attention"
+            )
+            if target_recipe == "attention_without_kv_up":
+                assert all(".kv_b_proj" not in name for name in keys)
+
             receipt.update(
                 {
                     "key_count": len(keys),
                     "total_bytes": total_bytes,
+                    "target_recipe": target_recipe,
                     "schema_sha256": hashlib.sha256(
                         json.dumps(schema, separators=(",", ":")).encode()
                     ).hexdigest(),
@@ -669,11 +712,7 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
         alpha=32,
         dropout=0.0,
         lora_sync_path=lora_sync_path,
-        target_modules=(
-            "all-linear"
-            if model == SMALL_DRY_RUN_MODEL
-            else MEGATRON_LORA_TARGET_MODULES
-        ),
+        target_modules=_get_megatron_lora_target_modules(model),
         max_loras=1,
     )
 
@@ -759,9 +798,7 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
     inference.enable_chunked_prefill = True
     kv_cache_dtype = os.environ.get("SKYRL_GLM53_KV_CACHE_DTYPE", "fp8")
     assert kv_cache_dtype in {"auto", "fp8"}
-    calculate_kv_scales = os.environ.get(
-        "SKYRL_GLM53_CALCULATE_KV_SCALES", "0"
-    )
+    calculate_kv_scales = os.environ.get("SKYRL_GLM53_CALCULATE_KV_SCALES", "0")
     assert calculate_kv_scales in {"0", "1"}
     inference.engine_init_kwargs = {
         "max_model_len": 32768,
