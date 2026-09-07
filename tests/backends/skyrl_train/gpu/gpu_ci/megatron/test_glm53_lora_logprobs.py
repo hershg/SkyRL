@@ -57,8 +57,10 @@ from tests.backends.skyrl_train.gpu.utils import (
     Timer,
     init_worker_with_type,
 )
+from tests.utils.glm53_parity_inputs import load_parity_inputs
 
 MODEL = "zai-org/GLM-5.3-BF16"
+MODEL_REVISION = "304b8051cfb2b260b61ce0cbe330e02a98e73639"
 SMALL_DRY_RUN_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 POLICY_GPUS = 8
 INFERENCE_TP = 8
@@ -1007,9 +1009,7 @@ async def _generate(client, tokenizer, model: str | None = None):
     return responses, response_mask, logprobs_t, training_input
 
 
-async def _score_responses(client, tokenizer, responses, model):
-    prompt_token_ids = _get_prompt_token_ids(tokenizer)
-
+async def _score_responses(client, tokenizer, responses, model, prompt_token_ids):
     async def score_response(prompt, response):
         result = await client.sample(
             {
@@ -1251,7 +1251,7 @@ def _validate_matrix_update_receipts(receipts, policy_gpus: int, update_scope: s
     ), "matrix perturbation must preserve all distributed replicas"
 
 
-async def _run_final_attention_scope_matrix(
+async def _run_lora_update_matrix(
     *,
     client,
     tokenizer,
@@ -1259,6 +1259,7 @@ async def _run_final_attention_scope_matrix(
     cfg,
     model,
     base_responses,
+    prompt_token_ids,
     adapter_name,
     lora_mask,
     lora_logprobs,
@@ -1266,24 +1267,44 @@ async def _run_final_attention_scope_matrix(
     lora_input,
     lora_sync_path,
     policy_gpus,
+    compare_update_scales=False,
 ):
+    cells = [(scope, scope, MATRIX_NOISE_STDS) for scope in MATRIX_UPDATE_SCOPES]
+    if compare_update_scales:
+        assert _get_megatron_lora_target_modules(model) == ["linear_proj"]
+        cells = [(f"all_output_std_{std}", "all", (std,)) for std in (0.04, 0.25)]
     snapshot_receipts = _inspect_policy_boundary(policy, "snapshot_glm53_lora_b")
     assert {receipt["rank"] for receipt in snapshot_receipts} == set(range(policy_gpus))
     assert all(receipt["parameter_count"] > 0 for receipt in snapshot_receipts)
     results = {}
     adapter_loaded = True
     try:
-        for update_scope in MATRIX_UPDATE_SCOPES:
+        for label, update_scope, noise_stds in cells:
             selected = None
             updated_megatron_logprobs = None
             update_receipts = None
-            for noise_std in MATRIX_NOISE_STDS:
+            for noise_std in noise_stds:
                 restore_receipts = _inspect_policy_boundary(
                     policy, "restore_glm53_lora_b"
                 )
                 assert {receipt["rank"] for receipt in restore_receipts} == set(
                     range(policy_gpus)
                 )
+                if compare_update_scales:
+                    restored = _get_megatron_logprobs(policy, lora_input)
+                    _print_boundary_receipt(
+                        f"restored_{label}",
+                        {
+                            "trainer_logprobs": restored[lora_mask.bool()].tolist(),
+                        },
+                    )
+                    _assert_logprobs_match(
+                        f"restored baseline {label}",
+                        lora_megatron_logprobs,
+                        restored,
+                        lora_mask,
+                        MEGATRON_MEAN_DIFF_THRESHOLD,
+                    )
                 with Timer(f"apply_matrix_update_{update_scope}_{noise_std}"):
                     update_receipts = _inspect_policy_boundary(
                         policy,
@@ -1311,7 +1332,7 @@ async def _run_final_attention_scope_matrix(
                     selected = noise_std
                     break
             if selected is None:
-                selected = MATRIX_NOISE_STDS[-1]
+                selected = noise_stds[-1]
             assert updated_megatron_logprobs is not None
             assert update_receipts is not None
 
@@ -1346,10 +1367,22 @@ async def _run_final_attention_scope_matrix(
             )
 
             updated_mask, updated_vllm_logprobs, updated_input = await _score_responses(
-                client, tokenizer, base_responses, adapter_name
+                client, tokenizer, base_responses, adapter_name, prompt_token_ids
             )
             assert torch.equal(lora_mask, updated_mask)
+            assert torch.equal(lora_input["sequences"], updated_input["sequences"])
             rescored_megatron_logprobs = _get_megatron_logprobs(policy, updated_input)
+            _print_boundary_receipt(
+                f"updated_{label}",
+                {
+                    "sampler_logprobs": updated_vllm_logprobs[
+                        updated_mask.bool()
+                    ].tolist(),
+                    "trainer_logprobs": rescored_megatron_logprobs[
+                        updated_mask.bool()
+                    ].tolist(),
+                },
+            )
             metrics = _direct_update_metrics(
                 lora_logprobs,
                 lora_megatron_logprobs,
@@ -1363,15 +1396,18 @@ async def _run_final_attention_scope_matrix(
             )
             metrics["updated_parameters"] = update_receipts[0]["updated_parameters"]
             metrics["updated_elements"] = update_receipts[0]["updated_elements"]
-            results[update_scope] = metrics
+            results[label] = metrics
             print(
-                "GLM53_LORA_SCOPE_MATRIX "
-                f"{update_scope} {json.dumps(metrics, sort_keys=True)}"
+                f"GLM53_LORA_SCOPE_MATRIX {label} {json.dumps(metrics, sort_keys=True)}"
             )
 
-        assert set(results) == set(MATRIX_UPDATE_SCOPES)
-        control = results["final_attention_output"]
+        assert set(results) == {label for label, _, _ in cells}
         print(f"GLM53_LORA_SCOPE_MATRIX_RESULT {json.dumps(results, sort_keys=True)}")
+        if compare_update_scales:
+            assert all(result["has_sufficient_signal"] for result in results.values())
+            assert all(result["passes_contract"] for result in results.values())
+            return
+        control = results["final_attention_output"]
         assert control["trainer_mean"] > MIN_DIRECT_UPDATE_MEAN
         assert control["passes_contract"], (
             "known final-attention output control failed the direct update contract"
@@ -1387,6 +1423,13 @@ async def _run_final_attention_scope_matrix(
 @pytest.mark.b300
 async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixture):
     model = os.environ.get("SKYRL_GLM53_MODEL", MODEL)
+    fixed_inputs = None
+    if model != SMALL_DRY_RUN_MODEL:
+        fixed_inputs = load_parity_inputs(
+            os.environ["SKYRL_GLM53_PARITY_INPUTS"],
+            os.environ["SKYRL_GLM53_PARITY_INPUTS_SHA256"],
+            MODEL_REVISION,
+        )
     policy_nodes, policy_gpus_per_node, inference_tp = _get_test_topology(model)
     policy_gpus = policy_nodes * policy_gpus_per_node
     shared_dir = Path(os.environ["SKYRL_GLM53_SHARED_DIR"])
@@ -1418,11 +1461,21 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
             client = engines.client
             adapter_loaded = False
             try:
-                base_responses, base_mask, base_logprobs, base_input = await _generate(
-                    client, tokenizer, model
+                if fixed_inputs is None:
+                    base_responses, _, _, _ = await _generate(client, tokenizer, model)
+                    prompt_token_ids = _get_prompt_token_ids(tokenizer)
+                else:
+                    prompt_token_ids, base_responses = fixed_inputs
+                _print_boundary_receipt(
+                    "scored_inputs",
+                    {
+                        "prompt_token_ids": prompt_token_ids,
+                        "response_ids": base_responses,
+                        "sha256": os.environ.get("SKYRL_GLM53_PARITY_INPUTS_SHA256"),
+                    },
                 )
                 base_mask, base_logprobs, base_input = await _score_responses(
-                    client, tokenizer, base_responses, model
+                    client, tokenizer, base_responses, model, prompt_token_ids
                 )
                 _print_boundary_receipt(
                     "vllm_kv_scales", await _inspect_vllm_kv_scales(client)
@@ -1476,7 +1529,7 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
 
                 adapter_name = resolve_policy_model_name(cfg)
                 lora_mask, lora_logprobs, lora_input = await _score_responses(
-                    client, tokenizer, base_responses, adapter_name
+                    client, tokenizer, base_responses, adapter_name, prompt_token_ids
                 )
                 assert torch.equal(base_mask, lora_mask)
                 _assert_logprobs_match(
@@ -1496,17 +1549,53 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     MEGATRON_MEAN_DIFF_THRESHOLD,
                 )
 
+                (
+                    repeat_mask,
+                    repeat_vllm_logprobs,
+                    repeat_input,
+                ) = await _score_responses(
+                    client, tokenizer, base_responses, adapter_name, prompt_token_ids
+                )
+                assert torch.equal(lora_mask, repeat_mask)
+                assert torch.equal(lora_input["sequences"], repeat_input["sequences"])
+                repeat_megatron_logprobs = _get_megatron_logprobs(policy, repeat_input)
+                valid = lora_mask.bool()
+                _print_boundary_receipt(
+                    "unchanged_logprobs",
+                    {
+                        "sampler_initial": lora_logprobs[valid].tolist(),
+                        "sampler_repeat": repeat_vllm_logprobs[valid].tolist(),
+                        "trainer_initial": lora_megatron_logprobs[valid].tolist(),
+                        "trainer_repeat": repeat_megatron_logprobs[valid].tolist(),
+                        "response_lengths": lora_mask.sum(dim=1).tolist(),
+                    },
+                )
+                _assert_logprobs_match(
+                    "unchanged sampler repeat",
+                    lora_logprobs,
+                    repeat_vllm_logprobs,
+                    lora_mask,
+                    MEGATRON_MEAN_DIFF_THRESHOLD,
+                )
+                _assert_logprobs_match(
+                    "unchanged trainer repeat",
+                    lora_megatron_logprobs,
+                    repeat_megatron_logprobs,
+                    lora_mask,
+                    MEGATRON_MEAN_DIFF_THRESHOLD,
+                )
                 scope_matrix = os.environ.get("SKYRL_GLM53_SCOPE_MATRIX", "0")
-                assert scope_matrix in {"0", "1"}
-                if scope_matrix == "1":
+                assert scope_matrix in {"0", "1", "scale"}
+                if scope_matrix != "0":
                     adapter_loaded = False
-                    await _run_final_attention_scope_matrix(
+                    await _run_lora_update_matrix(
                         client=client,
                         tokenizer=tokenizer,
                         policy=policy,
                         cfg=cfg,
                         model=model,
                         base_responses=base_responses,
+                        prompt_token_ids=prompt_token_ids,
                         adapter_name=adapter_name,
                         lora_mask=lora_mask,
                         lora_logprobs=lora_logprobs,
@@ -1514,6 +1603,7 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                         lora_input=lora_input,
                         lora_sync_path=lora_sync_path,
                         policy_gpus=policy_gpus,
+                        compare_update_scales=scope_matrix == "scale",
                     )
                     completed = True
                     return
@@ -1638,8 +1728,10 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     updated_vllm_logprobs,
                     updated_input,
                 ) = await _score_responses(
-                    client, tokenizer, base_responses, adapter_name
+                    client, tokenizer, base_responses, adapter_name, prompt_token_ids
                 )
+                assert torch.equal(lora_mask, updated_mask)
+                assert torch.equal(lora_input["sequences"], updated_input["sequences"])
                 updated_megatron_logprobs = _get_megatron_logprobs(
                     policy, updated_input
                 )
@@ -1647,6 +1739,15 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 sampler_delta = updated_vllm_logprobs[valid] - lora_logprobs[valid]
                 trainer_delta = (
                     updated_megatron_logprobs[valid] - lora_megatron_logprobs[valid]
+                )
+                _print_boundary_receipt(
+                    "update_logprobs",
+                    {
+                        "sampler_updated": updated_vllm_logprobs[valid].tolist(),
+                        "trainer_updated": updated_megatron_logprobs[valid].tolist(),
+                        "sampler_delta": sampler_delta.tolist(),
+                        "trainer_delta": trainer_delta.tolist(),
+                    },
                 )
                 delta_error = (sampler_delta - trainer_delta).abs()
                 cosine = torch.nn.functional.cosine_similarity(
