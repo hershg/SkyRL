@@ -59,6 +59,7 @@ from tests.backends.skyrl_train.gpu.utils import (
 )
 from tests.utils.glm53_parity_inputs import load_parity_inputs
 from tests.utils.glm53_scoring import score_fixed_responses
+from tests.utils.glm53_sparse_capture import SparseCapture
 
 MODEL = "zai-org/GLM-5.3-BF16"
 MODEL_REVISION = "304b8051cfb2b260b61ce0cbe330e02a98e73639"
@@ -103,11 +104,7 @@ MEGATRON_LORA_TARGET_MODULES = [
 GLM53_LORA_TARGET_RECIPES = {
     "attention": MEGATRON_LORA_TARGET_MODULES,
     "attention_output": ["linear_proj"],
-    "attention_without_kv_up": [
-        module
-        for module in MEGATRON_LORA_TARGET_MODULES
-        if module != "linear_kv_up_proj"
-    ],
+    "attention_without_kv_up": [module for module in MEGATRON_LORA_TARGET_MODULES if module != "linear_kv_up_proj"],
 }
 
 FINAL_ATTENTION_SCOPE_MODULES = {
@@ -138,9 +135,7 @@ VLLM_SUPPORTED_LORA_TARGET_MODULES = [
 ]
 
 
-def _get_sample_indices(
-    numel: int, sample_count: int, device: torch.device
-) -> torch.Tensor:
+def _get_sample_indices(numel: int, sample_count: int, device: torch.device) -> torch.Tensor:
     if sample_count == 0:
         return torch.empty(0, dtype=torch.long, device=device)
     if sample_count == 1:
@@ -267,9 +262,7 @@ def _get_megatron_lora_target_modules(model: str) -> str | list[str]:
     if model == SMALL_DRY_RUN_MODEL:
         return "all-linear"
     recipe = os.environ.get("SKYRL_GLM53_LORA_TARGET_RECIPE", "attention")
-    assert recipe in GLM53_LORA_TARGET_RECIPES, (
-        f"unsupported GLM 5.3 LoRA target recipe: {recipe}"
-    )
+    assert recipe in GLM53_LORA_TARGET_RECIPES, f"unsupported GLM 5.3 LoRA target recipe: {recipe}"
     return GLM53_LORA_TARGET_RECIPES[recipe]
 
 
@@ -294,9 +287,7 @@ def test_attention_output_recipe_is_explicit_and_narrow(monkeypatch):
     assert _get_megatron_lora_target_modules(MODEL) == ["linear_proj"]
 
 
-def _assert_adapter_matches_target_recipe(
-    adapter_names: list[str], target_recipe: str
-) -> None:
+def _assert_adapter_matches_target_recipe(adapter_names: list[str], target_recipe: str) -> None:
     assert adapter_names, "published GLM 5.3 adapter is empty"
     if target_recipe == "attention":
         return
@@ -307,18 +298,12 @@ def _assert_adapter_matches_target_recipe(
     assert all(".o_proj" in name for name in adapter_names)
 
 
-def _is_final_attention_scope_parameter(
-    name: str, final_layer: int | None, update_scope: str
-) -> bool:
+def _is_final_attention_scope_parameter(name: str, final_layer: int | None, update_scope: str) -> bool:
     modules = FINAL_ATTENTION_SCOPE_MODULES.get(update_scope)
     if modules is None or final_layer is None:
         return False
     return any(
-        name
-        == (
-            f"decoder.layers.{final_layer}.self_attention."
-            f"{module}.adapter.linear_out.weight"
-        )
+        name == (f"decoder.layers.{final_layer}.self_attention." f"{module}.adapter.linear_out.weight")
         for module in modules
     )
 
@@ -333,19 +318,26 @@ def test_final_attention_scope_selection_is_exact():
             assert _is_final_attention_scope_parameter(name, final_layer, scope)
 
     kv_up = f"{prefix}.linear_kv_up_proj.adapter.linear_out.weight"
-    assert not any(
-        _is_final_attention_scope_parameter(kv_up, final_layer, scope)
-        for scope in MATRIX_UPDATE_SCOPES
-    )
-    wrong_layer = (
-        "decoder.layers.76.self_attention.linear_proj.adapter.linear_out.weight"
-    )
-    assert not _is_final_attention_scope_parameter(
-        wrong_layer, final_layer, "final_attention_output"
-    )
+    assert not any(_is_final_attention_scope_parameter(kv_up, final_layer, scope) for scope in MATRIX_UPDATE_SCOPES)
+    wrong_layer = "decoder.layers.76.self_attention.linear_proj.adapter.linear_out.weight"
+    assert not _is_final_attention_scope_parameter(wrong_layer, final_layer, "final_attention_output")
 
 
 class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
+    def begin_glm53_sparse_capture(self, directory: str, token_count: int) -> dict:
+        if self.rank == 0:
+            assert not hasattr(self, "_glm53_sparse_capture")
+            self._glm53_sparse_capture = SparseCapture(directory, token_count)
+            self._glm53_sparse_capture.install()
+        return {"rank": self.rank, "capturing": self.rank == 0}
+
+    def end_glm53_sparse_capture(self) -> dict:
+        receipt = {"rank": self.rank, "capturing": self.rank == 0}
+        if self.rank == 0:
+            receipt.update(self._glm53_sparse_capture.restore())
+            del self._glm53_sparse_capture
+        return receipt
+
     def inspect_glm53_zero_output_adapter(self) -> dict:
         manager = self.model_runner.lora_manager._adapter_manager
         adapter_ids = sorted(manager.list_adapters())
@@ -444,20 +436,14 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
                 "tp_size": module.tp_size,
                 "output_slices": list(module.output_slices),
                 "cache_slice_matches": cache_slice_matches,
-                "lora_a": [
-                    _get_sampled_tensor_receipt(tensor) for tensor in kernel_a_weights
-                ],
-                "lora_b": [
-                    _get_sampled_tensor_receipt(tensor) for tensor in kernel_b_weights
-                ],
+                "lora_a": [_get_sampled_tensor_receipt(tensor) for tensor in kernel_a_weights],
+                "lora_b": [_get_sampled_tensor_receipt(tensor) for tensor in kernel_b_weights],
             }
         return receipt
 
     def inspect_glm53_kv_scales(self) -> dict:
         scales = []
-        for name, module in sorted(
-            self.model_runner.compilation_config.static_forward_context.items()
-        ):
+        for name, module in sorted(self.model_runner.compilation_config.static_forward_context.items()):
             if not hasattr(module, "_k_scale"):
                 continue
             k_scale = module._k_scale.item()
@@ -515,9 +501,7 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
                 adapter_manager.vocab_size,
             )
             element_count = num_tokens * module.input_size
-            inputs = torch.arange(
-                element_count, dtype=torch.int64, device=module.device
-            )
+            inputs = torch.arange(element_count, dtype=torch.int64, device=module.device)
             inputs = (
                 (inputs.remainder(257) - 128)
                 .to(module.lora_a_stacked[0].dtype)
@@ -541,9 +525,7 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
             torch.cuda.synchronize()
 
             expected_slices = []
-            for lora_a, lora_b in zip(
-                module.lora_a_stacked, module.lora_b_stacked, strict=True
-            ):
+            for lora_a, lora_b in zip(module.lora_a_stacked, module.lora_b_stacked, strict=True):
                 intermediate = inputs.float() @ lora_a[slot, 0].float().T
                 expected_slices.append(intermediate @ lora_b[slot, 0].float().T)
             expected = torch.cat(expected_slices, dim=-1)
@@ -597,9 +579,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
         selected = {}
         for chunk in self.actor_module:
             model = unwrap_model(chunk)
-            names = _get_final_layer_names(
-                [name for name, _ in model.named_parameters()], ".self_attention."
-            )
+            names = _get_final_layer_names([name for name, _ in model.named_parameters()], ".self_attention.")
             parameters = dict(model.named_parameters())
             for name in names:
                 if "linear_in.weight" in name or "linear_out.weight" in name:
@@ -643,9 +623,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                     numel *= dimension
                 total_bytes += numel * dtype_sizes[dtype]
             final_attention_names = _get_final_layer_names(keys, ".self_attn.")
-            target_recipe = os.environ.get(
-                "SKYRL_GLM53_LORA_TARGET_RECIPE", "attention"
-            )
+            target_recipe = os.environ.get("SKYRL_GLM53_LORA_TARGET_RECIPE", "attention")
             _assert_adapter_matches_target_recipe(keys, target_recipe)
 
             receipt.update(
@@ -653,12 +631,9 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                     "key_count": len(keys),
                     "total_bytes": total_bytes,
                     "target_recipe": target_recipe,
-                    "schema_sha256": hashlib.sha256(
-                        json.dumps(schema, separators=(",", ":")).encode()
-                    ).hexdigest(),
+                    "schema_sha256": hashlib.sha256(json.dumps(schema, separators=(",", ":")).encode()).hexdigest(),
                     "representative_tensors": {
-                        name: _get_sampled_tensor_receipt(adapter.get_tensor(name))
-                        for name in final_attention_names
+                        name: _get_sampled_tensor_receipt(adapter.get_tensor(name)) for name in final_attention_names
                     },
                 }
             )
@@ -667,9 +642,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
     def snapshot_glm53_lora_b(self) -> dict[str, int | str]:
         from megatron.core.utils import unwrap_model
 
-        assert not hasattr(self, "_glm53_lora_b_snapshot"), (
-            "GLM 5.3 LoRA-B snapshot already exists"
-        )
+        assert not hasattr(self, "_glm53_lora_b_snapshot"), "GLM 5.3 LoRA-B snapshot already exists"
         snapshot = {}
         elements = 0
         for chunk_index, chunk in enumerate(self.actor_module):
@@ -704,9 +677,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                     parameter.copy_(snapshot[key])
                     restored.add(key)
                     elements += parameter.numel()
-        assert restored == set(snapshot), (
-            "failed to restore every snapshotted GLM 5.3 LoRA-B parameter"
-        )
+        assert restored == set(snapshot), "failed to restore every snapshotted GLM 5.3 LoRA-B parameter"
         return {
             "hostname": socket.gethostname(),
             "rank": torch.distributed.get_rank(),
@@ -729,9 +700,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
         updated_elements = 0
         delta_norm = 0.0
         update_fingerprint = hashlib.sha256()
-        resolved_update_scope = update_scope or os.environ.get(
-            "SKYRL_GLM53_UPDATE_SCOPE", "all"
-        )
+        resolved_update_scope = update_scope or os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
         assert (
             resolved_update_scope
             in {
@@ -765,9 +734,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                         continue
                     if (
                         resolved_update_scope in FINAL_ATTENTION_SCOPE_MODULES
-                        and not _is_final_attention_scope_parameter(
-                            name, final_local_layer, resolved_update_scope
-                        )
+                        and not _is_final_attention_scope_parameter(name, final_local_layer, resolved_update_scope)
                     ):
                         continue
                     if resolved_update_scope == "final_expert":
@@ -775,8 +742,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                         if (
                             not is_routed_expert
                             or parallel_state.get_pipeline_model_parallel_rank()
-                            != parallel_state.get_pipeline_model_parallel_world_size()
-                            - 1
+                            != parallel_state.get_pipeline_model_parallel_world_size() - 1
                             or layer_match is None
                             or int(layer_match.group(1)) != final_local_layer
                         ):
@@ -788,10 +754,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                     digest = hashlib.sha256(parameter_key.encode()).digest()
                     parameter_seed = seed + int.from_bytes(digest[:8], "little")
                     update_fingerprint.update(
-                        (
-                            f"{parameter_key}:{tuple(parameter.shape)}:"
-                            f"{parameter.dtype}:{parameter_seed}"
-                        ).encode()
+                        (f"{parameter_key}:{tuple(parameter.shape)}:" f"{parameter.dtype}:{parameter_seed}").encode()
                     )
                     generator = torch.Generator(device=parameter.device)
                     generator.manual_seed(parameter_seed % (2**63 - 1))
@@ -806,20 +769,13 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
 
                     updated_parameters += 1
                     updated_elements += parameter.numel()
-                    delta_norm += torch.linalg.vector_norm(
-                        noise, dtype=torch.float32
-                    ).item()
+                    delta_norm += torch.linalg.vector_norm(noise, dtype=torch.float32).item()
 
         if resolved_update_scope == "final_expert":
-            is_final_pipeline_stage = (
-                pipeline_rank
-                == parallel_state.get_pipeline_model_parallel_world_size() - 1
-            )
+            is_final_pipeline_stage = pipeline_rank == parallel_state.get_pipeline_model_parallel_world_size() - 1
             assert (updated_parameters > 0) == is_final_pipeline_stage
         else:
-            assert updated_parameters > 0, (
-                "noise update found no trainable LoRA parameters"
-            )
+            assert updated_parameters > 0, "noise update found no trainable LoRA parameters"
         return {
             "rank": rank,
             "tensor_rank": tensor_rank,
@@ -881,16 +837,10 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
 
     megatron = cfg.trainer.policy.megatron_config
     megatron.tensor_model_parallel_size = policy_gpus_per_node
-    megatron.pipeline_model_parallel_size = int(
-        os.environ.get("SKYRL_GLM53_PIPELINE_PARALLEL_SIZE", "1")
-    )
-    megatron.context_parallel_size = int(
-        os.environ.get("SKYRL_GLM53_CONTEXT_PARALLEL_SIZE", "1")
-    )
+    megatron.pipeline_model_parallel_size = int(os.environ.get("SKYRL_GLM53_PIPELINE_PARALLEL_SIZE", "1"))
+    megatron.context_parallel_size = int(os.environ.get("SKYRL_GLM53_CONTEXT_PARALLEL_SIZE", "1"))
     model_parallel_world_size = (
-        megatron.tensor_model_parallel_size
-        * megatron.pipeline_model_parallel_size
-        * megatron.context_parallel_size
+        megatron.tensor_model_parallel_size * megatron.pipeline_model_parallel_size * megatron.context_parallel_size
     )
     assert policy_nodes * policy_gpus_per_node == model_parallel_world_size, (
         "The diagnostic requires exactly one data-parallel replica: "
@@ -980,9 +930,7 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
             "disable_custom_all_reduce": True,
             "trust_remote_code": True,
         }
-    inference.engine_init_kwargs["worker_extension_cls"] = (
-        f"{__name__}._InspectableInferenceWorkerWrap"
-    )
+    inference.engine_init_kwargs["worker_extension_cls"] = f"{__name__}._InspectableInferenceWorkerWrap"
 
     cfg.generator.sampling_params = SamplingParams(
         max_generate_length=MAX_GENERATE_LENGTH,
@@ -1021,9 +969,7 @@ async def _generate(client, tokenizer, model: str | None = None):
 
     with Timer("generate_with_vllm"):
         output = await client.generate(
-            InferenceEngineInput(
-                prompt_token_ids=prompt_token_ids, sampling_params=sampling_params
-            ),
+            InferenceEngineInput(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params),
             model=model,
         )
 
@@ -1037,15 +983,45 @@ async def _generate(client, tokenizer, model: str | None = None):
 
 
 async def _score_responses(
-    client, tokenizer, responses, model, prompt_token_ids, concurrent=True
+    client,
+    tokenizer,
+    responses,
+    model,
+    prompt_token_ids,
+    concurrent=True,
+    capture_directory=None,
 ):
-    with Timer("score_fixed_responses_with_vllm"):
-        response_logprobs = await score_fixed_responses(
-            client, prompt_token_ids, responses, model, concurrent
+    if capture_directory is not None:
+        assert not concurrent
+        lengths = [len(p) + len(r) for p, r in zip(prompt_token_ids, responses, strict=True)]
+        assert lengths.count(max(lengths)) == 1
+        await client._call_all_servers(
+            "/collective_rpc",
+            {
+                "method": "begin_glm53_sparse_capture",
+                "kwargs": {
+                    "directory": capture_directory,
+                    "token_count": max(lengths),
+                },
+            },
         )
-    return _build_training_input(
-        tokenizer, prompt_token_ids, responses, response_logprobs
-    )
+    try:
+        with Timer("score_fixed_responses_with_vllm"):
+            response_logprobs = await score_fixed_responses(client, prompt_token_ids, responses, model, concurrent)
+    finally:
+        if capture_directory is not None:
+            captured = await client._call_all_servers(
+                "/collective_rpc",
+                {"method": "end_glm53_sparse_capture", "kwargs": {}},
+            )
+            _print_boundary_receipt("sparse_capture", captured)
+            workers = [
+                worker for server in captured.values() for worker in server["body"]["results"] if worker["capturing"]
+            ]
+            assert len(workers) == 1
+            assert workers[0]["counts"]["attention"] == 78
+            assert workers[0]["counts"]["indexer"] > 0
+    return _build_training_input(tokenizer, prompt_token_ids, responses, response_logprobs)
 
 
 def _build_training_input(tokenizer, prompt_token_ids, responses, rollout_logprobs):
@@ -1074,12 +1050,8 @@ def _build_training_input(tokenizer, prompt_token_ids, responses, rollout_logpro
             "loss_mask": loss_mask_t,
             "rollout_logprobs": logprobs_t,
             "rollout_expert_indices": None,
-            "action_log_probs": torch.zeros(
-                (batch_size, num_actions), dtype=torch.float32
-            ),
-            "base_action_log_probs": torch.zeros(
-                (batch_size, num_actions), dtype=torch.float32
-            ),
+            "action_log_probs": torch.zeros((batch_size, num_actions), dtype=torch.float32),
+            "base_action_log_probs": torch.zeros((batch_size, num_actions), dtype=torch.float32),
             "advantages": torch.zeros((batch_size, num_actions), dtype=torch.float32),
         }
     )
@@ -1105,9 +1077,7 @@ def _assert_logprobs_match(label, expected, actual, response_mask, threshold):
         f"max_diff={difference.max().item():.6f}"
     )
     assert torch.isfinite(difference).all()
-    assert mean_difference < threshold, (
-        f"{label} mean diff {mean_difference:.6f} exceeds {threshold}"
-    )
+    assert mean_difference < threshold, f"{label} mean diff {mean_difference:.6f} exceeds {threshold}"
 
 
 def _assert_logprobs_changed(before, after, response_mask):
@@ -1118,9 +1088,9 @@ def _assert_logprobs_changed(before, after, response_mask):
         f"mean_diff={mean_difference:.6f}, max_diff={difference.max().item():.6f}"
     )
     assert torch.isfinite(difference).all()
-    assert mean_difference > MIN_UPDATED_LOGPROB_DIFF, (
-        f"dummy LoRA update changed mean logprob by only {mean_difference:.6f}"
-    )
+    assert (
+        mean_difference > MIN_UPDATED_LOGPROB_DIFF
+    ), f"dummy LoRA update changed mean logprob by only {mean_difference:.6f}"
 
 
 def _init_perturbable_policy(cfg, policy_nodes, policy_gpus_per_node):
@@ -1157,9 +1127,7 @@ async def _create_inference_engine(stack, cfg, model):
 
 async def _create_policy(cfg, policy_nodes, policy_gpus_per_node):
     with Timer("initialize_megatron"):
-        return await asyncio.to_thread(
-            _init_perturbable_policy, cfg, policy_nodes, policy_gpus_per_node
-        )
+        return await asyncio.to_thread(_init_perturbable_policy, cfg, policy_nodes, policy_gpus_per_node)
 
 
 def _print_boundary_receipt(label: str, receipt) -> None:
@@ -1221,9 +1189,7 @@ def _direct_update_metrics(
             sampler_delta.float().unsqueeze(0),
             trainer_delta.float().unsqueeze(0),
         ).item(),
-        "scale": (
-            torch.dot(sampler_delta.float(), trainer_delta.float()) / denominator
-        ).item(),
+        "scale": (torch.dot(sampler_delta.float(), trainer_delta.float()) / denominator).item(),
     }
     metrics["passes_contract"] = (
         metrics["cosine"] > MIN_DIRECT_UPDATE_COSINE
@@ -1291,12 +1257,8 @@ async def _run_lora_update_matrix(
             updated_megatron_logprobs = None
             update_receipts = None
             for noise_std in noise_stds:
-                restore_receipts = _inspect_policy_boundary(
-                    policy, "restore_glm53_lora_b"
-                )
-                assert {receipt["rank"] for receipt in restore_receipts} == set(
-                    range(policy_gpus)
-                )
+                restore_receipts = _inspect_policy_boundary(policy, "restore_glm53_lora_b")
+                assert {receipt["rank"] for receipt in restore_receipts} == set(range(policy_gpus))
                 if compare_update_scales:
                     restored = _get_megatron_logprobs(policy, lora_input)
                     _print_boundary_receipt(
@@ -1320,14 +1282,9 @@ async def _run_lora_update_matrix(
                         noise_std,
                         update_scope,
                     )
-                _validate_matrix_update_receipts(
-                    update_receipts, policy_gpus, update_scope
-                )
+                _validate_matrix_update_receipts(update_receipts, policy_gpus, update_scope)
                 updated_megatron_logprobs = _get_megatron_logprobs(policy, lora_input)
-                trainer_delta = (
-                    updated_megatron_logprobs[lora_mask.bool()]
-                    - lora_megatron_logprobs[lora_mask.bool()]
-                )
+                trainer_delta = updated_megatron_logprobs[lora_mask.bool()] - lora_megatron_logprobs[lora_mask.bool()]
                 trainer_mean = trainer_delta.abs().mean().item()
                 assert torch.isfinite(trainer_delta).all()
                 print(
@@ -1365,9 +1322,7 @@ async def _run_lora_update_matrix(
                     str(lora_sync_path),
                 ),
             )
-            _print_boundary_receipt(
-                f"vllm_matrix_{update_scope}", await _inspect_vllm_boundary(client)
-            )
+            _print_boundary_receipt(f"vllm_matrix_{update_scope}", await _inspect_vllm_boundary(client))
             _print_boundary_receipt(
                 f"vllm_attention_kernel_matrix_{update_scope}",
                 await _check_vllm_attention_kernels(client),
@@ -1382,12 +1337,8 @@ async def _run_lora_update_matrix(
             _print_boundary_receipt(
                 f"updated_{label}",
                 {
-                    "sampler_logprobs": updated_vllm_logprobs[
-                        updated_mask.bool()
-                    ].tolist(),
-                    "trainer_logprobs": rescored_megatron_logprobs[
-                        updated_mask.bool()
-                    ].tolist(),
+                    "sampler_logprobs": updated_vllm_logprobs[updated_mask.bool()].tolist(),
+                    "trainer_logprobs": rescored_megatron_logprobs[updated_mask.bool()].tolist(),
                 },
             )
             metrics = _direct_update_metrics(
@@ -1398,15 +1349,11 @@ async def _run_lora_update_matrix(
                 updated_mask,
             )
             metrics["noise_std"] = selected
-            metrics["has_sufficient_signal"] = (
-                metrics["trainer_mean"] > MIN_DIRECT_UPDATE_MEAN
-            )
+            metrics["has_sufficient_signal"] = metrics["trainer_mean"] > MIN_DIRECT_UPDATE_MEAN
             metrics["updated_parameters"] = update_receipts[0]["updated_parameters"]
             metrics["updated_elements"] = update_receipts[0]["updated_elements"]
             results[label] = metrics
-            print(
-                f"GLM53_LORA_SCOPE_MATRIX {label} {json.dumps(metrics, sort_keys=True)}"
-            )
+            print(f"GLM53_LORA_SCOPE_MATRIX {label} {json.dumps(metrics, sort_keys=True)}")
 
         assert set(results) == {label for label, _, _ in cells}
         print(f"GLM53_LORA_SCOPE_MATRIX_RESULT {json.dumps(results, sort_keys=True)}")
@@ -1416,9 +1363,7 @@ async def _run_lora_update_matrix(
             return
         control = results["final_attention_output"]
         assert control["trainer_mean"] > MIN_DIRECT_UPDATE_MEAN
-        assert control["passes_contract"], (
-            "known final-attention output control failed the direct update contract"
-        )
+        assert control["passes_contract"], "known final-attention output control failed the direct update contract"
     finally:
         if adapter_loaded:
             await client.unload_lora_adapter(adapter_name)
@@ -1435,6 +1380,7 @@ async def _run_unchanged_score_probe(
     base_input,
     lora_sync_path,
     compare_base=False,
+    capture_sparse=False,
 ):
     trainer_before = _inspect_policy_boundary(policy, "inspect_glm53_lora_parameters")
     with Timer("repeatability_initial_publication"):
@@ -1450,9 +1396,7 @@ async def _run_unchanged_score_probe(
     try:
         _print_boundary_receipt(
             "repeatability_export",
-            _inspect_policy_boundary(
-                policy, "inspect_glm53_exported_adapter", str(lora_sync_path)
-            ),
+            _inspect_policy_boundary(policy, "inspect_glm53_exported_adapter", str(lora_sync_path)),
         )
         sampler_before = await _inspect_vllm_boundary(client)
         _print_boundary_receipt("repeatability_sampler_before", sampler_before)
@@ -1483,11 +1427,14 @@ async def _run_unchanged_score_probe(
                         client,
                         tokenizer,
                         responses,
-                        cfg.trainer.policy.model.path
-                        if mode == "base"
-                        else adapter_name,
+                        cfg.trainer.policy.model.path if mode == "base" else adapter_name,
                         prompts,
                         concurrent=mode == "concurrent",
+                        capture_directory=(
+                            str(lora_sync_path.parent / "sparse-capture" / lora_sync_path.name / f"{mode}_{repeat}")
+                            if capture_sparse and mode == "base" and repeat < 2
+                            else None
+                        ),
                     )
                 assert torch.equal(base_input["sequences"], current_input["sequences"])
                 assert torch.equal(mask, current_mask.bool())
@@ -1501,9 +1448,7 @@ async def _run_unchanged_score_probe(
                         "response_lengths": mask.sum(dim=1).tolist(),
                     },
                 )
-        trainer_after = _inspect_policy_boundary(
-            policy, "inspect_glm53_lora_parameters"
-        )
+        trainer_after = _inspect_policy_boundary(policy, "inspect_glm53_lora_parameters")
         sampler_after = await _inspect_vllm_boundary(client)
         assert trainer_before == trainer_after
         assert sampler_before == sampler_after
@@ -1543,9 +1488,7 @@ async def _run_unchanged_score_probe(
             },
         )
         assert all(
-            pair["mean"] < 0.0075 and pair["p99"] < 0.075
-            for pairs in results.values()
-            for pair in pairs
+            pair["mean"] < 0.0075 and pair["p99"] < 0.075 for pairs in results.values() for pair in pairs
         ), "Unchanged scoring noise exceeds 10% of the existing update-error budgets"
     finally:
         await client.unload_lora_adapter(adapter_name)
@@ -1572,8 +1515,15 @@ async def test_glm53_base_and_zero_adapter_repeatability(glm53_ray_init_fixture)
     await _run_glm53_lora_probe(repeatability_mode="zero_adapter")
 
 
+@pytest.mark.asyncio
+@pytest.mark.megatron
+@pytest.mark.b300
+async def test_glm53_sparse_attention_capture(glm53_ray_init_fixture):
+    await _run_glm53_lora_probe(repeatability_mode="sparse_capture")
+
+
 async def _run_glm53_lora_probe(repeatability_mode=None):
-    assert repeatability_mode in {None, "submission", "zero_adapter"}
+    assert repeatability_mode in {None, "submission", "zero_adapter", "sparse_capture"}
     model = os.environ.get("SKYRL_GLM53_MODEL", MODEL)
     fixed_inputs = None
     if model != SMALL_DRY_RUN_MODEL:
@@ -1588,9 +1538,9 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
     lora_sync_path = shared_dir / f"glm53-lora-parity-{uuid.uuid4().hex}"
     lora_sync_path.mkdir(parents=True)
 
-    assert ray.cluster_resources().get("GPU", 0) >= policy_gpus + inference_tp, (
-        f"LoRA parity requires {policy_gpus + inference_tp} GPUs in the connected Ray cluster"
-    )
+    assert (
+        ray.cluster_resources().get("GPU", 0) >= policy_gpus + inference_tp
+    ), f"LoRA parity requires {policy_gpus + inference_tp} GPUs in the connected Ray cluster"
 
     cfg = _get_glm53_lora_config(model, str(lora_sync_path))
     tokenizer = get_tokenizer(model)
@@ -1629,9 +1579,7 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
                 base_mask, base_logprobs, base_input = await _score_responses(
                     client, tokenizer, base_responses, model, prompt_token_ids
                 )
-                _print_boundary_receipt(
-                    "vllm_kv_scales", await _inspect_vllm_kv_scales(client)
-                )
+                _print_boundary_receipt("vllm_kv_scales", await _inspect_vllm_kv_scales(client))
 
                 with Timer("initialize_weight_sync"):
                     ray.get(
@@ -1653,7 +1601,8 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
                         base_responses,
                         base_input,
                         lora_sync_path,
-                        compare_base=repeatability_mode == "zero_adapter",
+                        compare_base=repeatability_mode in {"zero_adapter", "sparse_capture"},
+                        capture_sparse=repeatability_mode == "sparse_capture",
                     )
                     completed = True
                     return
@@ -1690,9 +1639,7 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
                         str(lora_sync_path),
                     ),
                 )
-                _print_boundary_receipt(
-                    "vllm_initial", await _inspect_vllm_boundary(client)
-                )
+                _print_boundary_receipt("vllm_initial", await _inspect_vllm_boundary(client))
 
                 adapter_name = resolve_policy_model_name(cfg)
                 lora_mask, lora_logprobs, lora_input = await _score_responses(
@@ -1720,9 +1667,7 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
                     repeat_mask,
                     repeat_vllm_logprobs,
                     repeat_input,
-                ) = await _score_responses(
-                    client, tokenizer, base_responses, adapter_name, prompt_token_ids
-                )
+                ) = await _score_responses(client, tokenizer, base_responses, adapter_name, prompt_token_ids)
                 assert torch.equal(lora_mask, repeat_mask)
                 assert torch.equal(lora_input["sequences"], repeat_input["sequences"])
                 repeat_megatron_logprobs = _get_megatron_logprobs(policy, repeat_input)
@@ -1775,9 +1720,7 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
                     completed = True
                     return
 
-                lora_noise_std = float(
-                    os.environ.get("SKYRL_GLM53_LORA_NOISE_STD", LORA_NOISE_STD)
-                )
+                lora_noise_std = float(os.environ.get("SKYRL_GLM53_LORA_NOISE_STD", LORA_NOISE_STD))
                 assert math.isfinite(lora_noise_std) and lora_noise_std > 0
                 with Timer("apply_dummy_lora_update"):
                     update_receipts = ray.get(
@@ -1793,20 +1736,15 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
                     should_update = (
                         update_scope != "final_expert"
                         or receipt["pipeline_rank"]
-                        == cfg.trainer.policy.megatron_config.pipeline_model_parallel_size
-                        - 1
+                        == cfg.trainer.policy.megatron_config.pipeline_model_parallel_size - 1
                     )
                     assert (receipt["updated_parameters"] > 0) == should_update
                     assert (receipt["updated_elements"] > 0) == should_update
                     assert (receipt["delta_norm"] > 0) == should_update
-                assert {receipt["rank"] for receipt in update_receipts} == set(
-                    range(policy_gpus)
-                )
+                assert {receipt["rank"] for receipt in update_receipts} == set(range(policy_gpus))
                 receipts_by_pipeline_stage = {}
                 for receipt in update_receipts:
-                    receipts_by_pipeline_stage.setdefault(
-                        receipt["pipeline_rank"], []
-                    ).append(receipt)
+                    receipts_by_pipeline_stage.setdefault(receipt["pipeline_rank"], []).append(receipt)
                 for stage_receipts in receipts_by_pipeline_stage.values():
                     assert (
                         len(
@@ -1829,14 +1767,9 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
                         receipt["expert_rank"],
                         receipt["pipeline_rank"],
                     )
-                    receipts_by_model_coordinate.setdefault(coordinate, []).append(
-                        receipt
-                    )
+                    receipts_by_model_coordinate.setdefault(coordinate, []).append(receipt)
                 for replicas in receipts_by_model_coordinate.values():
-                    assert (
-                        len(replicas)
-                        == cfg.trainer.policy.megatron_config.context_parallel_size
-                    )
+                    assert len(replicas) == cfg.trainer.policy.megatron_config.context_parallel_size
                     assert {
                         (
                             receipt["updated_parameters"],
@@ -1857,9 +1790,7 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
                     "trainer_updated",
                     _inspect_policy_boundary(policy, "inspect_glm53_lora_parameters"),
                 )
-                _assert_logprobs_changed(
-                    lora_megatron_logprobs, updated_logprobs, lora_mask
-                )
+                _assert_logprobs_changed(lora_megatron_logprobs, updated_logprobs, lora_mask)
 
                 await client.unload_lora_adapter(adapter_name)
                 adapter_loaded = False
@@ -1882,9 +1813,7 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
                         str(lora_sync_path),
                     ),
                 )
-                _print_boundary_receipt(
-                    "vllm_updated", await _inspect_vllm_boundary(client)
-                )
+                _print_boundary_receipt("vllm_updated", await _inspect_vllm_boundary(client))
                 _print_boundary_receipt(
                     "vllm_attention_kernel_updated",
                     await _check_vllm_attention_kernels(client),
@@ -1894,19 +1823,13 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
                     updated_mask,
                     updated_vllm_logprobs,
                     updated_input,
-                ) = await _score_responses(
-                    client, tokenizer, base_responses, adapter_name, prompt_token_ids
-                )
+                ) = await _score_responses(client, tokenizer, base_responses, adapter_name, prompt_token_ids)
                 assert torch.equal(lora_mask, updated_mask)
                 assert torch.equal(lora_input["sequences"], updated_input["sequences"])
-                updated_megatron_logprobs = _get_megatron_logprobs(
-                    policy, updated_input
-                )
+                updated_megatron_logprobs = _get_megatron_logprobs(policy, updated_input)
                 valid = updated_mask.bool()
                 sampler_delta = updated_vllm_logprobs[valid] - lora_logprobs[valid]
-                trainer_delta = (
-                    updated_megatron_logprobs[valid] - lora_megatron_logprobs[valid]
-                )
+                trainer_delta = updated_megatron_logprobs[valid] - lora_megatron_logprobs[valid]
                 _print_boundary_receipt(
                     "update_logprobs",
                     {
@@ -1939,9 +1862,7 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
                     f"relative_mean_error={relative_mean_error:.6f}, "
                     f"cosine={cosine:.6f}, scale={scale:.6f}"
                 )
-                minimum_trainer_mean = (
-                    1e-2 if model == SMALL_DRY_RUN_MODEL else MIN_DIRECT_UPDATE_MEAN
-                )
+                minimum_trainer_mean = 1e-2 if model == SMALL_DRY_RUN_MODEL else MIN_DIRECT_UPDATE_MEAN
                 assert trainer_mean > minimum_trainer_mean
                 assert cosine > MIN_DIRECT_UPDATE_COSINE
                 assert MIN_DIRECT_UPDATE_SCALE < scale < MAX_DIRECT_UPDATE_SCALE
