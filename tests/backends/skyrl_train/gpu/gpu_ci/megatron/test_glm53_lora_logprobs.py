@@ -65,7 +65,7 @@ MAX_GENERATE_LENGTH = 128
 MEGATRON_MEAN_DIFF_THRESHOLD = 7.5e-2
 VLLM_MEAN_DIFF_THRESHOLD = 3e-1
 LORA_NOISE_SEED = 42
-LORA_NOISE_STD = 1e-2
+LORA_NOISE_STD = 5e-2
 MIN_UPDATED_LOGPROB_DIFF = 1e-5
 MIN_DIRECT_UPDATE_MEAN = 0.1
 MIN_DIRECT_UPDATE_COSINE = 0.8
@@ -150,6 +150,72 @@ def _get_weight_receipt(weight) -> list[dict] | dict | None:
     return _get_sampled_tensor_receipt(weight)
 
 
+def _as_weight_list(weight) -> list[torch.Tensor]:
+    if isinstance(weight, (list, tuple)):
+        return list(weight)
+    return [weight]
+
+
+def _expected_tp_lora_weights(
+    module_type: str,
+    tp_rank: int,
+    tp_size: int,
+    cached_a: torch.Tensor,
+    cached_b: torch.Tensor,
+    kernel_a: torch.Tensor,
+    kernel_b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if tp_size == 1:
+        return cached_a, cached_b
+    if module_type == "ColumnParallelLinearWithLoRA":
+        start = tp_rank * kernel_b.shape[0]
+        return cached_a, cached_b.narrow(0, start, kernel_b.shape[0])
+    if module_type == "RowParallelLinearWithLoRA":
+        start = tp_rank * kernel_a.shape[1]
+        return cached_a.narrow(1, start, kernel_a.shape[1]), cached_b
+    raise AssertionError(f"unsupported tensor-parallel LoRA module: {module_type}")
+
+
+def test_column_parallel_lora_uses_output_partition():
+    cached_a = torch.arange(12).reshape(2, 6)
+    cached_b = torch.arange(16).reshape(8, 2)
+    kernel_a = cached_a.clone()
+    kernel_b = cached_b[4:].clone()
+
+    expected_a, expected_b = _expected_tp_lora_weights(
+        "ColumnParallelLinearWithLoRA",
+        1,
+        2,
+        cached_a,
+        cached_b,
+        kernel_a,
+        kernel_b,
+    )
+
+    assert torch.equal(expected_a, cached_a)
+    assert torch.equal(expected_b, cached_b[4:])
+
+
+def test_row_parallel_lora_uses_input_partition():
+    cached_a = torch.arange(16).reshape(2, 8)
+    cached_b = torch.arange(12).reshape(6, 2)
+    kernel_a = cached_a[:, 4:].clone()
+    kernel_b = cached_b.clone()
+
+    expected_a, expected_b = _expected_tp_lora_weights(
+        "RowParallelLinearWithLoRA",
+        1,
+        2,
+        cached_a,
+        cached_b,
+        kernel_a,
+        kernel_b,
+    )
+
+    assert torch.equal(expected_a, cached_a[:, 4:])
+    assert torch.equal(expected_b, cached_b)
+
+
 def _get_final_layer_names(names: list[str], marker: str) -> list[str]:
     matched = []
     for name in names:
@@ -199,18 +265,46 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
         receipt["kernel_buffers"] = {}
         for name in module_names:
             module = adapter_manager.modules[name]
+            cached_lora = adapter.loras[name]
+            cached_a_weights = _as_weight_list(cached_lora.lora_a)
+            cached_b_weights = _as_weight_list(cached_lora.lora_b)
+            kernel_a_weights = [tensor[slot, 0] for tensor in module.lora_a_stacked]
+            kernel_b_weights = [tensor[slot, 0] for tensor in module.lora_b_stacked]
+            assert len(cached_a_weights) == len(kernel_a_weights)
+            assert len(cached_b_weights) == len(kernel_b_weights)
+            cache_slice_matches = []
+            for cached_a, cached_b, kernel_a, kernel_b in zip(
+                cached_a_weights,
+                cached_b_weights,
+                kernel_a_weights,
+                kernel_b_weights,
+                strict=True,
+            ):
+                expected_a, expected_b = _expected_tp_lora_weights(
+                    type(module).__name__,
+                    module.tp_rank,
+                    module.tp_size,
+                    cached_a,
+                    cached_b,
+                    kernel_a,
+                    kernel_b,
+                )
+                a_matches = torch.equal(kernel_a, expected_a.to(kernel_a))
+                b_matches = torch.equal(kernel_b, expected_b.to(kernel_b))
+                assert a_matches
+                assert b_matches
+                cache_slice_matches.append({"lora_a": a_matches, "lora_b": b_matches})
             receipt["kernel_buffers"][name] = {
                 "module_type": type(module).__name__,
                 "tp_rank": module.tp_rank,
                 "tp_size": module.tp_size,
                 "output_slices": list(module.output_slices),
+                "cache_slice_matches": cache_slice_matches,
                 "lora_a": [
-                    _get_sampled_tensor_receipt(tensor[slot, 0])
-                    for tensor in module.lora_a_stacked
+                    _get_sampled_tensor_receipt(tensor) for tensor in kernel_a_weights
                 ],
                 "lora_b": [
-                    _get_sampled_tensor_receipt(tensor[slot, 0])
-                    for tensor in module.lora_b_stacked
+                    _get_sampled_tensor_receipt(tensor) for tensor in kernel_b_weights
                 ],
             }
         return receipt
