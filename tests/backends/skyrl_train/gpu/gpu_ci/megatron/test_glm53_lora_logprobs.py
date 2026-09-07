@@ -220,6 +220,7 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
     def inspect_glm53_lora_buffers(self) -> dict:
         update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
         final_dense = update_scope == "final_dense"
+        final_expert_fc2 = update_scope == "final_expert_fc2"
         module_marker = ".self_attn.o_proj" if final_dense else ".mlp.experts"
         worker_manager = self.model_runner.lora_manager
         adapter_manager = worker_manager._adapter_manager
@@ -242,6 +243,8 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
         adapter = adapter_manager.get_adapter(adapter_id)
         assert adapter is not None
         cached_names = _get_final_layer_names(list(adapter.loras), module_marker)
+        if final_expert_fc2:
+            cached_names = [name for name in cached_names if ".down_proj" in name]
         receipt["cached_adapter"] = {
             name: {
                 "lora_a": _get_weight_receipt(adapter.loras[name].lora_a),
@@ -258,6 +261,8 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
         module_names = _get_final_layer_names(
             list(adapter_manager.modules), module_marker
         )
+        if final_expert_fc2:
+            module_names = [name for name in module_names if ".down_proj" in name]
         receipt["kernel_buffers"] = {}
         for name in module_names:
             module = adapter_manager.modules[name]
@@ -321,6 +326,8 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
             names = _get_final_layer_names(
                 [name for name, _ in model.named_parameters()], marker
             )
+            if update_scope == "final_expert_fc2":
+                names = [name for name in names if ".linear_fc2." in name]
             parameters = dict(model.named_parameters())
             for name in names:
                 if "linear_out.weight" in name:
@@ -370,6 +377,10 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                 if update_scope == "final_dense"
                 else _get_representative_expert_names(keys)
             )
+            if update_scope == "final_expert_fc2":
+                selected_names = [
+                    name for name in selected_names if ".down_proj." in name
+                ]
             receipt.update(
                 {
                     "key_count": len(keys),
@@ -406,6 +417,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
             "expert",
             "nonexpert",
             "final_expert",
+            "final_expert_fc2",
             "final_dense",
         }
         assert self._is_lora
@@ -429,13 +441,20 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                         continue
                     if update_scope == "nonexpert" and is_expert:
                         continue
-                    if update_scope in {"final_expert", "final_dense"}:
+                    if update_scope in {
+                        "final_expert",
+                        "final_expert_fc2",
+                        "final_dense",
+                    }:
                         layer_match = re.search(r"decoder\.layers\.(\d+)\.", name)
-                        expected_module = (
-                            is_routed_expert
-                            if update_scope == "final_expert"
-                            else ".self_attention.linear_proj." in name
-                        )
+                        if update_scope == "final_expert":
+                            expected_module = is_routed_expert
+                        elif update_scope == "final_expert_fc2":
+                            expected_module = (
+                                is_routed_expert and ".linear_fc2." in name
+                            )
+                        else:
+                            expected_module = ".self_attention.linear_proj." in name
                         if (
                             not expected_module
                             or parallel_state.get_pipeline_model_parallel_rank()
@@ -474,7 +493,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                         noise, dtype=torch.float32
                     ).item()
 
-        if update_scope in {"final_expert", "final_dense"}:
+        if update_scope in {"final_expert", "final_expert_fc2", "final_dense"}:
             is_final_pipeline_stage = (
                 pipeline_rank
                 == parallel_state.get_pipeline_model_parallel_world_size() - 1
@@ -788,17 +807,23 @@ def _get_megatron_logprobs(policy, training_input):
     return loss_fn_outputs_to_tensor(output.loss_fn_outputs, key="logprobs")
 
 
-def _assert_logprobs_match(label, expected, actual, response_mask, threshold):
+def _get_logprob_difference(label, expected, actual, response_mask):
     mask = response_mask.bool()
     expected_valid = expected[mask]
     actual_valid = actual[mask]
     difference = (expected_valid - actual_valid).abs()
-    mean_difference = difference.mean().item()
     print(
-        f"{label}: tokens={difference.numel()}, mean_diff={mean_difference:.6f}, "
+        f"{label}: tokens={difference.numel()}, "
+        f"mean_diff={difference.mean().item():.6f}, "
         f"max_diff={difference.max().item():.6f}"
     )
     assert torch.isfinite(difference).all()
+    return difference
+
+
+def _assert_logprobs_match(label, expected, actual, response_mask, threshold):
+    difference = _get_logprob_difference(label, expected, actual, response_mask)
+    mean_difference = difference.mean().item()
     assert mean_difference < threshold, (
         f"{label} mean diff {mean_difference:.6f} exceeds {threshold}"
     )
@@ -1020,7 +1045,8 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 for receipt in update_receipts:
                     assert receipt["update_scope"] == update_scope
                     should_update = (
-                        update_scope not in {"final_expert", "final_dense"}
+                        update_scope
+                        not in {"final_expert", "final_expert_fc2", "final_dense"}
                         or receipt["pipeline_rank"]
                         == cfg.trainer.policy.megatron_config.pipeline_model_parallel_size
                         - 1
@@ -1163,12 +1189,11 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 assert mean_error < 0.075
                 assert torch.quantile(delta_error.float(), 0.99).item() < 0.75
                 assert delta_error.max().item() < 5.0
-                _assert_logprobs_match(
+                _get_logprob_difference(
                     "dummy-updated vLLM LoRA vs Megatron LoRA",
                     updated_vllm_logprobs,
                     updated_megatron_logprobs,
                     updated_mask,
-                    MEGATRON_MEAN_DIFF_THRESHOLD,
                 )
             finally:
                 if adapter_loaded:
