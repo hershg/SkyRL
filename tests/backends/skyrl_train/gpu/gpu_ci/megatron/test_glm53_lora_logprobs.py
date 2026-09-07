@@ -99,7 +99,7 @@ VLLM_LORA_TARGET_MODULES = [
 
 
 class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
-    def add_model_coordinate_lora_b_noise(
+    def add_replica_safe_lora_b_noise(
         self, seed: int, std: float
     ) -> dict[str, float | int | str]:
         from megatron.core import parallel_state
@@ -113,6 +113,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
         updated_parameters = 0
         updated_elements = 0
         delta_norm = 0.0
+        update_fingerprint = hashlib.sha256()
         update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
         assert update_scope in {"all", "expert", "nonexpert"}
         assert self._is_lora
@@ -128,13 +129,20 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                         continue
                     if update_scope == "nonexpert" and is_expert:
                         continue
-                    digest = hashlib.sha256(
-                        (
-                            f"{tensor_rank}:{expert_rank}:{pipeline_rank}:"
-                            f"{chunk_index}:{name}"
-                        ).encode()
-                    ).digest()
+                    # Use the same local-coordinate update on every TP/EP/CP
+                    # rank. Some LoRA-B tensors are replicated across TP ranks,
+                    # while others are sharded. Rank-dependent noise silently
+                    # breaks the former; a repeated local pattern is a valid
+                    # global update for both layouts.
+                    parameter_key = f"{chunk_index}:{name}"
+                    digest = hashlib.sha256(parameter_key.encode()).digest()
                     parameter_seed = seed + int.from_bytes(digest[:8], "little")
+                    update_fingerprint.update(
+                        (
+                            f"{parameter_key}:{tuple(parameter.shape)}:"
+                            f"{parameter.dtype}:{parameter_seed}"
+                        ).encode()
+                    )
                     generator = torch.Generator(device=parameter.device)
                     generator.manual_seed(parameter_seed % (2**63 - 1))
                     noise = torch.randn(
@@ -163,6 +171,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
             "updated_parameters": updated_parameters,
             "updated_elements": updated_elements,
             "delta_norm": delta_norm,
+            "update_fingerprint": update_fingerprint.hexdigest(),
         }
 
 
@@ -612,7 +621,7 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     update_receipts = ray.get(
                         policy.async_run_ray_method(
                             "pass_through",
-                            "add_model_coordinate_lora_b_noise",
+                            "add_replica_safe_lora_b_noise",
                             LORA_NOISE_SEED,
                             LORA_NOISE_STD,
                         )
@@ -624,6 +633,26 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                 assert {receipt["rank"] for receipt in update_receipts} == set(
                     range(policy_gpus)
                 )
+                receipts_by_pipeline_stage = {}
+                for receipt in update_receipts:
+                    receipts_by_pipeline_stage.setdefault(
+                        receipt["pipeline_rank"], []
+                    ).append(receipt)
+                for stage_receipts in receipts_by_pipeline_stage.values():
+                    assert (
+                        len(
+                            {
+                                (
+                                    receipt["updated_parameters"],
+                                    receipt["updated_elements"],
+                                    receipt["delta_norm"],
+                                    receipt["update_fingerprint"],
+                                )
+                                for receipt in stage_receipts
+                            }
+                        )
+                        == 1
+                    ), "LoRA perturbation must preserve distributed replicas"
                 receipts_by_model_coordinate = {}
                 for receipt in update_receipts:
                     coordinate = (
