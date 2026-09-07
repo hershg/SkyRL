@@ -402,8 +402,10 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
                 actual.float().reshape(1, -1),
                 expected_rounded.reshape(1, -1),
             ).item()
+            has_signal = expected_mean.item() > 0
             check = {
                 "module_type": type(module).__name__,
+                "has_signal": has_signal,
                 "tp_rank": module.tp_rank,
                 "tp_size": module.tp_size,
                 "input_shape": list(inputs.shape),
@@ -418,9 +420,12 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
             }
             assert torch.isfinite(actual).all()
             assert torch.isfinite(expected).all()
-            assert expected_mean.item() > 0
-            assert cosine > 0.999
-            assert relative_mean_error.item() < 0.05
+            if has_signal:
+                assert cosine > 0.999
+                assert relative_mean_error.item() < 0.05
+            else:
+                assert torch.count_nonzero(actual).item() == 0
+                assert difference.max().item() == 0
             checks[name] = check
 
         return {
@@ -1112,13 +1117,17 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     MEGATRON_MEAN_DIFF_THRESHOLD,
                 )
 
+                lora_noise_std = float(
+                    os.environ.get("SKYRL_GLM53_LORA_NOISE_STD", LORA_NOISE_STD)
+                )
+                assert math.isfinite(lora_noise_std) and lora_noise_std > 0
                 with Timer("apply_dummy_lora_update"):
                     update_receipts = ray.get(
                         policy.async_run_ray_method(
                             "pass_through",
                             "add_shard_symmetric_lora_b_noise",
                             LORA_NOISE_SEED,
-                            LORA_NOISE_STD,
+                            lora_noise_std,
                         )
                     )
                 update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
