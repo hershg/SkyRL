@@ -88,7 +88,8 @@ MEGATRON_LORA_TARGET_MODULES = [
     "linear_proj",
 ]
 
-VLLM_LORA_TARGET_MODULES = [
+# vLLM needs the full registry to initialize LoRA context during MoE graph warmup.
+VLLM_SUPPORTED_LORA_TARGET_MODULES = [
     "fused_qkv_a_proj",
     "q_a_proj",
     "q_b_proj",
@@ -96,6 +97,9 @@ VLLM_LORA_TARGET_MODULES = [
     "kv_a_proj_with_mqa",
     "kv_b_proj",
     "o_proj",
+    "gate_up_proj",
+    "down_proj",
+    "experts",
 ]
 
 
@@ -615,7 +619,7 @@ def _get_glm53_lora_config(model: str, lora_sync_path: str) -> SkyRLTrainConfig:
         "disable_custom_all_reduce": True,
         "linear_backend": "triton",
         "moe_backend": "triton",
-        "lora_target_modules": VLLM_LORA_TARGET_MODULES,
+        "lora_target_modules": VLLM_SUPPORTED_LORA_TARGET_MODULES,
         "trust_remote_code": True,
     }
     if model == SMALL_DRY_RUN_MODEL:
