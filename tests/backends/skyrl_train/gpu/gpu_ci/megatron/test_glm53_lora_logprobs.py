@@ -15,6 +15,7 @@ SKYRL_GLM53_RAY_ADDRESS=auto
 import asyncio
 import hashlib
 import os
+import re
 import shutil
 import uuid
 from contextlib import AsyncExitStack
@@ -99,7 +100,7 @@ VLLM_LORA_TARGET_MODULES = [
 
 
 class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
-    def add_replica_safe_lora_b_noise(
+    def add_shard_symmetric_lora_b_noise(
         self, seed: int, std: float
     ) -> dict[str, float | int | str]:
         from megatron.core import parallel_state
@@ -115,25 +116,41 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
         delta_norm = 0.0
         update_fingerprint = hashlib.sha256()
         update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
-        assert update_scope in {"all", "expert", "nonexpert"}
+        assert update_scope in {"all", "expert", "nonexpert", "final_expert"}
         assert self._is_lora
 
         with torch.no_grad():
             for chunk_index, chunk in enumerate(self.actor_module):
                 model = unwrap_model(chunk)
-                for name, parameter in model.named_parameters():
+                named_parameters = list(model.named_parameters())
+                local_layer_indices = [
+                    int(match.group(1))
+                    for name, _ in named_parameters
+                    if (match := re.search(r"decoder\.layers\.(\d+)\.", name))
+                ]
+                final_local_layer = max(local_layer_indices, default=None)
+                for name, parameter in named_parameters:
                     if not (parameter.requires_grad and "linear_out.weight" in name):
                         continue
-                    is_expert = "experts" in name
+                    is_routed_expert = ".mlp.experts." in name
+                    is_expert = is_routed_expert or ".mlp.shared_experts." in name
                     if update_scope == "expert" and not is_expert:
                         continue
                     if update_scope == "nonexpert" and is_expert:
                         continue
-                    # Use the same local-coordinate update on every TP/EP/CP
-                    # rank. Some LoRA-B tensors are replicated across TP ranks,
-                    # while others are sharded. Rank-dependent noise silently
-                    # breaks the former; a repeated local pattern is a valid
-                    # global update for both layouts.
+                    if update_scope == "final_expert":
+                        layer_match = re.search(r"decoder\.layers\.(\d+)\.", name)
+                        if (
+                            not is_routed_expert
+                            or parallel_state.get_pipeline_model_parallel_rank()
+                            != parallel_state.get_pipeline_model_parallel_world_size() - 1
+                            or layer_match is None
+                            or int(layer_match.group(1)) != final_local_layer
+                        ):
+                            continue
+                    # Use the same local-coordinate update on every distributed
+                    # shard. This preserves CP replicas and removes shard order
+                    # as a confound in the publication check.
                     parameter_key = f"{chunk_index}:{name}"
                     digest = hashlib.sha256(parameter_key.encode()).digest()
                     parameter_seed = seed + int.from_bytes(digest[:8], "little")
@@ -160,7 +177,14 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                         noise, dtype=torch.float32
                     ).item()
 
-        assert updated_parameters > 0, "noise update found no trainable LoRA parameters"
+        if update_scope == "final_expert":
+            is_final_pipeline_stage = (
+                pipeline_rank
+                == parallel_state.get_pipeline_model_parallel_world_size() - 1
+            )
+            assert (updated_parameters > 0) == is_final_pipeline_stage
+        else:
+            assert updated_parameters > 0, "noise update found no trainable LoRA parameters"
         return {
             "rank": rank,
             "tensor_rank": tensor_rank,
@@ -621,15 +645,22 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     update_receipts = ray.get(
                         policy.async_run_ray_method(
                             "pass_through",
-                            "add_replica_safe_lora_b_noise",
+                            "add_shard_symmetric_lora_b_noise",
                             LORA_NOISE_SEED,
                             LORA_NOISE_STD,
                         )
                     )
+                update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
                 for receipt in update_receipts:
-                    assert receipt["updated_parameters"] > 0
-                    assert receipt["updated_elements"] > 0
-                    assert receipt["delta_norm"] > 0
+                    should_update = (
+                        update_scope != "final_expert"
+                        or receipt["pipeline_rank"]
+                        == cfg.trainer.policy.megatron_config.pipeline_model_parallel_size
+                        - 1
+                    )
+                    assert (receipt["updated_parameters"] > 0) == should_update
+                    assert (receipt["updated_elements"] > 0) == should_update
+                    assert (receipt["delta_norm"] > 0) == should_update
                 assert {receipt["rank"] for receipt in update_receipts} == set(
                     range(policy_gpus)
                 )
