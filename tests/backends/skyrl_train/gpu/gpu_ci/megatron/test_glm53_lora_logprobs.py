@@ -346,6 +346,32 @@ def test_final_attention_scope_selection_is_exact():
 
 
 class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
+    def inspect_glm53_zero_output_adapter(self) -> dict:
+        manager = self.model_runner.lora_manager._adapter_manager
+        adapter_ids = sorted(manager.list_adapters())
+        assert len(adapter_ids) == 1
+        adapter_id = adapter_ids[0]
+        slot = manager.lora_index_to_id.index(adapter_id)
+        adapter = manager.get_adapter(adapter_id)
+        assert adapter is not None
+        assert len(adapter.loras) == 78
+        receipts = {}
+        for name, weights in sorted(adapter.loras.items()):
+            assert name.endswith(".self_attn.o_proj")
+            module = manager.modules[name]
+            cached = _as_weight_list(weights.lora_b)
+            loaded = [tensor[slot, 0] for tensor in module.lora_b_stacked]
+            assert len(cached) == len(loaded)
+            for tensor in cached + loaded:
+                assert torch.isfinite(tensor).all()
+                assert torch.count_nonzero(tensor).item() == 0
+            receipts[name] = {
+                "cached_b_elements": sum(tensor.numel() for tensor in cached),
+                "loaded_b_elements": sum(tensor.numel() for tensor in loaded),
+                "nonzero_b_elements": 0,
+            }
+        return {"hostname": socket.gethostname(), "modules": receipts}
+
     def inspect_glm53_lora_buffers(self) -> dict:
         worker_manager = self.model_runner.lora_manager
         adapter_manager = worker_manager._adapter_manager
@@ -1400,7 +1426,15 @@ async def _run_lora_update_matrix(
 
 
 async def _run_unchanged_score_probe(
-    client, tokenizer, policy, cfg, prompts, responses, base_input, lora_sync_path
+    client,
+    tokenizer,
+    policy,
+    cfg,
+    prompts,
+    responses,
+    base_input,
+    lora_sync_path,
+    compare_base=False,
 ):
     trainer_before = _inspect_policy_boundary(policy, "inspect_glm53_lora_parameters")
     with Timer("repeatability_initial_publication"):
@@ -1422,6 +1456,14 @@ async def _run_unchanged_score_probe(
         )
         sampler_before = await _inspect_vllm_boundary(client)
         _print_boundary_receipt("repeatability_sampler_before", sampler_before)
+        if compare_base:
+            _print_boundary_receipt(
+                "repeatability_zero_adapter_before",
+                await client._call_all_servers(
+                    "/collective_rpc",
+                    {"method": "inspect_glm53_zero_output_adapter", "kwargs": {}},
+                ),
+            )
         trainer_logprobs = _get_megatron_logprobs(policy, base_input)
         mask = base_input["response_mask"].bool()
         _print_boundary_receipt(
@@ -1431,16 +1473,19 @@ async def _run_unchanged_score_probe(
                 "response_lengths": mask.sum(dim=1).tolist(),
             },
         )
-        samples = {"serial": [], "concurrent": []}
+        modes = ("base", "adapter") if compare_base else ("serial", "concurrent")
+        samples = {mode: [] for mode in modes}
         for repeat in range(3):
-            for mode in ("serial", "concurrent"):
+            for mode in modes:
                 await client.reset_prefix_cache()
                 with Timer(f"repeatability_{mode}_{repeat}"):
                     current_mask, logprobs, current_input = await _score_responses(
                         client,
                         tokenizer,
                         responses,
-                        adapter_name,
+                        cfg.trainer.policy.model.path
+                        if mode == "base"
+                        else adapter_name,
                         prompts,
                         concurrent=mode == "concurrent",
                     )
@@ -1463,6 +1508,14 @@ async def _run_unchanged_score_probe(
         assert trainer_before == trainer_after
         assert sampler_before == sampler_after
         _print_boundary_receipt("repeatability_sampler_after", sampler_after)
+        if compare_base:
+            _print_boundary_receipt(
+                "repeatability_zero_adapter_after",
+                await client._call_all_servers(
+                    "/collective_rpc",
+                    {"method": "inspect_glm53_zero_output_adapter", "kwargs": {}},
+                ),
+            )
         results = {}
         for mode, values in samples.items():
             pairs = []
@@ -1502,17 +1555,25 @@ async def _run_unchanged_score_probe(
 @pytest.mark.megatron
 @pytest.mark.b300
 async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixture):
-    await _run_glm53_lora_probe(repeatability_only=False)
+    await _run_glm53_lora_probe()
 
 
 @pytest.mark.asyncio
 @pytest.mark.megatron
 @pytest.mark.b300
 async def test_glm53_unchanged_score_repeatability(glm53_ray_init_fixture):
-    await _run_glm53_lora_probe(repeatability_only=True)
+    await _run_glm53_lora_probe(repeatability_mode="submission")
 
 
-async def _run_glm53_lora_probe(repeatability_only):
+@pytest.mark.asyncio
+@pytest.mark.megatron
+@pytest.mark.b300
+async def test_glm53_base_and_zero_adapter_repeatability(glm53_ray_init_fixture):
+    await _run_glm53_lora_probe(repeatability_mode="zero_adapter")
+
+
+async def _run_glm53_lora_probe(repeatability_mode=None):
+    assert repeatability_mode in {None, "submission", "zero_adapter"}
     model = os.environ.get("SKYRL_GLM53_MODEL", MODEL)
     fixed_inputs = None
     if model != SMALL_DRY_RUN_MODEL:
@@ -1582,7 +1643,7 @@ async def _run_glm53_lora_probe(repeatability_only):
                         )
                     )
 
-                if repeatability_only:
+                if repeatability_mode is not None:
                     await _run_unchanged_score_probe(
                         client,
                         tokenizer,
@@ -1592,6 +1653,7 @@ async def _run_glm53_lora_probe(repeatability_only):
                         base_responses,
                         base_input,
                         lora_sync_path,
+                        compare_base=repeatability_mode == "zero_adapter",
                     )
                     completed = True
                     return
