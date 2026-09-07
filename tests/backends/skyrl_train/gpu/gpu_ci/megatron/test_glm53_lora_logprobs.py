@@ -99,6 +99,7 @@ MEGATRON_LORA_TARGET_MODULES = [
 
 GLM53_LORA_TARGET_RECIPES = {
     "attention": MEGATRON_LORA_TARGET_MODULES,
+    "attention_output": ["linear_proj"],
     "attention_without_kv_up": [
         module
         for module in MEGATRON_LORA_TARGET_MODULES
@@ -284,6 +285,25 @@ def test_attention_without_kv_up_recipe_is_explicit_and_narrow(monkeypatch):
     ]
 
 
+def test_attention_output_recipe_is_explicit_and_narrow(monkeypatch):
+    monkeypatch.setenv("SKYRL_GLM53_LORA_TARGET_RECIPE", "attention_output")
+
+    assert _get_megatron_lora_target_modules(MODEL) == ["linear_proj"]
+
+
+def _assert_adapter_matches_target_recipe(
+    adapter_names: list[str], target_recipe: str
+) -> None:
+    assert adapter_names, "published GLM 5.3 adapter is empty"
+    if target_recipe == "attention":
+        return
+    if target_recipe == "attention_without_kv_up":
+        assert all(".kv_b_proj" not in name for name in adapter_names)
+        return
+    assert target_recipe == "attention_output"
+    assert all(".o_proj" in name for name in adapter_names)
+
+
 def _is_final_attention_scope_parameter(
     name: str, final_layer: int | None, update_scope: str
 ) -> bool:
@@ -344,8 +364,7 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
         adapter = adapter_manager.get_adapter(adapter_id)
         assert adapter is not None
         target_recipe = os.environ.get("SKYRL_GLM53_LORA_TARGET_RECIPE", "attention")
-        if target_recipe == "attention_without_kv_up":
-            assert all(".kv_b_proj" not in name for name in adapter.loras)
+        _assert_adapter_matches_target_recipe(list(adapter.loras), target_recipe)
         receipt["target_recipe"] = target_recipe
         cached_names = _get_final_layer_names(list(adapter.loras), ".self_attn.")
         receipt["cached_adapter"] = {
@@ -598,8 +617,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
             target_recipe = os.environ.get(
                 "SKYRL_GLM53_LORA_TARGET_RECIPE", "attention"
             )
-            if target_recipe == "attention_without_kv_up":
-                assert all(".kv_b_proj" not in name for name in keys)
+            _assert_adapter_matches_target_recipe(keys, target_recipe)
 
             receipt.update(
                 {
