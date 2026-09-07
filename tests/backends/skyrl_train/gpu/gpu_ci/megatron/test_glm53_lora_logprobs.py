@@ -216,6 +216,7 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
         adapter_ids = sorted(adapter_manager.list_adapters())
         receipt = {
             "hostname": socket.gethostname(),
+            "update_scope": update_scope,
             "adapter_ids": adapter_ids,
             "slot_layout": adapter_manager.lora_index_to_id,
             "enable_mixed_moe_lora_format": adapter_manager._enable_mixed_moe_lora_format,
@@ -316,6 +317,7 @@ class _PerturbableMegatronPolicyWorker(MegatronPolicyWorkerBase):
                     selected[name] = _get_sampled_tensor_receipt(parameters[name])
         return {
             "hostname": socket.gethostname(),
+            "update_scope": update_scope,
             "rank": torch.distributed.get_rank(),
             "tensor_rank": parallel_state.get_tensor_model_parallel_rank(),
             "expert_rank": parallel_state.get_expert_model_parallel_rank(),
@@ -492,7 +494,12 @@ _PerturbablePolicyWorker = ray.remote(num_gpus=1)(_PerturbableMegatronPolicyWork
 @pytest.fixture
 def glm53_ray_init_fixture():
     with ray_init(
-        extra_env_vars={"NVTE_FUSED_ATTN": "1"},
+        extra_env_vars={
+            "NVTE_FUSED_ATTN": "1",
+            "SKYRL_GLM53_UPDATE_SCOPE": os.environ.get(
+                "SKYRL_GLM53_UPDATE_SCOPE", "all"
+            ),
+        },
         address=os.environ.get("SKYRL_GLM53_RAY_ADDRESS"),
     ):
         yield
@@ -855,6 +862,7 @@ async def _inspect_vllm_boundary(client):
 @pytest.mark.b300
 async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixture):
     model = os.environ.get("SKYRL_GLM53_MODEL", MODEL)
+    update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
     policy_nodes, policy_gpus_per_node, inference_tp = _get_test_topology(model)
     policy_gpus = policy_nodes * policy_gpus_per_node
     shared_dir = Path(os.environ["SKYRL_GLM53_SHARED_DIR"])
@@ -911,10 +919,13 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                     base_mask,
                     MEGATRON_MEAN_DIFF_THRESHOLD,
                 )
-                _print_boundary_receipt(
-                    "trainer_initial",
-                    _inspect_policy_boundary(policy, "inspect_glm53_lora_parameters"),
+                trainer_initial_receipts = _inspect_policy_boundary(
+                    policy, "inspect_glm53_lora_parameters"
                 )
+                assert {
+                    receipt["update_scope"] for receipt in trainer_initial_receipts
+                } == {update_scope}
+                _print_boundary_receipt("trainer_initial", trainer_initial_receipts)
 
                 with Timer("publish_initialized_lora"):
                     ray.get(
@@ -935,9 +946,13 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                         str(lora_sync_path),
                     ),
                 )
-                _print_boundary_receipt(
-                    "vllm_initial", await _inspect_vllm_boundary(client)
-                )
+                vllm_initial_receipt = await _inspect_vllm_boundary(client)
+                assert {
+                    worker_receipt["update_scope"]
+                    for server_receipt in vllm_initial_receipt.values()
+                    for worker_receipt in server_receipt["body"]["results"]
+                } == {update_scope}
+                _print_boundary_receipt("vllm_initial", vllm_initial_receipt)
 
                 adapter_name = resolve_policy_model_name(cfg)
                 lora_mask, lora_logprobs, lora_input = await _score_responses(
@@ -970,8 +985,8 @@ async def test_glm53_lora_init_and_dummy_update_match_vllm(glm53_ray_init_fixtur
                             LORA_NOISE_STD,
                         )
                     )
-                update_scope = os.environ.get("SKYRL_GLM53_UPDATE_SCOPE", "all")
                 for receipt in update_receipts:
+                    assert receipt["update_scope"] == update_scope
                     should_update = (
                         update_scope not in {"final_expert", "final_dense"}
                         or receipt["pipeline_rank"]
