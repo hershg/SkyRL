@@ -104,16 +104,22 @@ VLLM_LORA_TARGET_MODULES = [
 ]
 
 
+def _get_sample_indices(
+    numel: int, sample_count: int, device: torch.device
+) -> torch.Tensor:
+    if sample_count == 0:
+        return torch.empty(0, dtype=torch.long, device=device)
+    if sample_count == 1:
+        return torch.zeros(1, dtype=torch.long, device=device)
+    positions = torch.arange(sample_count, dtype=torch.long, device=device)
+    return torch.div(positions * (numel - 1), sample_count - 1, rounding_mode="floor")
+
+
 def _get_sampled_tensor_receipt(tensor: torch.Tensor) -> dict:
     flat = tensor.detach().reshape(-1)
     sample_count = min(64, flat.numel())
     if sample_count:
-        indices = torch.linspace(
-            0,
-            flat.numel() - 1,
-            steps=sample_count,
-            device=flat.device,
-        ).long()
+        indices = _get_sample_indices(flat.numel(), sample_count, flat.device)
         sample = flat.index_select(0, indices).float().cpu()
     else:
         sample = torch.empty(0, dtype=torch.float32)
@@ -126,6 +132,15 @@ def _get_sampled_tensor_receipt(tensor: torch.Tensor) -> dict:
         "sample_l2": torch.linalg.vector_norm(sample).item() if sample_count else 0.0,
         "sample_values": sample[:8].tolist(),
     }
+
+
+def test_sample_indices_stay_in_bounds_above_float32_integer_range():
+    numel = 15_380_406_246
+    indices = _get_sample_indices(numel, 64, torch.device("cpu"))
+
+    assert indices[0].item() == 0
+    assert indices[-1].item() == numel - 1
+    assert torch.all(indices[1:] > indices[:-1])
 
 
 def _get_weight_receipt(weight) -> list[dict] | dict | None:
