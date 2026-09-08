@@ -52,9 +52,11 @@ def compact_attention_inputs(arguments, output, rows):
 
 
 class SparseCapture:
-    def __init__(self, directory, token_count):
+    def __init__(self, directory, token_count, max_records=None):
         self.directory = Path(directory)
         self.token_count = token_count
+        assert max_records is None or max_records > 0
+        self.max_records = max_records
         self.counts = {"attention": 0, "indexer": 0}
         self.original_decode = None
         self.original_topk = None
@@ -72,7 +74,9 @@ class SparseCapture:
     def decode(self, **arguments):
         output = self.original_decode(**arguments)
         query = arguments["query"]
-        if query.shape[0] == self.token_count:
+        if query.shape[0] == self.token_count and (
+            self.max_records is None or self.counts["attention"] < self.max_records
+        ):
             assert isinstance(output, torch.Tensor)
             rows = torch.arange(max(0, self.token_count - 64), self.token_count, device=query.device)
             self.save("attention", compact_attention_inputs(arguments, output, rows))
@@ -80,7 +84,9 @@ class SparseCapture:
 
     def topk(self, logits, starts, ends, indices, *arguments):
         output = self.original_topk(logits, starts, ends, indices, *arguments)
-        if logits.shape[0] == self.token_count:
+        if logits.shape[0] == self.token_count and (
+            self.max_records is None or self.counts["indexer"] < self.max_records
+        ):
             rows = torch.arange(max(0, self.token_count - 64), self.token_count, device=logits.device)
             selected = logits[rows].clone()
             columns = torch.arange(logits.shape[1], device=logits.device)

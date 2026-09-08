@@ -112,3 +112,38 @@ def test_compaction_rejects_out_of_range_cache_selection():
     arguments["block_tables"][0, 0, 0] = 12
     with pytest.raises(AssertionError):
         compact_attention_inputs(arguments, arguments["query"], torch.tensor([0]))
+
+
+def test_capture_limit_bounds_files_without_skipping_kernel_execution(tmp_path):
+    capture = SparseCapture(tmp_path, 3, max_records=2)
+    arguments = make_arguments()
+    expected = arguments["query"] + 1
+    calls = {"attention": 0, "indexer": 0}
+
+    def decode(**arguments):
+        calls["attention"] += 1
+        return expected
+
+    def topk(logits, starts, ends, indices):
+        calls["indexer"] += 1
+        indices.copy_(torch.tensor([[1, 0]] * 3, dtype=indices.dtype))
+        return "native"
+
+    capture.original_decode = decode
+    capture.original_topk = topk
+    logits = torch.ones(3, 2)
+    starts, ends = torch.zeros(3, dtype=torch.int32), torch.full((3,), 2)
+    indices = torch.empty((3, 2), dtype=torch.int32)
+    for _ in range(4):
+        assert capture.decode(**arguments) is expected
+        assert capture.topk(logits, starts, ends, indices) == "native"
+        assert indices.tolist() == [[1, 0]] * 3
+    assert capture.counts == {"attention": 2, "indexer": 2}
+    assert calls == {"attention": 4, "indexer": 4}
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "attention_000.pt",
+        "attention_001.pt",
+        "indexer_000.pt",
+        "indexer_001.pt",
+    ]
+    assert torch.equal(torch.load(tmp_path / "attention_001.pt", weights_only=True)["output"], expected)

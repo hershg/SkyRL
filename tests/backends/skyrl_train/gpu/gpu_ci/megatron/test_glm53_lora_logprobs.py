@@ -337,17 +337,19 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
         return receipt
 
     def begin_glm53_sparse_capture(self, directory: str, token_count: int) -> dict:
-        if self.rank == 0:
-            assert not hasattr(self, "_glm53_sparse_capture")
-            self._glm53_sparse_capture = SparseCapture(directory, token_count)
-            self._glm53_sparse_capture.install()
-        return {"rank": self.rank, "capturing": self.rank == 0}
+        assert not hasattr(self, "_glm53_sparse_capture")
+        self._glm53_sparse_capture = SparseCapture(
+            Path(directory) / f"rank_{self.rank}",
+            token_count,
+            max_records=None if self.rank == 0 else 2,
+        )
+        self._glm53_sparse_capture.install()
+        return {"rank": self.rank, "capturing": True}
 
     def end_glm53_sparse_capture(self) -> dict:
-        receipt = {"rank": self.rank, "capturing": self.rank == 0}
-        if self.rank == 0:
-            receipt.update(self._glm53_sparse_capture.restore())
-            del self._glm53_sparse_capture
+        receipt = {"rank": self.rank, "hostname": socket.gethostname(), "capturing": True}
+        receipt.update(self._glm53_sparse_capture.restore())
+        del self._glm53_sparse_capture
         return receipt
 
     def inspect_glm53_zero_output_adapter(self) -> dict:
@@ -1030,9 +1032,14 @@ async def _score_responses(
             workers = [
                 worker for server in captured.values() for worker in server["body"]["results"] if worker["capturing"]
             ]
-            assert len(workers) == 1
-            assert workers[0]["counts"]["attention"] == 78
-            assert workers[0]["counts"]["indexer"] > 0
+            assert all(server["status"] == 200 for server in captured.values())
+            assert sorted(worker["rank"] for worker in workers) == list(range(8))
+            for worker in workers:
+                if worker["rank"] == 0:
+                    assert worker["counts"]["attention"] == 78
+                    assert worker["counts"]["indexer"] > 0
+                else:
+                    assert worker["counts"] == {"attention": 2, "indexer": 2}
     return _build_training_input(tokenizer, prompt_token_ids, responses, response_logprobs)
 
 
