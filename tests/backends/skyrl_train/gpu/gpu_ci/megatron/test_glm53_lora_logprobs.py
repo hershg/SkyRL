@@ -57,6 +57,7 @@ from tests.backends.skyrl_train.gpu.utils import (
     Timer,
     init_worker_with_type,
 )
+from tests.utils.glm53_adaptive_capture import AdaptiveSparseCapture
 from tests.utils.glm53_canonical_topk import CanonicalSparseTopK
 from tests.utils.glm53_parity_inputs import load_parity_inputs
 from tests.utils.glm53_scoring import score_fixed_responses
@@ -350,6 +351,22 @@ class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
         receipt = {"rank": self.rank, "hostname": socket.gethostname(), "capturing": True}
         receipt.update(self._glm53_sparse_capture.restore())
         del self._glm53_sparse_capture
+        return receipt
+
+    def begin_glm53_adaptive_capture(self, directory: str, token_count: int) -> dict:
+        directory = Path(directory) / f"rank_{self.rank}"
+        if not hasattr(self, "_glm53_adaptive_capture"):
+            self._glm53_adaptive_capture = AdaptiveSparseCapture(directory, token_count)
+        capture = self._glm53_adaptive_capture
+        assert capture.directory == directory and capture.token_count == token_count
+        capture.install()
+        return {"rank": self.rank, "capturing": True, "pass_index": capture.pass_index}
+
+    def end_glm53_adaptive_capture(self) -> dict:
+        receipt = {"rank": self.rank, "hostname": socket.gethostname(), "capturing": True}
+        receipt.update(self._glm53_adaptive_capture.restore())
+        if not receipt["pending"]:
+            del self._glm53_adaptive_capture
         return receipt
 
     def inspect_glm53_zero_output_adapter(self) -> dict:
@@ -1004,6 +1021,7 @@ async def _score_responses(
     prompt_token_ids,
     concurrent=True,
     capture_directory=None,
+    adaptive_capture=False,
 ):
     if capture_directory is not None:
         assert not concurrent
@@ -1012,7 +1030,7 @@ async def _score_responses(
         await client._call_all_servers(
             "/collective_rpc",
             {
-                "method": "begin_glm53_sparse_capture",
+                "method": "begin_glm53_adaptive_capture" if adaptive_capture else "begin_glm53_sparse_capture",
                 "kwargs": {
                     "directory": capture_directory,
                     "token_count": max(lengths),
@@ -1026,15 +1044,29 @@ async def _score_responses(
         if capture_directory is not None:
             captured = await client._call_all_servers(
                 "/collective_rpc",
-                {"method": "end_glm53_sparse_capture", "kwargs": {}},
+                {
+                    "method": "end_glm53_adaptive_capture" if adaptive_capture else "end_glm53_sparse_capture",
+                    "kwargs": {},
+                },
             )
-            _print_boundary_receipt("sparse_capture", captured)
+            _print_boundary_receipt("adaptive_capture" if adaptive_capture else "sparse_capture", captured)
             workers = [
                 worker for server in captured.values() for worker in server["body"]["results"] if worker["capturing"]
             ]
             assert all(server["status"] == 200 for server in captured.values())
             assert sorted(worker["rank"] for worker in workers) == list(range(8))
             for worker in workers:
+                if adaptive_capture:
+                    assert len(worker["passes"]) == (1 if worker["pending"] else 2)
+                    assert all(p["captured"] == {"attention": 3, "indexer": 3} for p in worker["passes"])
+                    assert all(p["native"] == {"attention": 78, "indexer": 21} for p in worker["passes"])
+                    assert worker["peak_retained_tensor_bytes"] <= 4 * 1024**3
+                    assert worker["saved_bytes"] <= 160 * 1024**2
+                    assert len(worker["files"]) == (0 if worker["pending"] else 15)
+                    if not worker["pending"]:
+                        assert len(worker["reports"]) == 3
+                        assert all(len(report["selected_rows"]) <= 88 for report in worker["reports"])
+                    continue
                 if worker["rank"] == 0:
                     assert worker["counts"]["attention"] == 78
                     assert worker["counts"]["indexer"] > 0
@@ -1401,6 +1433,7 @@ async def _run_unchanged_score_probe(
     compare_base=False,
     capture_sparse=False,
     canonical_topk=False,
+    adaptive_capture=False,
 ):
     trainer_before = _inspect_policy_boundary(policy, "inspect_glm53_lora_parameters")
     with Timer("repeatability_initial_publication"):
@@ -1457,6 +1490,14 @@ async def _run_unchanged_score_probe(
         for repeat in range(3):
             for mode in modes:
                 await client.reset_prefix_cache()
+                capture_directory = None
+                if mode == "base" and repeat < 2:
+                    if adaptive_capture:
+                        capture_directory = str(lora_sync_path.parent / "adaptive-capture" / lora_sync_path.name)
+                    elif capture_sparse:
+                        capture_directory = str(
+                            lora_sync_path.parent / "sparse-capture" / lora_sync_path.name / f"{mode}_{repeat}"
+                        )
                 with Timer(f"repeatability_{mode}_{repeat}"):
                     current_mask, logprobs, current_input = await _score_responses(
                         client,
@@ -1465,11 +1506,8 @@ async def _run_unchanged_score_probe(
                         cfg.trainer.policy.model.path if mode == "base" else adapter_name,
                         prompts,
                         concurrent=mode == "concurrent",
-                        capture_directory=(
-                            str(lora_sync_path.parent / "sparse-capture" / lora_sync_path.name / f"{mode}_{repeat}")
-                            if capture_sparse and mode == "base" and repeat < 2
-                            else None
-                        ),
+                        capture_directory=capture_directory,
+                        adaptive_capture=adaptive_capture,
                     )
                 assert torch.equal(base_input["sequences"], current_input["sequences"])
                 assert torch.equal(mask, current_mask.bool())
@@ -1586,9 +1624,18 @@ async def test_glm53_canonical_sparse_capture(glm53_ray_init_fixture):
     await _run_glm53_lora_probe(repeatability_mode="canonical_topk", capture_sparse=True)
 
 
-async def _run_glm53_lora_probe(repeatability_mode=None, capture_sparse=False):
+@pytest.mark.asyncio
+@pytest.mark.megatron
+@pytest.mark.b300
+async def test_glm53_adaptive_sparse_capture(glm53_ray_init_fixture):
+    await _run_glm53_lora_probe(repeatability_mode="canonical_topk", adaptive_capture=True)
+
+
+async def _run_glm53_lora_probe(repeatability_mode=None, capture_sparse=False, adaptive_capture=False):
     assert repeatability_mode in {None, "submission", "zero_adapter", "sparse_capture", "canonical_topk"}
     assert not capture_sparse or repeatability_mode == "canonical_topk"
+    assert not adaptive_capture or repeatability_mode == "canonical_topk"
+    assert not (capture_sparse and adaptive_capture)
     model = os.environ.get("SKYRL_GLM53_MODEL", MODEL)
     fixed_inputs = None
     if model != SMALL_DRY_RUN_MODEL:
@@ -1669,6 +1716,7 @@ async def _run_glm53_lora_probe(repeatability_mode=None, capture_sparse=False):
                         compare_base=repeatability_mode in {"zero_adapter", "sparse_capture", "canonical_topk"},
                         capture_sparse=capture_sparse or repeatability_mode == "sparse_capture",
                         canonical_topk=repeatability_mode == "canonical_topk",
+                        adaptive_capture=adaptive_capture,
                     )
                     completed = True
                     return

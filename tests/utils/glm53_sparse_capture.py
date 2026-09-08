@@ -8,6 +8,17 @@ from pathlib import Path
 import torch
 
 
+def save_capture(path, tensors):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    assert not path.exists()
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+        torch.save(tensors, handle)
+        temporary = handle.name
+    os.replace(temporary, path)
+    return path.stat().st_size
+
+
 def compact_attention_inputs(arguments, output, rows):
     indices = arguments["block_tables"][rows].clone()
     valid = indices >= 0
@@ -62,13 +73,7 @@ class SparseCapture:
         self.original_topk = None
 
     def save(self, kind, tensors):
-        self.directory.mkdir(parents=True, exist_ok=True)
-        destination = self.directory / f"{kind}_{self.counts[kind]:03d}.pt"
-        assert not destination.exists()
-        with tempfile.NamedTemporaryFile(dir=self.directory, delete=False) as handle:
-            torch.save(tensors, handle)
-            temporary = handle.name
-        os.replace(temporary, destination)
+        save_capture(self.directory / f"{kind}_{self.counts[kind]:03d}.pt", tensors)
         self.counts[kind] += 1
 
     def decode(self, **arguments):
