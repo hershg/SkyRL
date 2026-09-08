@@ -1572,8 +1572,16 @@ async def test_glm53_canonical_topk_repeatability(glm53_ray_init_fixture):
     await _run_glm53_lora_probe(repeatability_mode="canonical_topk")
 
 
-async def _run_glm53_lora_probe(repeatability_mode=None):
+@pytest.mark.asyncio
+@pytest.mark.megatron
+@pytest.mark.b300
+async def test_glm53_canonical_sparse_capture(glm53_ray_init_fixture):
+    await _run_glm53_lora_probe(repeatability_mode="canonical_topk", capture_sparse=True)
+
+
+async def _run_glm53_lora_probe(repeatability_mode=None, capture_sparse=False):
     assert repeatability_mode in {None, "submission", "zero_adapter", "sparse_capture", "canonical_topk"}
+    assert not capture_sparse or repeatability_mode == "canonical_topk"
     model = os.environ.get("SKYRL_GLM53_MODEL", MODEL)
     fixed_inputs = None
     if model != SMALL_DRY_RUN_MODEL:
@@ -1652,7 +1660,7 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
                         base_input,
                         lora_sync_path,
                         compare_base=repeatability_mode in {"zero_adapter", "sparse_capture", "canonical_topk"},
-                        capture_sparse=repeatability_mode == "sparse_capture",
+                        capture_sparse=capture_sparse or repeatability_mode == "sparse_capture",
                         canonical_topk=repeatability_mode == "canonical_topk",
                     )
                     completed = True
