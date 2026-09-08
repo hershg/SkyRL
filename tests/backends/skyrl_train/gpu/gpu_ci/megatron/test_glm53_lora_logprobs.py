@@ -57,6 +57,7 @@ from tests.backends.skyrl_train.gpu.utils import (
     Timer,
     init_worker_with_type,
 )
+from tests.utils.glm53_canonical_topk import CanonicalSparseTopK
 from tests.utils.glm53_parity_inputs import load_parity_inputs
 from tests.utils.glm53_scoring import score_fixed_responses
 from tests.utils.glm53_sparse_capture import SparseCapture
@@ -324,6 +325,17 @@ def test_final_attention_scope_selection_is_exact():
 
 
 class _InspectableInferenceWorkerWrap(NewInferenceWorkerWrap):
+    def begin_glm53_canonical_topk(self) -> dict:
+        assert not hasattr(self, "_glm53_canonical_topk")
+        self._glm53_canonical_topk = CanonicalSparseTopK()
+        self._glm53_canonical_topk.install()
+        return {"rank": self.rank, "enabled": True}
+
+    def end_glm53_canonical_topk(self) -> dict:
+        receipt = {"rank": self.rank, **self._glm53_canonical_topk.restore()}
+        del self._glm53_canonical_topk
+        return receipt
+
     def begin_glm53_sparse_capture(self, directory: str, token_count: int) -> dict:
         if self.rank == 0:
             assert not hasattr(self, "_glm53_sparse_capture")
@@ -1381,6 +1393,7 @@ async def _run_unchanged_score_probe(
     lora_sync_path,
     compare_base=False,
     capture_sparse=False,
+    canonical_topk=False,
 ):
     trainer_before = _inspect_policy_boundary(policy, "inspect_glm53_lora_parameters")
     with Timer("repeatability_initial_publication"):
@@ -1393,7 +1406,22 @@ async def _run_unchanged_score_probe(
             )
         )
     adapter_name = resolve_policy_model_name(cfg)
+    canonical_started = False
     try:
+        if canonical_topk:
+            enabled = await client._call_all_servers(
+                "/collective_rpc",
+                {"method": "begin_glm53_canonical_topk", "kwargs": {}},
+            )
+            canonical_started = True
+            _print_boundary_receipt("canonical_topk_enabled", enabled)
+            for server in enabled.values():
+                assert server["status"] == 200
+                workers = server["body"]["results"]
+                assert sorted(worker["rank"] for worker in workers) == list(
+                    range(cfg.generator.inference_engine.tensor_parallel_size)
+                )
+                assert all(worker["enabled"] for worker in workers)
         _print_boundary_receipt(
             "repeatability_export",
             _inspect_policy_boundary(policy, "inspect_glm53_exported_adapter", str(lora_sync_path)),
@@ -1491,7 +1519,22 @@ async def _run_unchanged_score_probe(
             pair["mean"] < 0.0075 and pair["p99"] < 0.075 for pairs in results.values() for pair in pairs
         ), "Unchanged scoring noise exceeds 10% of the existing update-error budgets"
     finally:
-        await client.unload_lora_adapter(adapter_name)
+        try:
+            if canonical_started:
+                restored = await client._call_all_servers(
+                    "/collective_rpc",
+                    {"method": "end_glm53_canonical_topk", "kwargs": {}},
+                )
+                _print_boundary_receipt("canonical_topk_restored", restored)
+                for server in restored.values():
+                    assert server["status"] == 200
+                    workers = server["body"]["results"]
+                    assert sorted(worker["rank"] for worker in workers) == list(
+                        range(cfg.generator.inference_engine.tensor_parallel_size)
+                    )
+                    assert all(worker["calls"] > 0 and worker["shapes"] for worker in workers)
+        finally:
+            await client.unload_lora_adapter(adapter_name)
 
 
 @pytest.mark.asyncio
@@ -1522,8 +1565,15 @@ async def test_glm53_sparse_attention_capture(glm53_ray_init_fixture):
     await _run_glm53_lora_probe(repeatability_mode="sparse_capture")
 
 
+@pytest.mark.asyncio
+@pytest.mark.megatron
+@pytest.mark.b300
+async def test_glm53_canonical_topk_repeatability(glm53_ray_init_fixture):
+    await _run_glm53_lora_probe(repeatability_mode="canonical_topk")
+
+
 async def _run_glm53_lora_probe(repeatability_mode=None):
-    assert repeatability_mode in {None, "submission", "zero_adapter", "sparse_capture"}
+    assert repeatability_mode in {None, "submission", "zero_adapter", "sparse_capture", "canonical_topk"}
     model = os.environ.get("SKYRL_GLM53_MODEL", MODEL)
     fixed_inputs = None
     if model != SMALL_DRY_RUN_MODEL:
@@ -1601,8 +1651,9 @@ async def _run_glm53_lora_probe(repeatability_mode=None):
                         base_responses,
                         base_input,
                         lora_sync_path,
-                        compare_base=repeatability_mode in {"zero_adapter", "sparse_capture"},
+                        compare_base=repeatability_mode in {"zero_adapter", "sparse_capture", "canonical_topk"},
                         capture_sparse=repeatability_mode == "sparse_capture",
+                        canonical_topk=repeatability_mode == "canonical_topk",
                     )
                     completed = True
                     return
