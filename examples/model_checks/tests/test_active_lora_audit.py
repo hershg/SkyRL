@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from examples.model_checks.active_lora_audit import (
+    check_untargeted_buffers,
     compare_active_tensors,
     map_exported_tensor,
 )
@@ -52,3 +53,10 @@ def test_missing_scope_fails():
     loaded["unknown", 0, "A"] = torch.zeros(2, 4)
     with pytest.raises(AssertionError, match="unexpected"):
         compare_active_tensors(exported, loaded, 2, 2)
+
+
+@pytest.mark.parametrize("name", ["model.embed_tokens", "lm_head"])
+def test_untargeted_wrappers_must_stay_zero(name):
+    check_untargeted_buffers(name, [torch.zeros(2, 4)])
+    with pytest.raises(AssertionError):
+        check_untargeted_buffers(name, [torch.ones(2, 4)])

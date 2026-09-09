@@ -8,7 +8,10 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
-from examples.model_checks.active_lora_audit import compare_active_tensors
+from examples.model_checks.active_lora_audit import (
+    check_untargeted_buffers,
+    compare_active_tensors,
+)
 from skyrl.backends.skyrl_train.inference_servers.new_inference_worker_wrap import (
     NewInferenceWorkerWrap,
 )
@@ -27,7 +30,13 @@ class ActiveLoRAAuditWorker(NewInferenceWorkerWrap):
         slot = slots[0]
         torch.cuda.synchronize()
         loaded = {}
+        untargeted = []
         for name, module in manager.modules.items():
+            if name in ("model.embed_tokens", "lm_head"):
+                assert type(module).__name__ in ("VocabParallelEmbeddingWithLoRA", "LogitsProcessorWithLoRA")
+                check_untargeted_buffers(name, (module.lora_a_stacked[slot], module.lora_b_stacked[slot]))
+                untargeted.append(name)
+                continue
             assert type(module).__name__ in (
                 "RowParallelLinearWithLoRA",
                 "QKVParallelLinearWithLoRA",
@@ -48,5 +57,5 @@ class ActiveLoRAAuditWorker(NewInferenceWorkerWrap):
         result = compare_active_tensors(exported, loaded, config["r"], config["lora_alpha"])
         with weights.open("rb") as stream:
             result["export_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
-        result.update(vllm_version=version, adapter_id=ids[0], slot=slot, dtype="bfloat16", tp=1)
+        result.update(vllm_version=version, adapter_id=ids[0], slot=slot, dtype="bfloat16", tp=1, zero_untargeted=untargeted)
         return result

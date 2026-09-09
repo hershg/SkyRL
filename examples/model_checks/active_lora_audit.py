@@ -23,6 +23,12 @@ def map_exported_tensor(name):
     return f"{parent}.{fused}", index, adapter[-1]
 
 
+def check_untargeted_buffers(name, buffers):
+    assert name in ("model.embed_tokens", "lm_head"), name
+    for buffer in buffers:
+        assert torch.isfinite(buffer).all() and torch.count_nonzero(buffer) == 0, name
+
+
 def compare_active_tensors(exported, loaded, rank, alpha):
     expected_keys = set()
     mismatches = []
