@@ -30,12 +30,17 @@ def run_reference(model_path, adapter_path, sequences, dtype):
     start = perf_counter()
     model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype, attn_implementation="eager")
     model = model.to("cuda").eval()
+    base_buffers = {name: buffer.clone() for name, buffer in model.named_buffers()}
     before = score_sequences(model, sequences)
-    model = PeftModel.from_pretrained(model, adapter_path, autocast_adapter_dtype=False).to(dtype=dtype).eval()
+    model = PeftModel.from_pretrained(model, adapter_path, autocast_adapter_dtype=False).eval()
+    for name, expected in base_buffers.items():
+        actual = model.get_base_model().get_buffer(name)
+        assert actual.dtype == expected.dtype and torch.equal(actual, expected), name
     exported = load_file(adapter_path / "adapter_model.safetensors")
     loaded = get_peft_model_state_dict(model)
     assert loaded.keys() == exported.keys()
     for name, tensor in loaded.items():
+        assert tensor.dtype == dtype, name
         assert torch.equal(tensor.cpu(), exported[name].to(dtype=dtype)), name
     after = score_sequences(model, sequences)
     with model.disable_adapter():
@@ -45,11 +50,13 @@ def run_reference(model_path, adapter_path, sequences, dtype):
         "updated": after,
         "disabled": disabled,
         "loaded_adapter_tensors": len(loaded),
+        "base_buffer_dtypes": {name: str(buffer.dtype) for name, buffer in base_buffers.items()},
         "seconds": perf_counter() - start,
     }
     result["disabled_parity"] = compare_logprobs(before, disabled)
+    assert result["disabled_parity"]["max_abs"] < 1e-6
     result["adapter_change"] = compare_logprobs(before, after)
-    del model, loaded, exported
+    del model, loaded, exported, base_buffers
     gc.collect()
     torch.cuda.empty_cache()
     return result
