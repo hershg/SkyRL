@@ -31,6 +31,20 @@ class ActiveLoRAAuditWorker(NewInferenceWorkerWrap):
         torch.cuda.synchronize()
         loaded = {}
         untargeted = []
+        supported = {
+            "VocabParallelEmbeddingWithLoRA",
+            "LogitsProcessorWithLoRA",
+            "RowParallelLinearWithLoRA",
+            "QKVParallelLinearWithLoRA",
+            "MergedQKVParallelLinearWithLoRA",
+            "MergedColumnParallelLinearWithLoRA",
+        }
+        unknown = [
+            (name, type(module).__name__)
+            for name, module in manager.modules.items()
+            if type(module).__name__ not in supported
+        ]
+        assert not unknown, unknown
         for name, module in manager.modules.items():
             if name in ("model.embed_tokens", "lm_head"):
                 assert type(module).__name__ in ("VocabParallelEmbeddingWithLoRA", "LogitsProcessorWithLoRA")
@@ -40,6 +54,7 @@ class ActiveLoRAAuditWorker(NewInferenceWorkerWrap):
             assert type(module).__name__ in (
                 "RowParallelLinearWithLoRA",
                 "QKVParallelLinearWithLoRA",
+                "MergedQKVParallelLinearWithLoRA",
                 "MergedColumnParallelLinearWithLoRA",
             ), (name, type(module).__name__)
             assert module.tp_size == 1
@@ -57,5 +72,7 @@ class ActiveLoRAAuditWorker(NewInferenceWorkerWrap):
         result = compare_active_tensors(exported, loaded, config["r"], config["lora_alpha"])
         with weights.open("rb") as stream:
             result["export_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
-        result.update(vllm_version=version, adapter_id=ids[0], slot=slot, dtype="bfloat16", tp=1, zero_untargeted=untargeted)
+        result.update(
+            vllm_version=version, adapter_id=ids[0], slot=slot, dtype="bfloat16", tp=1, zero_untargeted=untargeted
+        )
         return result
