@@ -20,11 +20,19 @@ def main():
     parser.add_argument("--direction", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--trainer-representable", action="store_true", help="Round B to native BF16 storage before export"
+    )
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     zero = load_file(args.zero / "adapter_model.safetensors")
     direction = load_file(args.direction / "adapter_model.safetensors")
     candidate, norms = build_b_only_candidate(zero, direction)
+    if args.trainer_representable:
+        candidate = {name: value.to(torch.bfloat16).float() for name, value in candidate.items()}
+        assert all(torch.equal(value, zero[name]) for name, value in candidate.items() if ".lora_A." in name)
+        for name in norms:
+            norms[name]["candidate"] = candidate[name].norm().item()
     save_file(candidate, args.output_dir / "adapter_model.safetensors")
     shutil.copyfile(args.zero / "adapter_config.json", args.output_dir / "adapter_config.json")
     fixture = json.loads(args.receipt.read_text())
@@ -35,6 +43,7 @@ def main():
         "tokens": fixture["tokens"],
         "b_norms": norms,
         "a_unchanged_tensors": sum(".lora_A." in name for name in candidate),
+        "trainer_representable": args.trainer_representable,
     }
     for label, path in (("zero", args.zero), ("direction", args.direction), ("candidate", args.output_dir)):
         with (path / "adapter_model.safetensors").open("rb") as stream:

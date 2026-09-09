@@ -1,16 +1,20 @@
 """Native SkyRL calls used by the standalone LoRA score diagnostic."""
 
-from contextlib import asynccontextmanager
 import math
+from contextlib import asynccontextmanager
 
 import ray
 import torch
 
-from examples.model_checks.lora_logprobs import perturb_adapters
+from examples.model_checks.lora_logprobs import perturb_adapters, perturb_b_only
 from skyrl.backends.skyrl_train.distributed.dispatch import WorkerOutput
-from skyrl.backends.skyrl_train.inference_servers.setup import build_new_inference_client
+from skyrl.backends.skyrl_train.inference_servers.setup import (
+    build_new_inference_client,
+)
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
-from skyrl.backends.skyrl_train.workers.megatron.megatron_worker import MegatronPolicyWorkerBase
+from skyrl.backends.skyrl_train.workers.megatron.megatron_worker import (
+    MegatronPolicyWorkerBase,
+)
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
 from skyrl.train.dataset.preprocess import convert_prompts_responses_to_batch_tensors
 from skyrl.train.utils.utils import initialize_ray
@@ -57,6 +61,14 @@ def perturb_trainer(policy):
 
 
 class LoRALogprobWorker(MegatronPolicyWorkerBase):
+    def perturb_test_b_only(self):
+        parameters = (
+            (f"chunk{index}.{name}", parameter)
+            for index, chunk in enumerate(self.actor_module)
+            for name, parameter in chunk.named_parameters()
+        )
+        return perturb_b_only(parameters)
+
     def perturb_test_adapter(self):
         parameters = (
             (f"chunk{index}.{name}", parameter)

@@ -8,12 +8,16 @@ from pathlib import Path
 from time import perf_counter
 
 import httpx
+import ray
+import torch
+from safetensors.torch import load_file
 
 from examples.model_checks.megatron_lora import (
     build_batch,
     open_runtime,
     publish,
     score_sampler,
+    score_trainer,
 )
 from examples.tinker.glm53.run_lora_logprobs import (
     apply_trainer_update,
@@ -72,12 +76,27 @@ async def run(args, report):
         shutil.copytree(exports, zero)
         report["zero_buffers"] = await audit(client, zero, report, "zero")
         assert report["zero_buffers"]["passed"], report["zero_buffers"]
-        apply_trainer_update(policy, batch, report)
+        if args.b_only_candidate is None:
+            apply_trainer_update(policy, batch, report)
+        else:
+            report["perturbation"] = ray.get(policy.async_run_ray_method("pass_through", "perturb_test_b_only"))
+            report["trainer_updated"] = score_trainer(policy, batch)
         await check_unpublished_sampler(client, sequences, adapter, report)
         await publish(policy, client, cfg)
         report["updated"] = await score_sampler(client, sequences, adapter)
         updated = args.output_dir / "updated-export"
         shutil.copytree(exports, updated)
+        if args.b_only_candidate is not None:
+            candidate = load_file(args.b_only_candidate / "adapter_model.safetensors")
+            actual = load_file(updated / "adapter_model.safetensors")
+            assert candidate.keys() == actual.keys()
+            report["candidate_mismatched_tensors"] = [
+                name
+                for name, tensor in actual.items()
+                if not torch.equal(tensor, candidate[name].to(torch.bfloat16).float())
+            ]
+            assert not report["candidate_mismatched_tensors"], report["candidate_mismatched_tensors"]
+            report["exact_representable_candidate_tensors"] = len(actual)
         report["updated_buffers"] = await audit(client, updated, report, "updated")
         report["stale_export_negative"] = await audit(client, zero, report, "stale")
         assert report["updated_buffers"]["passed"], report["updated_buffers"]
@@ -90,6 +109,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend-config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--b-only-candidate", type=Path, help="Diagnostic-only retained B-only10x reference export")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     report = {"passed": False, "diagnostic_only": True, "tensor_integrity_passed": False}
