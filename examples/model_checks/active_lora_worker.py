@@ -9,6 +9,7 @@ import torch
 from safetensors.torch import load_file
 
 from examples.model_checks.active_lora_audit import (
+    check_qwen_export_scope,
     check_untargeted_buffers,
     compare_active_tensors,
     validate_qwen_wrapper_layout,
@@ -80,7 +81,8 @@ class ActiveLoRAAuditWorker(NewInferenceWorkerWrap):
         assert not config.get("use_rslora", False) and not config.get("use_dora", False)
         weights = path / "adapter_model.safetensors"
         exported = load_file(weights)
-        assert len(exported) == 392 and all(t.dtype == torch.float32 for t in exported.values())
+        geometry = self.model_runner.model.config.to_dict()
+        check_qwen_export_scope(exported, geometry, config["r"])
         result = compare_active_tensors(exported, loaded, config["r"], config["lora_alpha"])
         with weights.open("rb") as stream:
             result["export_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()

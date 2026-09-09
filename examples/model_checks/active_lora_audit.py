@@ -13,6 +13,31 @@ PACKED_MODULES = {
 }
 
 
+def check_qwen_export_scope(exported, geometry, rank):
+    hidden = geometry["hidden_size"]
+    query = geometry["num_attention_heads"] * geometry["head_dim"]
+    kv = geometry["num_key_value_heads"] * geometry["head_dim"]
+    intermediate = geometry["intermediate_size"]
+    dimensions = {
+        "self_attn.q_proj": (hidden, query),
+        "self_attn.k_proj": (hidden, kv),
+        "self_attn.v_proj": (hidden, kv),
+        "self_attn.o_proj": (query, hidden),
+        "mlp.gate_proj": (hidden, intermediate),
+        "mlp.up_proj": (hidden, intermediate),
+        "mlp.down_proj": (intermediate, hidden),
+    }
+    expected = {
+        f"base_model.model.model.layers.{layer}.{target}.lora_{label}.weight": shape
+        for layer in range(geometry["num_hidden_layers"])
+        for target, (width_in, width_out) in dimensions.items()
+        for label, shape in (("A", (rank, width_in)), ("B", (width_out, rank)))
+    }
+    assert exported.keys() == expected.keys(), "Missing or unexpected exported Qwen targets"
+    for name, tensor in exported.items():
+        assert tensor.dtype == torch.float32 and tuple(tensor.shape) == expected[name], name
+
+
 def validate_qwen_wrapper_layout(modules):
     expected = {
         "embed_tokens": ("VocabParallelEmbeddingWithLoRA", None),

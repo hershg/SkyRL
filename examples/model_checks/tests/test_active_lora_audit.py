@@ -2,11 +2,45 @@ import pytest
 import torch
 
 from examples.model_checks.active_lora_audit import (
+    check_qwen_export_scope,
     check_untargeted_buffers,
     compare_active_tensors,
     map_exported_tensor,
     validate_qwen_wrapper_layout,
 )
+
+
+@pytest.mark.parametrize("layers", [28, 36])
+def test_export_scope_uses_exact_model_geometry(layers):
+    geometry = dict(
+        num_hidden_layers=layers,
+        hidden_size=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=3,
+        intermediate_size=8,
+    )
+    exported = {}
+    for layer in range(layers):
+        for target, width_in, width_out in (
+            ("self_attn.q_proj", 4, 6),
+            ("self_attn.k_proj", 4, 3),
+            ("self_attn.v_proj", 4, 3),
+            ("self_attn.o_proj", 6, 4),
+            ("mlp.gate_proj", 4, 8),
+            ("mlp.up_proj", 4, 8),
+            ("mlp.down_proj", 8, 4),
+        ):
+            for label, shape in (("A", (2, width_in)), ("B", (width_out, 2))):
+                exported[f"base_model.model.model.layers.{layer}.{target}.lora_{label}.weight"] = torch.zeros(shape)
+    check_qwen_export_scope(exported, geometry, 2)
+    key = next(iter(exported))
+    tensor = exported.pop(key)
+    with pytest.raises(AssertionError, match="Missing"):
+        check_qwen_export_scope(exported, geometry, 2)
+    exported[key] = tensor.transpose(0, 1)
+    with pytest.raises(AssertionError):
+        check_qwen_export_scope(exported, geometry, 2)
 
 
 def make_tensors():
