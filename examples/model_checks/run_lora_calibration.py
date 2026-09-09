@@ -21,7 +21,7 @@ from examples.tinker.glm53.run_lora_logprobs import (
     check_zero_initialized_policy,
     load_config,
 )
-from skyrl.backends.skyrl_train.inference_servers.utils import resolve_policy_model_name
+from skyrl.backends.skyrl_train.inference_servers.utils import build_vllm_cli_args, resolve_policy_model_name
 from skyrl.tinker.logprob_checks import (
     build_probe_sequences,
     check_updated_adapter,
@@ -42,6 +42,16 @@ def compare_update_deltas(trainer_before, trainer_after, sampler_before, sampler
 
 async def run(args, report):
     cfg = load_config(args.backend_config, args.output_dir)
+    # SkyRL resets eager LoRA to compiled for speed; this is an explicit numerical control.
+    cfg.generator.inference_engine.enforce_eager = True
+    engine_args = build_vllm_cli_args(cfg)
+    assert engine_args.enforce_eager is True
+    report["effective_inference"] = {
+        "enforce_eager": engine_args.enforce_eager,
+        "dtype": engine_args.dtype,
+        "kv_cache_dtype": engine_args.kv_cache_dtype,
+        "max_model_len": engine_args.max_model_len,
+    }
     tokenizer = get_tokenizer(cfg.trainer.policy.model.path)
     sequences = build_probe_sequences(tokenizer)
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
