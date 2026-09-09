@@ -5,6 +5,7 @@ from examples.model_checks.active_lora_audit import (
     check_untargeted_buffers,
     compare_active_tensors,
     map_exported_tensor,
+    validate_qwen_wrapper_layout,
 )
 
 
@@ -60,3 +61,23 @@ def test_untargeted_wrappers_must_stay_zero(name):
     check_untargeted_buffers(name, [torch.zeros(2, 4)])
     with pytest.raises(AssertionError):
         check_untargeted_buffers(name, [torch.ones(2, 4)])
+
+
+def test_all_qwen028_wrappers_and_slice_counts():
+    modules = [
+        {"name": name, "class": cls, "slices": slices}
+        for name, cls, slices in (
+            ("model.embed_tokens", "VocabParallelEmbeddingWithLoRA", None),
+            ("lm_head", "LogitsProcessorWithLoRA", None),
+            ("model.layers.0.self_attn.qkv_proj", "MergedQKVParallelLinearWithLoRA", 3),
+            ("model.layers.0.mlp.gate_up_proj", "MergedColumnParallelLinearWithLoRA", 2),
+            ("model.layers.0.self_attn.o_proj", "RowParallelLinearWithLoRA", 1),
+            ("model.layers.0.mlp.down_proj", "RowParallelLinearWithLoRA", 1),
+        )
+    ]
+    validate_qwen_wrapper_layout(modules)
+    modules[2]["class"] = "QKVParallelLinearWithLoRA"
+    modules[3]["slices"] = 3
+    with pytest.raises(AssertionError) as error:
+        validate_qwen_wrapper_layout(modules)
+    assert "qkv_proj" in str(error.value) and "gate_up_proj" in str(error.value)

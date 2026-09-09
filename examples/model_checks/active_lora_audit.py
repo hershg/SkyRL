@@ -13,6 +13,24 @@ PACKED_MODULES = {
 }
 
 
+def validate_qwen_wrapper_layout(modules):
+    expected = {
+        "embed_tokens": ("VocabParallelEmbeddingWithLoRA", None),
+        "lm_head": ("LogitsProcessorWithLoRA", None),
+        "qkv_proj": ("MergedQKVParallelLinearWithLoRA", 3),
+        "gate_up_proj": ("MergedColumnParallelLinearWithLoRA", 2),
+        "o_proj": ("RowParallelLinearWithLoRA", 1),
+        "down_proj": ("RowParallelLinearWithLoRA", 1),
+    }
+    errors = []
+    for module in modules:
+        target = module["name"].rsplit(".", 1)[-1]
+        actual = module["class"], module["slices"]
+        if target not in expected or actual != expected[target]:
+            errors.append({"name": module["name"], "actual": actual, "expected": expected.get(target)})
+    assert not errors, errors
+
+
 def build_b_only_candidate(zero, direction):
     assert zero.keys() == direction.keys()
     candidate = {}

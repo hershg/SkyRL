@@ -11,6 +11,7 @@ from safetensors.torch import load_file
 from examples.model_checks.active_lora_audit import (
     check_untargeted_buffers,
     compare_active_tensors,
+    validate_qwen_wrapper_layout,
 )
 from skyrl.backends.skyrl_train.inference_servers.new_inference_worker_wrap import (
     NewInferenceWorkerWrap,
@@ -18,6 +19,30 @@ from skyrl.backends.skyrl_train.inference_servers.new_inference_worker_wrap impo
 
 
 class ActiveLoRAAuditWorker(NewInferenceWorkerWrap):
+    def describe_active_lora(self):
+        manager = self.model_runner.lora_manager._adapter_manager
+        modules = []
+        for name, module in manager.modules.items():
+            entry = {
+                "name": name,
+                "class": type(module).__name__,
+                "slices": getattr(module, "n_slices", None),
+                "tp": getattr(module, "tp_size", None),
+            }
+            for label in ("a", "b"):
+                buffers = getattr(module, f"lora_{label}_stacked", ())
+                if isinstance(buffers, torch.Tensor):
+                    buffers = (buffers,)
+                entry[label] = [{"shape": list(buffer.shape), "dtype": str(buffer.dtype)} for buffer in buffers]
+            modules.append(entry)
+        return {
+            "modules": modules,
+            "registered_ids": list(manager._registered_adapters),
+            "active_slots": manager.lora_index_to_id,
+            "runner_class": type(self.model_runner).__name__,
+            "vllm": importlib.metadata.version("vllm"),
+        }
+
     def audit_active_lora(self, adapter_path):
         version = importlib.metadata.version("vllm")
         assert version.split("+")[0] == "0.28.0", version
@@ -28,23 +53,10 @@ class ActiveLoRAAuditWorker(NewInferenceWorkerWrap):
         slots = [index for index, value in enumerate(manager.lora_index_to_id) if value == ids[0]]
         assert len(slots) == 1, manager.lora_index_to_id
         slot = slots[0]
+        validate_qwen_wrapper_layout(self.describe_active_lora()["modules"])
         torch.cuda.synchronize()
         loaded = {}
         untargeted = []
-        supported = {
-            "VocabParallelEmbeddingWithLoRA",
-            "LogitsProcessorWithLoRA",
-            "RowParallelLinearWithLoRA",
-            "QKVParallelLinearWithLoRA",
-            "MergedQKVParallelLinearWithLoRA",
-            "MergedColumnParallelLinearWithLoRA",
-        }
-        unknown = [
-            (name, type(module).__name__)
-            for name, module in manager.modules.items()
-            if type(module).__name__ not in supported
-        ]
-        assert not unknown, unknown
         for name, module in manager.modules.items():
             if name in ("model.embed_tokens", "lm_head"):
                 assert type(module).__name__ in ("VocabParallelEmbeddingWithLoRA", "LogitsProcessorWithLoRA")

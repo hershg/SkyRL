@@ -29,17 +29,24 @@ from skyrl.tinker.logprob_checks import build_probe_sequences, check_updated_ada
 from skyrl.utils.tok import get_tokenizer
 
 
-async def audit(client, path):
+async def call_worker(client, method, args):
     assert len(client.server_urls) == 1
     async with httpx.AsyncClient(timeout=120) as http:
         response = await http.post(
             f"{client.server_urls[0]}/collective_rpc",
-            json={"method": "audit_active_lora", "args": [str(path)], "timeout": 90},
+            json={"method": method, "args": args, "timeout": 90},
         )
         response.raise_for_status()
         results = response.json()["results"]
     assert len(results) == 1, results
     return results[0]
+
+
+async def audit(client, path, report, phase):
+    report[f"{phase}_layout"] = await call_worker(client, "describe_active_lora", [])
+    with (path.parent / f"{phase}-buffer-layout.json").open("x") as output:
+        json.dump(report[f"{phase}_layout"], output, indent=2, allow_nan=False)
+    return await call_worker(client, "audit_active_lora", [str(path)])
 
 
 async def run(args, report):
@@ -63,7 +70,7 @@ async def run(args, report):
         await check_zero_initialized_policy(policy, client, cfg, batch, sequences, report, 0.05)
         zero = args.output_dir / "zero-export"
         shutil.copytree(exports, zero)
-        report["zero_buffers"] = await audit(client, zero)
+        report["zero_buffers"] = await audit(client, zero, report, "zero")
         assert report["zero_buffers"]["passed"], report["zero_buffers"]
         apply_trainer_update(policy, batch, report)
         await check_unpublished_sampler(client, sequences, adapter, report)
@@ -71,8 +78,8 @@ async def run(args, report):
         report["updated"] = await score_sampler(client, sequences, adapter)
         updated = args.output_dir / "updated-export"
         shutil.copytree(exports, updated)
-        report["updated_buffers"] = await audit(client, updated)
-        report["stale_export_negative"] = await audit(client, zero)
+        report["updated_buffers"] = await audit(client, updated, report, "updated")
+        report["stale_export_negative"] = await audit(client, zero, report, "stale")
         assert report["updated_buffers"]["passed"], report["updated_buffers"]
         assert not report["stale_export_negative"]["passed"], "Stale export was not detected"
         report["tensor_integrity_passed"] = True
