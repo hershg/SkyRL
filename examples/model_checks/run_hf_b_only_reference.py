@@ -10,7 +10,9 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from examples.model_checks.active_lora_audit import build_b_only_candidate
+from examples.model_checks.heldout_publication import build_heldout_sequences
 from examples.model_checks.run_hf_lora_reference import run_reference
+from skyrl.utils.tok import get_tokenizer
 
 
 def main():
@@ -20,8 +22,11 @@ def main():
     parser.add_argument("--direction", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--heldout", action="store_true")
     parser.add_argument(
-        "--trainer-representable", action="store_true", help="Round B to native BF16 storage before export"
+        "--trainer-representable",
+        action="store_true",
+        help="Round B to native BF16 storage before export",
     )
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
@@ -36,6 +41,8 @@ def main():
     save_file(candidate, args.output_dir / "adapter_model.safetensors")
     shutil.copyfile(args.zero / "adapter_config.json", args.output_dir / "adapter_config.json")
     fixture = json.loads(args.receipt.read_text())
+    if args.heldout:
+        fixture["tokens"] = build_heldout_sequences(get_tokenizer(args.model))
     report = {
         "diagnostic_only": True,
         "amplitude_multiplier": 10,
@@ -45,7 +52,11 @@ def main():
         "a_unchanged_tensors": sum(".lora_A." in name for name in candidate),
         "trainer_representable": args.trainer_representable,
     }
-    for label, path in (("zero", args.zero), ("direction", args.direction), ("candidate", args.output_dir)):
+    for label, path in (
+        ("zero", args.zero),
+        ("direction", args.direction),
+        ("candidate", args.output_dir),
+    ):
         with (path / "adapter_model.safetensors").open("rb") as stream:
             report[f"{label}_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
     torch.set_float32_matmul_precision("highest")
@@ -61,7 +72,11 @@ def main():
     signal = fp32.abs().mean().item()
     error = (bf16 - fp32).abs().mean().item()
     assert error > 0 and torch.isfinite(bf16).all() and torch.isfinite(fp32).all()
-    report.update(signal_mean_abs=signal, arithmetic_error_mean_abs=error, signal_error_ratio=signal / error)
+    report.update(
+        signal_mean_abs=signal,
+        arithmetic_error_mean_abs=error,
+        signal_error_ratio=signal / error,
+    )
     report["signal_separation_passed"] = signal / error >= report["minimum_signal_error_ratio"]
     with (args.output_dir / "reference.json").open("x") as output:
         json.dump(report, output, indent=2, allow_nan=False)
