@@ -24,17 +24,27 @@ def perturb_adapters(named_parameters, seed=0, scale=1e-3):
         name_seed = int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "little")
         generator = torch.Generator(device=parameter.device).manual_seed((seed + name_seed) % (2**63))
         parameter.add_(
-            torch.randn(parameter.shape, generator=generator, device=parameter.device, dtype=parameter.dtype),
+            torch.randn(
+                parameter.shape,
+                generator=generator,
+                device=parameter.device,
+                dtype=parameter.dtype,
+            ),
             alpha=scale,
         )
         changed += parameter.numel()
         tensors += 1
     assert changed > 0
-    return {"trainable_tensors": tensors, "trainable_elements": changed, "seed": seed, "noise_std": scale}
+    return {
+        "trainable_tensors": tensors,
+        "trainable_elements": changed,
+        "seed": seed,
+        "noise_std": scale,
+    }
 
 
 @torch.no_grad()
-def perturb_b_only(named_parameters):
+def perturb_b_only(named_parameters, multiplier=10):
     parameters = [(name, p) for name, p in named_parameters if p.requires_grad]
     a = [(name, p) for name, p in parameters if name.endswith(".linear_in.weight")]
     b = [(name, p) for name, p in parameters if name.endswith(".linear_out.weight")]
@@ -43,7 +53,7 @@ def perturb_b_only(named_parameters):
     assert all(torch.count_nonzero(p) == 0 for _, p in b)
     report = perturb_adapters(b)
     for _, parameter in b:
-        parameter.mul_(10)
+        parameter.mul_(multiplier)
     assert all(torch.equal(before, after) for before, (_, after) in zip(preserved, a))
-    report.update(a_unchanged_tensors=len(a), b_multiplier=10)
+    report.update(a_unchanged_tensors=len(a), b_multiplier=multiplier)
     return report

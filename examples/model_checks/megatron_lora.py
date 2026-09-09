@@ -39,7 +39,10 @@ async def open_runtime(cfg, tokenizer):
             ray.get(policy.async_init_model(cfg.trainer.policy.model.path))
             ray.get(
                 policy.async_run_ray_method(
-                    "pass_through", "init_weight_sync_state", client, cfg.generator.inference_engine
+                    "pass_through",
+                    "init_weight_sync_state",
+                    client,
+                    cfg.generator.inference_engine,
                 )
             )
             yield policy, client
@@ -61,13 +64,13 @@ def perturb_trainer(policy):
 
 
 class LoRALogprobWorker(MegatronPolicyWorkerBase):
-    def perturb_test_b_only(self):
+    def perturb_test_b_only(self, multiplier=10):
         parameters = (
             (f"chunk{index}.{name}", parameter)
             for index, chunk in enumerate(self.actor_module)
             for name, parameter in chunk.named_parameters()
         )
-        return perturb_b_only(parameters)
+        return perturb_b_only(parameters, multiplier)
 
     def perturb_test_adapter(self):
         parameters = (
@@ -143,7 +146,10 @@ async def publish(policy, client, cfg):
     try:
         ray.get(
             policy.async_run_ray_method(
-                "pass_through", "broadcast_to_inference_engines", client, cfg.generator.inference_engine
+                "pass_through",
+                "broadcast_to_inference_engines",
+                client,
+                cfg.generator.inference_engine,
             )
         )
     finally:
