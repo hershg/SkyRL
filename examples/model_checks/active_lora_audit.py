@@ -13,6 +13,23 @@ PACKED_MODULES = {
 }
 
 
+def build_b_only_candidate(zero, direction):
+    assert zero.keys() == direction.keys()
+    candidate = {}
+    norms = {}
+    for name, tensor in zero.items():
+        assert tensor.dtype == direction[name].dtype == torch.float32
+        if ".lora_A." in name:
+            candidate[name] = tensor.clone()
+            assert torch.equal(candidate[name], tensor)
+        else:
+            assert ".lora_B." in name and torch.count_nonzero(tensor) == 0, name
+            candidate[name] = direction[name] * 10
+            assert torch.isfinite(candidate[name]).all() and torch.count_nonzero(candidate[name]) > 0, name
+            norms[name] = {"original": direction[name].norm().item(), "candidate": candidate[name].norm().item()}
+    return candidate, norms
+
+
 def map_exported_tensor(name):
     prefix = "base_model.model."
     assert name.startswith(prefix), name
