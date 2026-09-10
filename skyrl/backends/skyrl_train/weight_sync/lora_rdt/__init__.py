@@ -24,6 +24,7 @@ from .receiver import (
     resolve_lora_rdt_producers,
 )
 from .rendezvous import LoRardtProducerRendezvous
+from .server_lifecycle import LoRardtRollbackError, LoRardtServerLifecycle
 from .vllm_adapter import (
     activate_staged_vllm_lora_model,
     build_vllm_lora_model,
@@ -41,6 +42,8 @@ __all__ = [
     "LoRAAdapterLayout",
     "LoRATensorSlice",
     "LoRardtProducer",
+    "LoRardtRollbackError",
+    "LoRardtServerLifecycle",
     "LoRardtProducerRendezvous",
     "LoRATransferInitInfo",
     "LoRAUpdateRequest",
