@@ -23,6 +23,7 @@ class LoRABridgeSource:
     expert_parallel_axis: int | None
     expert_parallel_rank: int
     expert_parallel_size: int
+    transform_config: tuple[tuple[str, int | bool | None], ...]
 
 
 def extract_lora_bridge_sources(
@@ -64,6 +65,7 @@ def extract_lora_bridge_sources(
                 expert_parallel_axis=record.expert_parallel_axis,
                 expert_parallel_rank=record.expert_parallel_rank,
                 expert_parallel_size=record.expert_parallel_size,
+                transform_config=tuple(record.transform_config),
             )
         )
     if not sources:
@@ -123,6 +125,7 @@ def reconstruct_lora_bridge_tensors(
             or source.transform != first.transform
             or source.tensor_parallel_axis != first.tensor_parallel_axis
             or source.expert_parallel_axis != first.expert_parallel_axis
+            or source.transform_config != first.transform_config
             for source in group
         ):
             raise ValueError(f"Bridge source {key!r} has inconsistent shard metadata")
@@ -200,6 +203,78 @@ def _emit_reconstructed_lora_tensors(
         result[source.hf_param_names[0]] = gate
         result[source.hf_param_names[1]] = up
         return
+    if source.transform == "split_qkv":
+        if len(source.hf_param_names) != 3:
+            raise ValueError(
+                f"Bridge source {source.key!r} QKV transform requires three HF names"
+            )
+        q, k, v = _split_qkv_lora_tensor(tensor, dict(source.transform_config))
+        result[source.hf_param_names[0]] = q
+        result[source.hf_param_names[1]] = k
+        result[source.hf_param_names[2]] = v
+        return
     raise ValueError(
         f"Bridge source {source.key!r} requires {source.transform!r} conversion with the Megatron config"
+    )
+
+
+def _split_qkv_lora_tensor(
+    tensor: torch.Tensor,
+    config: Mapping[str, int | bool | None],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split a full Megatron interleaved QKV LoRA-B tensor into PEFT tensors."""
+    required = ("num_attention_heads", "num_query_groups", "kv_channels", "hidden_size")
+    if any(config.get(field) is None for field in required):
+        raise ValueError("QKV LoRA source is missing its Bridge transform config")
+    num_heads = int(config["num_attention_heads"])
+    num_groups = int(config["num_query_groups"])
+    head_size = int(config["kv_channels"] or int(config["hidden_size"]) // num_heads)
+    heads_per_group = num_heads // num_groups
+    attention_output_gate = bool(config.get("attention_output_gate", False))
+    total_heads_per_group = (
+        2 * heads_per_group + 2 if attention_output_gate else heads_per_group + 2
+    )
+    qkv_total_dim = (
+        2 * num_heads + 2 * num_groups
+        if attention_output_gate
+        else num_heads + 2 * num_groups
+    )
+    if tensor.ndim != 2 or tensor.shape[0] != qkv_total_dim * head_size:
+        raise ValueError(
+            f"QKV LoRA source has shape {tuple(tensor.shape)}, expected first dimension "
+            f"{qkv_total_dim * head_size}"
+        )
+    feature_dim = tensor.shape[1]
+    qkv = tensor.view(qkv_total_dim, head_size, feature_dim)
+    q_indices = torch.cat(
+        [
+            torch.arange(
+                total_heads_per_group * index,
+                total_heads_per_group * index + heads_per_group,
+            )
+            for index in range(num_groups)
+        ]
+    )
+    k_indices = torch.arange(
+        total_heads_per_group - 2, qkv_total_dim, total_heads_per_group
+    )
+    v_indices = torch.arange(
+        total_heads_per_group - 1, qkv_total_dim, total_heads_per_group
+    )
+    q = qkv[q_indices]
+    if attention_output_gate:
+        z_indices = torch.cat(
+            [
+                torch.arange(
+                    total_heads_per_group * index + heads_per_group,
+                    total_heads_per_group * index + heads_per_group * 2,
+                )
+                for index in range(num_groups)
+            ]
+        )
+        q = torch.cat([q, qkv[z_indices]], dim=1)
+    return (
+        q.reshape(-1, feature_dim),
+        qkv[k_indices].reshape(-1, feature_dim),
+        qkv[v_indices].reshape(-1, feature_dim),
     )

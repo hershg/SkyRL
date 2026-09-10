@@ -23,6 +23,7 @@ def _record(**overrides):
         "expert_parallel_axis": None,
         "expert_parallel_rank": 0,
         "expert_parallel_size": 1,
+        "transform_config": (),
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -115,4 +116,42 @@ def test_reconstruct_lora_bridge_tensors_replicates_and_splits_gated_sources():
     )
     assert torch.equal(
         result["up.lora_B.weight"], torch.tensor([[4.0, 5.0], [6.0, 7.0]])
+    )
+
+
+def test_reconstruct_lora_bridge_tensors_splits_qkv_with_bridge_layout_config():
+    source_tensor = torch.arange(32, dtype=torch.float32).reshape(16, 2)
+    qkv = _record(
+        global_param_name="decoder.layers.0.self_attention.linear_qkv.adapter.linear_out.weight",
+        hf_param_names=("q.lora_B.weight", "k.lora_B.weight", "v.lora_B.weight"),
+        component="linear_out",
+        transform="split_qkv",
+        weight=source_tensor,
+        tensor_parallel_size=1,
+        transform_config=(
+            ("num_attention_heads", 4),
+            ("num_query_groups", 2),
+            ("kv_channels", 2),
+            ("hidden_size", 8),
+            ("attention_output_gate", False),
+        ),
+    )
+    tensors, sources = extract_lora_bridge_sources([qkv])
+
+    result = reconstruct_lora_bridge_tensors(
+        sources,
+        {(sources[0].key, 0, 0): tensors[sources[0].key]},
+    )
+
+    assert torch.equal(
+        result["q.lora_B.weight"],
+        torch.cat([source_tensor[:4], source_tensor[8:12]], dim=0),
+    )
+    assert torch.equal(
+        result["k.lora_B.weight"],
+        torch.cat([source_tensor[4:6], source_tensor[12:14]], dim=0),
+    )
+    assert torch.equal(
+        result["v.lora_B.weight"],
+        torch.cat([source_tensor[6:8], source_tensor[14:16]], dim=0),
     )
