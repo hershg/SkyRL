@@ -292,6 +292,11 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
             )
         activate_staged_vllm_lora_model(self.model_runner, adapter_id)
         active = getattr(self, "_skyrl_lora_rdt_active", {})
+        previous = active.get(update_request.adapter_name)
+        if previous is not None:
+            retained = getattr(self, "_skyrl_lora_rdt_retained", {})
+            retained[previous[1]] = (update_request.adapter_name, previous)
+            self._skyrl_lora_rdt_retained = retained
         active[update_request.adapter_name] = staged_record
         self._skyrl_lora_rdt_active = active
         del staged[update_request.adapter_name]
@@ -302,7 +307,17 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
             activate_staged_vllm_lora_model,
         )
 
+        active = getattr(self, "_skyrl_lora_rdt_active", {})
+        retained = getattr(self, "_skyrl_lora_rdt_retained", {})
+        previous = retained.get(adapter_id)
+        if previous is None:
+            if not any(record[1] == adapter_id for record in active.values()):
+                raise ValueError(f"LoRA adapter id {adapter_id} has no retained generation")
         activate_staged_vllm_lora_model(self.model_runner, adapter_id)
+        if previous is not None:
+            adapter_name, record = previous
+            active[adapter_name] = record
+            del retained[adapter_id]
 
     def discard_lora_rdt_adapter(self, adapter_id: int) -> None:
         """Remove a failed staged adapter before generation resumes."""
@@ -315,6 +330,11 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
         for adapter_name, record in tuple(staged.items()):
             if record[1] == adapter_id:
                 del staged[adapter_name]
+        active = getattr(self, "_skyrl_lora_rdt_active", {})
+        for adapter_name, record in tuple(active.items()):
+            if record[1] == adapter_id:
+                del active[adapter_name]
+        getattr(self, "_skyrl_lora_rdt_retained", {}).pop(adapter_id, None)
 
     def remove_lora_rdt_adapter(self, adapter_id: int) -> None:
         """Release a drained retired adapter after its replacement is active."""

@@ -65,9 +65,7 @@ def test_worker_stages_then_activates_only_the_requested_generation(monkeypatch)
     )
     request = _request(2)
 
-    result = worker.stage_lora_rdt_adapter(
-        _rendezvous().to_json_dict(), request.to_json_dict(), 9, {"r": 2}
-    )
+    result = worker.stage_lora_rdt_adapter(_rendezvous().to_json_dict(), request.to_json_dict(), 9, {"r": 2})
 
     assert result == {"adapter_id": 9, "generation": 2}
     assert staged[0]["device"] == "cuda:0"
@@ -93,8 +91,66 @@ def test_worker_rejects_stale_or_unstaged_generation(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="stale"):
-        worker.stage_lora_rdt_adapter(
-            _rendezvous().to_json_dict(), _request(1).to_json_dict(), 10, {"r": 2}
-        )
+        worker.stage_lora_rdt_adapter(_rendezvous().to_json_dict(), _request(1).to_json_dict(), 10, {"r": 2})
     with pytest.raises(ValueError, match="not staged"):
         worker.activate_lora_rdt_adapter(_request(3).to_json_dict(), 10)
+
+
+def test_worker_rollback_restores_generation_and_allows_a_replacement(monkeypatch):
+    worker = _worker()
+    registered = set()
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.resolve_lora_rdt_producers",
+        lambda names, namespace: {0: "producer"},
+    )
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.pull_reconstruct_and_stage_lora_adapter",
+        lambda **kwargs: registered.add(kwargs["adapter_id"]),
+    )
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.activate_staged_vllm_lora_model",
+        lambda runner, adapter_id: None,
+    )
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.discard_staged_vllm_lora_model",
+        lambda runner, adapter_id: registered.discard(adapter_id),
+    )
+    for generation, adapter_id in ((1, 9), (2, 10)):
+        worker.stage_lora_rdt_adapter(
+            _rendezvous().to_json_dict(), _request(generation).to_json_dict(), adapter_id, {"r": 2}
+        )
+        worker.activate_lora_rdt_adapter(_request(generation).to_json_dict(), adapter_id)
+
+    worker.restore_lora_rdt_adapter(9)
+    worker.discard_lora_rdt_adapter(10)
+    worker.discard_lora_rdt_adapter(10)
+
+    assert worker._skyrl_lora_rdt_active == {"adapter": (1, 9)}
+    assert registered == {9}
+    assert worker._skyrl_lora_rdt_retained == {}
+    worker.stage_lora_rdt_adapter(_rendezvous().to_json_dict(), _request(2).to_json_dict(), 11, {"r": 2})
+    worker.activate_lora_rdt_adapter(_request(2).to_json_dict(), 11)
+    worker.remove_lora_rdt_adapter(9)
+
+    assert worker._skyrl_lora_rdt_active == {"adapter": (2, 11)}
+    assert worker._skyrl_lora_rdt_retained == {}
+    assert registered == {11}
+
+    worker.remove_lora_rdt_adapter(11)
+
+    assert worker._skyrl_lora_rdt_active == {}
+    assert registered == set()
+
+
+def test_worker_restoring_unknown_generation_does_not_touch_vllm(monkeypatch):
+    worker = _worker()
+
+    def unexpected_activation(runner, adapter_id):
+        raise AssertionError("an unknown generation must not activate")
+
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.activate_staged_vllm_lora_model",
+        unexpected_activation,
+    )
+    with pytest.raises(ValueError, match="no retained generation"):
+        worker.restore_lora_rdt_adapter(9)

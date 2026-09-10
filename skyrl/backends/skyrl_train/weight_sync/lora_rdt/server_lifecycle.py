@@ -43,15 +43,26 @@ class LoRardtServerLifecycle:
         self._validate_update(rendezvous, request, adapter_id)
         if request.adapter_name in self._staged:
             raise ValueError(f"LoRA adapter {request.adapter_name!r} already has a staged generation")
-        await engine.collective_rpc(
-            LORA_RDT_STAGE_METHOD,
-            kwargs={
-                "rendezvous": rendezvous.to_json_dict(),
-                "request": request.to_json_dict(),
-                "adapter_id": adapter_id,
-                "adapter_config": dict(adapter_config),
-            },
-        )
+        try:
+            await engine.collective_rpc(
+                LORA_RDT_STAGE_METHOD,
+                kwargs={
+                    "rendezvous": rendezvous.to_json_dict(),
+                    "request": request.to_json_dict(),
+                    "adapter_id": adapter_id,
+                    "adapter_config": dict(adapter_config),
+                },
+            )
+        except BaseException:
+            try:
+                await engine.collective_rpc(
+                    LORA_RDT_DISCARD_METHOD, kwargs={"adapter_id": adapter_id}
+                )
+            except BaseException as cleanup_error:
+                raise LoRardtRollbackError(
+                    f"lora_rdt could not discard partially staged adapter id {adapter_id}"
+                ) from cleanup_error
+            raise
         self._staged[request.adapter_name] = (
             request, adapter_id, self._active_ids.get(request.adapter_name)
         )
