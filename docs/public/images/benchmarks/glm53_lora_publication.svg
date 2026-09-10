@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">GLM-5.3 LoRA publication time improvement</title>
+  <desc id="desc">Baseline publication plus first sample averaged 439.59 seconds. Compact export averaged 132.03 seconds across three measured updates.</desc>
+  <rect width="1200" height="620" fill="#ffffff"/>
+  <text x="72" y="66" font-family="Arial, sans-serif" font-size="30" font-weight="700" fill="#162033">GLM-5.3 LoRA publication</text>
+  <text x="72" y="98" font-family="Arial, sans-serif" font-size="18" fill="#52616b">Two B300 nodes · 32K context · rank 32 · publication plus first sample</text>
+
+  <rect x="72" y="134" width="1056" height="222" rx="12" fill="#f7f9fb"/>
+  <text x="104" y="178" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#162033">Matched mean latency</text>
+  <text x="104" y="204" font-family="Arial, sans-serif" font-size="15" fill="#52616b">Lower is better</text>
+  <line x1="314" y1="232" x2="1060" y2="232" stroke="#d9e0e5" stroke-width="1"/>
+  <line x1="314" y1="286" x2="1060" y2="286" stroke="#d9e0e5" stroke-width="1"/>
+  <text x="104" y="260" font-family="Arial, sans-serif" font-size="17" fill="#25313a">Baseline</text>
+  <rect x="314" y="238" width="657" height="30" rx="6" fill="#a9b7c3"/>
+  <text x="990" y="261" font-family="Arial, sans-serif" font-size="17" font-weight="700" fill="#162033">439.59 s</text>
+  <text x="104" y="314" font-family="Arial, sans-serif" font-size="17" fill="#25313a">Compact export</text>
+  <rect x="314" y="292" width="197" height="30" rx="6" fill="#167d9a"/>
+  <text x="530" y="315" font-family="Arial, sans-serif" font-size="17" font-weight="700" fill="#162033">132.03 s</text>
+  <rect x="852" y="296" width="184" height="42" rx="21" fill="#dff3ea"/>
+  <text x="874" y="324" font-family="Arial, sans-serif" font-size="19" font-weight="700" fill="#087443">3.33× faster</text>
+
+  <text x="72" y="414" font-family="Arial, sans-serif" font-size="20" font-weight="700" fill="#162033">Three measured compact updates</text>
+  <text x="72" y="442" font-family="Arial, sans-serif" font-size="15" fill="#52616b">Publication plus first sample · mean 132.03 s · standard deviation 1.08 s</text>
+  <line x1="105" y1="550" x2="1096" y2="550" stroke="#d9e0e5" stroke-width="2"/>
+  <line x1="105" y1="487" x2="1096" y2="487" stroke="#edf1f4" stroke-width="1"/>
+  <text x="74" y="554" font-family="Arial, sans-serif" font-size="13" fill="#73808a">0</text>
+  <text x="64" y="491" font-family="Arial, sans-serif" font-size="13" fill="#73808a">140</text>
+  <rect x="258" y="491.1" width="144" height="58.9" rx="7" fill="#167d9a"/>
+  <rect x="526" y="490.5" width="144" height="59.5" rx="7" fill="#167d9a"/>
+  <rect x="794" y="490.0" width="144" height="60.0" rx="7" fill="#167d9a"/>
+  <text x="278" y="479" font-family="Arial, sans-serif" font-size="17" font-weight="700" fill="#162033">130.86 s</text>
+  <text x="546" y="479" font-family="Arial, sans-serif" font-size="17" font-weight="700" fill="#162033">132.27 s</text>
+  <text x="814" y="479" font-family="Arial, sans-serif" font-size="17" font-weight="700" fill="#162033">132.97 s</text>
+  <text x="285" y="578" font-family="Arial, sans-serif" font-size="16" fill="#25313a">Update 1</text>
+  <text x="553" y="578" font-family="Arial, sans-serif" font-size="16" fill="#25313a">Update 2</text>
+  <text x="821" y="578" font-family="Arial, sans-serif" font-size="16" fill="#25313a">Update 3</text>
+</svg>
