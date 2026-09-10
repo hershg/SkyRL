@@ -29,7 +29,7 @@ def build_vllm_lora_model(
     peft_helper = PEFTHelper.from_dict(dict(adapter_config))
     return LoRAModel.from_lora_tensors(
         adapter_id,
-        {name: tensor.to(device=device, dtype=dtype).clone() for name, tensor in source_tensors.items()},
+        {name: tensor.to(device=device, dtype=dtype) for name, tensor in source_tensors.items()},
         peft_helper,
         device=device,
         dtype=dtype,

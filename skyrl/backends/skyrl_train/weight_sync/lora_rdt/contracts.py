@@ -286,4 +286,4 @@ def materialize_bf16_adapter_tensor(source: torch.Tensor) -> torch.Tensor:
     """Create independent BF16 inference storage from one FP32 source tensor."""
     if source.dtype is not torch.float32:
         raise ValueError(f"lora_rdt requires float32 sources, got {source.dtype}")
-    return source.to(dtype=torch.bfloat16).clone()
+    return source.to(dtype=torch.bfloat16)
