@@ -6,6 +6,7 @@ from typing import Mapping
 
 import ray
 import torch
+from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from .bridge_sources import LoRABridgeSourceLayout
 from .contracts import LoRAAdapterLayout, LoRAUpdateRequest
@@ -74,6 +75,22 @@ class LoRardtProducer:
                 dict(tensors), set(), consumer_count
             )
             self._latest_generation = request.generation
+
+    def publish_cuda(
+        self,
+        request: LoRAUpdateRequest,
+        handles: Mapping[str, tuple],
+        consumer_count: int,
+    ) -> None:
+        """Rebuild trainer-local CUDA IPC handles before exposing tensors over NIXL."""
+        tensors = {}
+        for name, arguments in handles.items():
+            arguments = list(arguments)
+            # The sidecar sees the trainer's physical GPU as local device zero.
+            arguments[6] = torch.cuda.current_device()
+            tensors[name] = rebuild_cuda_tensor(*arguments)
+        # Consume IPC references even when a timeout has already discarded the generation.
+        self.publish(request, tensors, consumer_count)
 
     @ray.method(tensor_transport="nixl")
     def pull(self, generation: int, names: list[str]) -> dict[str, torch.Tensor]:

@@ -1762,6 +1762,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
             RemoteInferenceClient,
         )
+        from skyrl.backends.skyrl_train.weight_sync.lora_layout import convert_moe_expert_lora_key
         from skyrl.backends.skyrl_train.weight_sync.lora_rdt.bridge_sources import (
             LoRABridgeSourceLayout,
             extract_lora_bridge_sources,
@@ -1811,9 +1812,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 if key in os.environ
             }
             gpu_ids = ray.get_gpu_ids()
-            if gpu_ids:
-                env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
-                env_vars["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[0])
+            if not gpu_ids:
+                raise RuntimeError("LoRA RDT producer requires a GPU assigned to its trainer rank")
+            env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+            env_vars["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[0])
             producer = ray.remote(LoRardtProducer).options(
                 name=actor_name,
                 namespace=namespace,
@@ -1843,7 +1845,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             target_modules = sorted(
                 set(
                     infer_target_modules_from_adapter_weights(
-                        f"base_model.model.{name}"
+                        convert_moe_expert_lora_key(f"base_model.model.{name}", len(source.shape))
                         for source in publication.layout.sources
                         for name in source.hf_param_names
                     )

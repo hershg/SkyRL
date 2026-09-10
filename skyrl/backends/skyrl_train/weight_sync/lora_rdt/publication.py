@@ -8,6 +8,7 @@ from typing import Any
 
 import ray
 import torch
+from torch.multiprocessing.reductions import reduce_tensor
 
 from .bridge_sources import (
     LoRABridgeSource,
@@ -120,10 +121,11 @@ def publish_lora_sources(
     """Require every trainer rank to retain its sources before receivers start."""
     error = None
     try:
+        handles = export_lora_cuda_ipc(publication.local_tensors)
         ray.get(
-            producer.publish.remote(
+            producer.publish_cuda.remote(
                 publication.request,
-                publication.local_tensors,
+                handles,
                 publication.rendezvous.consumer_count,
             ),
             timeout=timeout_seconds,
@@ -154,3 +156,13 @@ def publish_lora_sources(
         if result is not None
     )
     raise RuntimeError("LoRA RDT sources not ready: " + "; ".join(failures))
+
+
+def export_lora_cuda_ipc(tensors: dict[str, torch.Tensor]) -> dict[str, tuple]:
+    """Share retained trainer snapshots with a sidecar on the same physical GPU."""
+    for name, tensor in tensors.items():
+        if not tensor.is_cuda or tensor.dtype is not torch.float32:
+            raise ValueError(f"LoRA IPC source {name!r} must be a CUDA float32 tensor")
+    for device in {tensor.device for tensor in tensors.values()}:
+        torch.cuda.current_stream(device).synchronize()
+    return {name: reduce_tensor(tensor.detach())[1] for name, tensor in tensors.items()}

@@ -24,13 +24,16 @@ def published_rank(monkeypatch):
     request = LoRAUpdateRequest.from_layout(layout, 4)
     producer = LoRardtProducer(0, layout)
     actor = SimpleNamespace(
-        publish=SimpleNamespace(remote=producer.publish),
+        publish_cuda=SimpleNamespace(remote=producer.publish),
         discard=SimpleNamespace(remote=producer.discard),
     )
     publication = SimpleNamespace(
         request=request,
         local_tensors={"a": torch.tensor([1.0, 2.0])},
         rendezvous=SimpleNamespace(consumer_count=1),
+    )
+    monkeypatch.setattr(
+        publication_module, "export_lora_cuda_ipc", lambda tensors: tensors
     )
     monkeypatch.setattr(publication_module.ray, "get", lambda result, timeout: result)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
