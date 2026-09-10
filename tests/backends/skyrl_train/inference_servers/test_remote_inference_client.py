@@ -93,11 +93,7 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
         n_prompts = len(prompts) if isinstance(prompts, list) else 1
         return {
             "choices": [
-                {
-                    "index": i,
-                    "text": f"Response {i} from server {server_id}",
-                    "finish_reason": "stop",
-                }
+                {"index": i, "text": f"Response {i} from server {server_id}", "finish_reason": "stop"}
                 for i in range(n_prompts)
             ],
             "model": body.get("model"),
@@ -239,12 +235,7 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
     # Control plane endpoints
     @app.post("/pause")
     async def pause(request: Request, mode: str = "abort", clear_cache: str = "true"):
-        return {
-            "status": "paused",
-            "server_id": server_id,
-            "mode": mode,
-            "clear_cache": clear_cache,
-        }
+        return {"status": "paused", "server_id": server_id, "mode": mode, "clear_cache": clear_cache}
 
     @app.post("/resume")
     async def resume():
@@ -257,12 +248,7 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
 
     @app.post("/sleep")
     async def sleep(level: int = 2, tags: Optional[List[str]] = Query(None)):
-        return {
-            "status": "sleeping",
-            "server_id": server_id,
-            "level": level,
-            "tags": tags,
-        }
+        return {"status": "sleeping", "server_id": server_id, "level": level, "tags": tags}
 
     @app.post("/wake_up")
     async def wake_up(tags: Optional[List[str]] = Query(None)):
@@ -270,11 +256,7 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
 
     @app.post("/reset_prefix_cache")
     async def reset_prefix_cache(request: Request):
-        return {
-            "status": "cache_reset",
-            "server_id": server_id,
-            "body": await request.json(),
-        }
+        return {"status": "cache_reset", "server_id": server_id, "body": await request.json()}
 
     @app.post("/init_weight_transfer_engine")
     async def init_weight_transfer_engine(request: Request):
@@ -303,16 +285,10 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
         if lora_name is None or lora_path is None:
             return JSONResponse(
                 status_code=400,
-                content={
-                    "object": "error",
-                    "message": "missing lora_name/lora_path",
-                    "type": "BadRequest",
-                },
+                content={"object": "error", "message": "missing lora_name/lora_path", "type": "BadRequest"},
             )
         app.state.lora_registry[lora_name] = lora_path
-        return PlainTextResponse(
-            f"Success: LoRA adapter '{lora_name}' added successfully on server {server_id}."
-        )
+        return PlainTextResponse(f"Success: LoRA adapter '{lora_name}' added successfully on server {server_id}.")
 
     @app.post("/v1/unload_lora_adapter")
     async def unload_lora_adapter(request: Request):
@@ -328,17 +304,13 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
                 },
             )
         del app.state.lora_registry[lora_name]
-        return PlainTextResponse(
-            f"Success: LoRA adapter '{lora_name}' removed successfully on server {server_id}."
-        )
+        return PlainTextResponse(f"Success: LoRA adapter '{lora_name}' removed successfully on server {server_id}.")
 
     return app
 
 
 @pytest.mark.asyncio
-async def test_build_new_inference_client_uses_served_model_name_for_chat_requests(
-    mock_servers,
-):
+async def test_build_new_inference_client_uses_served_model_name_for_chat_requests(mock_servers):
     cfg = SkyRLTrainConfig()
     cfg.trainer.policy.model.path = "Qwen/Qwen2.5-1.5B-Instruct"
     cfg.generator.inference_engine.served_model_name = "served-alias"
@@ -519,9 +491,7 @@ class TestDataPlane:
 
         assert len(result["rollout_expert_indices"]) == 1
         assert result["rollout_expert_indices"][0].dtype == np.uint8
-        assert np.array_equal(
-            result["rollout_expert_indices"][0], np.arange(12).reshape(3, 2, 2)
-        )
+        assert np.array_equal(result["rollout_expert_indices"][0], np.arange(12).reshape(3, 2, 2))
 
     @pytest.mark.asyncio
     async def test_generate_rejects_list_routed_experts(self, monkeypatch):
@@ -688,12 +658,7 @@ class TestWeightSync:
     @pytest.mark.asyncio
     async def test_init_weight_update_communicator(self, client):
         """Test init_weight_update_communicator expands init_info via to_api_payload and fans out."""
-        api_payload = {
-            "master_address": "127.0.0.1",
-            "master_port": 29500,
-            "rank_offset": 1,
-            "world_size": 5,
-        }
+        api_payload = {"master_address": "127.0.0.1", "master_port": 29500, "rank_offset": 1, "world_size": 5}
 
         class MockInitInfo:
             """Lightweight mock satisfying the for_servers / to_api_payload protocol."""
@@ -748,9 +713,7 @@ class TestServerInfo:
         """world_size sums across servers and is cached after the first call."""
 
         async def _total_server_calls():
-            counts = await client._call_all_servers(
-                "/test/world_size_calls", {}, method="GET"
-            )
+            counts = await client._call_all_servers("/test/world_size_calls", {}, method="GET")
             return sum(response["body"]["count"] for response in counts.values())
 
         before = await _total_server_calls()
@@ -1045,9 +1008,7 @@ class TestMultiModalGeneration:
         assert result["stop_reasons"][0] == "stop"
 
         async with httpx.AsyncClient() as http:
-            resp = await http.get(
-                f"{mock_servers['proxy_url']}/test/last_generate_features"
-            )
+            resp = await http.get(f"{mock_servers['proxy_url']}/test/last_generate_features")
             captured = resp.json()
         assert captured["features"] == mm_features
 
@@ -1380,9 +1341,7 @@ class TestExplicitModelRequired:
             await client.teardown()
 
     @pytest.mark.asyncio
-    async def test_render_chat_completion_defaults_to_base_when_no_lora(
-        self, mock_servers
-    ):
+    async def test_render_chat_completion_defaults_to_base_when_no_lora(self, mock_servers):
         client = RemoteInferenceClient(
             proxy_url=mock_servers["proxy_url"],
             server_urls=mock_servers["server_urls"],
@@ -1390,9 +1349,7 @@ class TestExplicitModelRequired:
             data_parallel_size=1,
         )
         try:
-            request_payload = {
-                "json": {"messages": [{"role": "user", "content": "hi"}]}
-            }
+            request_payload = {"json": {"messages": [{"role": "user", "content": "hi"}]}}
             result = await client.render_chat_completion(request_payload)
             assert result["model"] == "base-model"
             captured = await _get_last_models(mock_servers["server_urls"])
@@ -1401,9 +1358,7 @@ class TestExplicitModelRequired:
             await client.teardown()
 
     @pytest.mark.asyncio
-    async def test_render_chat_completion_raises_when_lora_and_no_model(
-        self, mock_servers
-    ):
+    async def test_render_chat_completion_raises_when_lora_and_no_model(self, mock_servers):
         client = RemoteInferenceClient(
             proxy_url=mock_servers["proxy_url"],
             server_urls=mock_servers["server_urls"],
@@ -1412,9 +1367,7 @@ class TestExplicitModelRequired:
             data_parallel_size=1,
         )
         try:
-            request_payload = {
-                "json": {"messages": [{"role": "user", "content": "hi"}]}
-            }
+            request_payload = {"json": {"messages": [{"role": "user", "content": "hi"}]}}
             with pytest.raises(ValueError, match="LoRA is enabled"):
                 await client.render_chat_completion(request_payload)
         finally:
@@ -1501,23 +1454,17 @@ class TestFinishSession:
         await client.finish_session("traj-finish-1")
         await client.finish_session("traj-finish-2")
 
-        finished = httpx.get(
-            f"{mock_servers['proxy_url']}/test/finished", timeout=2.0
-        ).json()["finished"]
+        finished = httpx.get(f"{mock_servers['proxy_url']}/test/finished", timeout=2.0).json()["finished"]
         assert "traj-finish-1" in finished
         assert "traj-finish-2" in finished
 
     @pytest.mark.asyncio
     async def test_empty_session_id_is_noop(self, client, mock_servers):
         """Empty or None session ids are not sent to the router."""
-        before = httpx.get(
-            f"{mock_servers['proxy_url']}/test/finished", timeout=2.0
-        ).json()["finished"]
+        before = httpx.get(f"{mock_servers['proxy_url']}/test/finished", timeout=2.0).json()["finished"]
         await client.finish_session("")
         await client.finish_session(None)
-        after = httpx.get(
-            f"{mock_servers['proxy_url']}/test/finished", timeout=2.0
-        ).json()["finished"]
+        after = httpx.get(f"{mock_servers['proxy_url']}/test/finished", timeout=2.0).json()["finished"]
         assert before == after
 
     @pytest.mark.asyncio

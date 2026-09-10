@@ -244,9 +244,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
     def __post_init__(self):
         if self.data_parallel_size <= 0:
-            raise ValueError(
-                f"Expected `data_parallel_size` >0, got {self.data_parallel_size}"
-            )
+            raise ValueError(f"Expected `data_parallel_size` >0, got {self.data_parallel_size}")
 
         if len(self.server_urls) % self.data_parallel_size != 0:
             raise ValueError(
@@ -261,9 +259,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
     # Session Management
     # ---------------------------
 
-    def _get_semaphores(
-        self,
-    ) -> Tuple[Optional[asyncio.Semaphore], Optional[asyncio.Semaphore]]:
+    def _get_semaphores(self) -> Tuple[Optional[asyncio.Semaphore], Optional[asyncio.Semaphore]]:
         """Get or create the shared generate/detokenize semaphores for this client.
 
         Semaphores are event-loop-bound (Python 3.10+). If the running loop has
@@ -276,12 +272,8 @@ class RemoteInferenceClient(InferenceEngineInterface):
         current_loop = asyncio.get_running_loop()
         if self._sem_loop is not current_loop:
             if SKYRL_GENERATE_CONCURRENCY_PER_ENGINE > 0:
-                concurrency = SKYRL_GENERATE_CONCURRENCY_PER_ENGINE * len(
-                    self.server_urls
-                )
-                logger.info(
-                    f"Capping concurrency for generation to a maximum of {concurrency} requests"
-                )
+                concurrency = SKYRL_GENERATE_CONCURRENCY_PER_ENGINE * len(self.server_urls)
+                logger.info(f"Capping concurrency for generation to a maximum of {concurrency} requests")
                 self._gen_sem = asyncio.Semaphore(concurrency)
                 self._detok_sem = asyncio.Semaphore(concurrency)
             else:
@@ -296,11 +288,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         # Note that we also create a new session object if the event loop has changed, since
         # aiohttp.ClientSession is tied to the event loop.
         current_loop = asyncio.get_running_loop()
-        if (
-            self._session is not None
-            and not self._session.closed
-            and self._session.loop != current_loop
-        ):
+        if self._session is not None and not self._session.closed and self._session.loop != current_loop:
             # Event loop changed - the old session is unusable (bound to a dead loop).
             self._session = None
         if self._session is None or self._session.closed:
@@ -311,14 +299,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 limit=SKYRL_HTTP_CONNECTION_LIMIT,
                 keepalive_timeout=2,
             )
-            self._session = aiohttp.ClientSession(
-                connector=connector, timeout=aiohttp.ClientTimeout(total=None)
-            )
+            self._session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=None))
         return self._session
 
-    async def _post(
-        self, url: str, json: Dict[str, Any], headers: Optional[Dict[str, str]] = None
-    ) -> Any:
+    async def _post(self, url: str, json: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> Any:
         """POST with retry + backoff on transient connection errors.
 
         Between generate bursts the pool's keep-alive connections go stale
@@ -347,18 +331,14 @@ class RemoteInferenceClient(InferenceEngineInterface):
                                 headers=resp.headers,
                             )
                         last_exc = e
-                        logger.debug(
-                            f"retry {attempt + 1}/{_DATA_PLANE_RETRIES} for {url=}: {e}"
-                        )
+                        logger.debug(f"retry {attempt + 1}/{_DATA_PLANE_RETRIES} for {url=}: {e}")
                         await asyncio.sleep(1)
                         continue
                     raise_for_status(resp, body)
                     return body
             except (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as e:
                 last_exc = e
-                logger.debug(
-                    f"POST retry {attempt + 1}/{_DATA_PLANE_RETRIES} for {url=}: {e}"
-                )
+                logger.debug(f"POST retry {attempt + 1}/{_DATA_PLANE_RETRIES} for {url=}: {e}")
                 await asyncio.sleep(1)
                 continue
         raise last_exc  # type: ignore[misc]
@@ -417,15 +397,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
         prompt_token_ids = input_batch.get("prompt_token_ids")
         if prompt_token_ids is None:
-            raise ValueError(
-                "RemoteInferenceClient only accepts `prompt_token_ids`, not `prompts`."
-            )
+            raise ValueError("RemoteInferenceClient only accepts `prompt_token_ids`, not `prompts`.")
 
         sampling_params = input_batch.get("sampling_params") or {}
         if sampling_params.get("n", 1) > 1:
-            raise ValueError(
-                "n > 1 is not supported. Use `config.generator.n_samples_per_prompt` instead."
-            )
+            raise ValueError("n > 1 is not supported. Use `config.generator.n_samples_per_prompt` instead.")
 
         session_ids = input_batch.get("session_ids")
         mm_features = input_batch.get("mm_features")
@@ -451,12 +427,8 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 return await self._generate_single(
                     prompt_token_ids=prompt_token_ids[idx],
                     sampling_params=sampling_params,
-                    session_id=session_ids[idx]
-                    if session_ids and idx < len(session_ids)
-                    else None,
-                    mm_features=mm_features[idx]
-                    if mm_features and idx < len(mm_features)
-                    else None,
+                    session_id=session_ids[idx] if session_ids and idx < len(session_ids) else None,
+                    mm_features=mm_features[idx] if mm_features and idx < len(mm_features) else None,
                     model=model,
                     cache_salt=cache_salt,
                 )
@@ -464,12 +436,8 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 return await self._generate_single(
                     prompt_token_ids=prompt_token_ids[idx],
                     sampling_params=sampling_params,
-                    session_id=session_ids[idx]
-                    if session_ids and idx < len(session_ids)
-                    else None,
-                    mm_features=mm_features[idx]
-                    if mm_features and idx < len(mm_features)
-                    else None,
+                    session_id=session_ids[idx] if session_ids and idx < len(session_ids) else None,
+                    mm_features=mm_features[idx] if mm_features and idx < len(mm_features) else None,
                     model=model,
                     cache_salt=cache_salt,
                 )
@@ -480,26 +448,18 @@ class RemoteInferenceClient(InferenceEngineInterface):
             async with detok_sem:
                 return (await self.detokenize([token_ids]))[0]
 
-        raw_results = await asyncio.gather(
-            *[_throttled_generate(idx) for idx in range(batch_size)]
-        )
-        responses = await asyncio.gather(
-            *[_throttled_detokenize(r["response_ids"]) for r in raw_results]
-        )
+        raw_results = await asyncio.gather(*[_throttled_generate(idx) for idx in range(batch_size)])
+        responses = await asyncio.gather(*[_throttled_detokenize(r["response_ids"]) for r in raw_results])
 
         rollout_expert_indices = (
-            [result["routed_experts"] for result in raw_results]
-            if self.enable_return_routed_experts
-            else None
+            [result["routed_experts"] for result in raw_results] if self.enable_return_routed_experts else None
         )
 
         return InferenceEngineOutput(
             responses=responses,
             stop_reasons=[r["stop_reason"] for r in raw_results],
             response_ids=[r["response_ids"] for r in raw_results],
-            response_logprobs=[r["response_logprobs"] for r in raw_results]
-            if get_logprobs
-            else None,
+            response_logprobs=[r["response_logprobs"] for r in raw_results] if get_logprobs else None,
             rollout_expert_indices=rollout_expert_indices,
         )
 
@@ -555,9 +515,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         if logprobs is not None:
             logprobs_content = logprobs.get("content", [])
             if logprobs_content:
-                response_logprobs = [
-                    logprob_info["logprob"] for logprob_info in logprobs_content
-                ]
+                response_logprobs = [logprob_info["logprob"] for logprob_info in logprobs_content]
 
         routed_experts = None
         if self.enable_return_routed_experts:
@@ -592,9 +550,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         chunks = prompt.get("chunks", [])
 
         # No images → flatten text tokens directly.
-        image_chunks = [
-            c for c in chunks if c.get("type") in ("image", "image_asset_pointer")
-        ]
+        image_chunks = [c for c in chunks if c.get("type") in ("image", "image_asset_pointer")]
         if not image_chunks:
             token_ids = [tok for c in chunks for tok in c.get("tokens", [])]
             return token_ids, None
@@ -648,9 +604,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 final_token_ids.extend(c.get("tokens", []))
             elif ctype in ("image", "image_asset_pointer"):
                 ph_tokens = placeholder_token_slices[img_idx]
-                new_placeholders.append(
-                    {"offset": len(final_token_ids), "length": len(ph_tokens)}
-                )
+                new_placeholders.append({"offset": len(final_token_ids), "length": len(ph_tokens)})
                 final_token_ids.extend(ph_tokens)
                 img_idx += 1
 
@@ -692,23 +646,17 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
         # Note: Tinker SampleRequest uses "prompt_logprobs" (bool), while
         # SamplingClient.sample() uses "include_prompt_logprobs".
-        include_prompt_logprobs = body.get(
-            "include_prompt_logprobs", body.get("prompt_logprobs", False)
-        )
+        include_prompt_logprobs = body.get("include_prompt_logprobs", body.get("prompt_logprobs", False))
         topk_prompt_logprobs_k = body.get("topk_prompt_logprobs", 0)
 
         # vLLM prompt logprob mapping
         prompt_logprobs_sp = None
         if include_prompt_logprobs:
-            prompt_logprobs_sp = (
-                topk_prompt_logprobs_k if topk_prompt_logprobs_k > 0 else 0
-            )
+            prompt_logprobs_sp = topk_prompt_logprobs_k if topk_prompt_logprobs_k > 0 else 0
 
         # Render prompt: flatten text tokens and, if images are present,
         # call the render endpoint to get placeholder tokens + features.
-        token_ids, mm_features = await self._render_for_sample(
-            prompt, session_id, model=model
-        )
+        token_ids, mm_features = await self._render_for_sample(prompt, session_id, model=model)
 
         # Map Tinker SamplingParams → vLLM format
         sampling_params: Dict[str, Any] = {
@@ -745,17 +693,13 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
         # vLLM returns: list[dict[str(token_id) → {"logprob": float, ...}] | None]
         result_prompt_logprobs: Optional[List[Optional[float]]] = None
-        result_topk_prompt_logprobs: Optional[
-            List[Optional[List[Tuple[int, float]]]]
-        ] = None
+        result_topk_prompt_logprobs: Optional[List[Optional[List[Tuple[int, float]]]]] = None
 
         if include_prompt_logprobs:
-            result_prompt_logprobs, result_topk_prompt_logprobs = (
-                convert_vllm_prompt_logprobs(
-                    token_ids,
-                    response.get("prompt_logprobs"),
-                    topk=topk_prompt_logprobs_k,
-                )
+            result_prompt_logprobs, result_topk_prompt_logprobs = convert_vllm_prompt_logprobs(
+                token_ids,
+                response.get("prompt_logprobs"),
+                topk=topk_prompt_logprobs_k,
             )
 
         # Transform response choices → sequences
@@ -898,9 +842,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
             List of token ID lists.
         """
         if self.tokenizer is not None:
-            return self.tokenizer(texts, add_special_tokens=add_special_tokens)[
-                "input_ids"
-            ]
+            return self.tokenizer(texts, add_special_tokens=add_special_tokens)["input_ids"]
 
         url = f"{self.proxy_url}/tokenize"
 
@@ -978,13 +920,9 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 # Drain the body so the keep-alive connection can be reused.
                 await resp.read()
                 if resp.status >= 400:
-                    logger.warning(
-                        f"finish_session for session_id={session_id!r} returned HTTP {resp.status}"
-                    )
+                    logger.warning(f"finish_session for session_id={session_id!r} returned HTTP {resp.status}")
         except asyncio.TimeoutError:
-            logger.warning(
-                f"finish_session for session_id={session_id!r} timed out after 10s (router unresponsive)"
-            )
+            logger.warning(f"finish_session for session_id={session_id!r} timed out after 10s (router unresponsive)")
         except Exception as e:
             logger.warning(f"finish_session for session_id={session_id!r} failed: {e}")
 
@@ -1040,16 +978,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
             Dict mapping server_url to response.
         """
         results = await asyncio.gather(
-            *[
-                self._call_server(url, endpoint, json, method, params)
-                for url in self.server_urls
-            ]
+            *[self._call_server(url, endpoint, json, method, params) for url in self.server_urls]
         )
         return {url: resp for url, resp in results}
 
-    async def pause(
-        self, mode: Union[PauseMode, str] = PauseMode.KEEP, clear_cache: bool = False
-    ) -> Dict[str, Any]:
+    async def pause(self, mode: Union[PauseMode, str] = PauseMode.KEEP, clear_cache: bool = False) -> Dict[str, Any]:
         """
         Pause generation on all backends.
 
@@ -1071,10 +1004,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         if isinstance(mode, str):
             mode = PauseMode(mode.lower())
 
-        params: Dict[str, Any] = {
-            "mode": mode.value,
-            "clear_cache": str(clear_cache).lower(),
-        }
+        params: Dict[str, Any] = {"mode": mode.value, "clear_cache": str(clear_cache).lower()}
 
         return await self._call_all_servers("/pause", params=params)
 
@@ -1090,9 +1020,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """Resume after pause."""
         return await self.resume()
 
-    async def sleep(
-        self, level: int = 2, tags: Optional[List[str]] = None
-    ) -> Dict[str, Any]:
+    async def sleep(self, level: int = 2, tags: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Put all backends to sleep (offload weights to CPU).
 
@@ -1141,10 +1069,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """
         return await self._call_all_servers(
             "/collective_rpc",
-            {
-                "method": "skyrl_sleep_for_weight_sync",
-                "kwargs": {"offload_kv": offload_kv},
-            },
+            {"method": "skyrl_sleep_for_weight_sync", "kwargs": {"offload_kv": offload_kv}},
         )
 
     async def wake_for_weight_sync(self, tags: List[str]) -> Dict[str, Any]:
@@ -1171,9 +1096,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         Returns:
             Dict mapping server_url to response.
         """
-        return await self._call_all_servers(
-            "/reset_prefix_cache", {"reset_running_requests": reset_running_requests}
-        )
+        return await self._call_all_servers("/reset_prefix_cache", {"reset_running_requests": reset_running_requests})
 
     # ---------------------------
     # Weight Sync (control plane - fan-out)
@@ -1198,9 +1121,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """
         _, world_size_per_server = await self.get_world_size()
         num_servers = len(self.server_urls)
-        server_infos = init_info.for_servers(
-            world_size_per_server, num_servers, dp_size=self.data_parallel_size
-        )
+        server_infos = init_info.for_servers(world_size_per_server, num_servers, dp_size=self.data_parallel_size)
         payloads = [{"init_info": x.to_api_payload()} for x in server_infos]
         results = await asyncio.gather(
             *[
@@ -1413,9 +1334,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
                     raise_for_status(resp, body)
                 return server_url, {"status": resp.status, "body": await resp.text()}
 
-        results = await asyncio.gather(
-            *[_load_on_server(url) for url in self.server_urls]
-        )
+        results = await asyncio.gather(*[_load_on_server(url) for url in self.server_urls])
 
         logger.info(f"Loaded LoRA adapter '{lora_name}' from {lora_path}")
 
@@ -1449,9 +1368,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
                     raise_for_status(resp, body)
                 return server_url, {"status": resp.status, "body": await resp.text()}
 
-        results = await asyncio.gather(
-            *[_unload_on_server(url) for url in self.server_urls]
-        )
+        results = await asyncio.gather(*[_unload_on_server(url) for url in self.server_urls])
 
         logger.info(f"Unloaded LoRA adapter '{lora_name}'")
 
@@ -1493,9 +1410,9 @@ class RemoteInferenceClient(InferenceEngineInterface):
                 raise RuntimeError(f"Missing world_size in response from {server_url}")
             per_server.append(world_size)
 
-        assert all(ws == per_server[0] for ws in per_server), (
-            f"All servers must have the same world_size, got {per_server}"
-        )
+        assert all(
+            ws == per_server[0] for ws in per_server
+        ), f"All servers must have the same world_size, got {per_server}"
 
         # Each server is one DP rank. vLLM reports world_size = dp_size * tp_size * pp_size,
         # which is the worker count across ALL DP ranks in one deployment.
@@ -1549,9 +1466,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
             try:
                 await self._session.close()
             except Exception as e:
-                logger.warning(
-                    f"Encountered exception {e} while closing client session"
-                )
+                logger.warning(f"Encountered exception {e} while closing client session")
                 pass
             self._session = None
 
@@ -1565,11 +1480,7 @@ def raise_for_status(resp: aiohttp.ClientResponse, body: Optional[Any] = None) -
     """
     if resp.status >= 400 and body is not None:
         error_detail = body.get("error", {})
-        detail_msg = (
-            error_detail.get("message", resp.reason)
-            if isinstance(error_detail, dict)
-            else resp.reason
-        )
+        detail_msg = error_detail.get("message", resp.reason) if isinstance(error_detail, dict) else resp.reason
         raise aiohttp.ClientResponseError(
             resp.request_info,
             resp.history,

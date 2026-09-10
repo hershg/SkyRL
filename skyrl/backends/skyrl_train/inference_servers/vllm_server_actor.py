@@ -208,24 +208,21 @@ class VLLMServerActor(ServerActorProtocol):
                         f"got {type(kv_config).__name__}: {e}"
                     ) from e
                 self._cli_args.kv_transfer_config = kv_config
-            p2p_connector = (
-                get_pd_p2p_connector_name(kv_config) if kv_config else "NixlConnector"
-            )
+            p2p_connector = get_pd_p2p_connector_name(kv_config) if kv_config else "NixlConnector"
 
             if p2p_connector == "MooncakeConnector":
                 # Each external-LB instance launches its own bootstrap HTTP
                 # server bound at exactly VLLM_MOONCAKE_BOOTSTRAP_PORT
                 # The router is given the same port per prefill server
                 # via server info returned by `.start`
-                (
-                    self._mooncake_bootstrap_server_port,
-                    self._mooncake_port_reservation,
-                ) = find_and_reserve_port(mooncake_bootstrap_base_port)
+                self._mooncake_bootstrap_server_port, self._mooncake_port_reservation = find_and_reserve_port(
+                    mooncake_bootstrap_base_port
+                )
                 self._setup_mooncake_port(self._mooncake_bootstrap_server_port)
             else:
                 # use nixl_side_channel_base to start searching for a free port for this server
-                self._nixl_side_channel_base, self._nixl_port_reservation = (
-                    find_and_reserve_port(nixl_side_channel_base)
+                self._nixl_side_channel_base, self._nixl_port_reservation = find_and_reserve_port(
+                    nixl_side_channel_base
                 )
                 self._setup_nixl_side_channel(self._nixl_side_channel_base)
 
@@ -254,16 +251,14 @@ class VLLMServerActor(ServerActorProtocol):
         if self._use_mp_backend:
             self._setup_mp_gpu_visibility(mp_cuda_visible_devices)
         else:
-            os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(
-                0.2 if colocated_training else 1.0
-            )
+            os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(0.2 if colocated_training else 1.0)
             # Set bundle indices for this server's TP/PP workers in the placement group.
             # NOTE: This assumes single-GPU-per-bundle placement groups.
             if bundle_indices is None:
                 bundle_indices = list(range(self._num_gpus_per_server))
-            assert len(bundle_indices) == self._num_gpus_per_server, (
-                f"Expected {self._num_gpus_per_server} bundle indices (one per GPU), got {len(bundle_indices)}"
-            )
+            assert (
+                len(bundle_indices) == self._num_gpus_per_server
+            ), f"Expected {self._num_gpus_per_server} bundle indices (one per GPU), got {len(bundle_indices)}"
             os.environ["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, bundle_indices))
             logger.info(f"Server {server_idx}: using bundle indices {bundle_indices}")
 
@@ -281,17 +276,13 @@ class VLLMServerActor(ServerActorProtocol):
             os.environ["CUDA_VISIBLE_DEVICES"] = mp_cuda_visible_devices
             os.environ.pop("ROCR_VISIBLE_DEVICES", None)
             os.environ.pop("HIP_VISIBLE_DEVICES", None)
-            logger.info(
-                f"Server {self._server_idx}: mp backend, "
-                f"CUDA_VISIBLE_DEVICES={mp_cuda_visible_devices}"
-            )
+            logger.info(f"Server {self._server_idx}: mp backend, " f"CUDA_VISIBLE_DEVICES={mp_cuda_visible_devices}")
         else:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             os.environ.pop("ROCR_VISIBLE_DEVICES", None)
             os.environ.pop("HIP_VISIBLE_DEVICES", None)
             logger.info(
-                f"Server {self._server_idx}: mp backend, "
-                f"cleared CUDA_VISIBLE_DEVICES (single-GPU or auto-detect)"
+                f"Server {self._server_idx}: mp backend, " f"cleared CUDA_VISIBLE_DEVICES (single-GPU or auto-detect)"
             )
 
     def _setup_nixl_side_channel(self, side_channel_port: int) -> None:
@@ -306,10 +297,7 @@ class VLLMServerActor(ServerActorProtocol):
 
         engine_id = f"server-{self._server_idx}-{self._ip}-{side_channel_port}"
 
-        if (
-            hasattr(self._cli_args, "kv_transfer_config")
-            and self._cli_args.kv_transfer_config
-        ):
+        if hasattr(self._cli_args, "kv_transfer_config") and self._cli_args.kv_transfer_config:
             kv_config = self._cli_args.kv_transfer_config
             kv_config["engine_id"] = engine_id
             self._cli_args.kv_transfer_config = kv_config
@@ -324,10 +312,7 @@ class VLLMServerActor(ServerActorProtocol):
         os.environ["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = str(mooncake_server_port)
         engine_id = f"server-{self._server_idx}-{self._ip}-{mooncake_server_port}"
 
-        if (
-            hasattr(self._cli_args, "kv_transfer_config")
-            and self._cli_args.kv_transfer_config
-        ):
+        if hasattr(self._cli_args, "kv_transfer_config") and self._cli_args.kv_transfer_config:
             kv_config = self._cli_args.kv_transfer_config
             kv_config["engine_id"] = engine_id
             self._cli_args.kv_transfer_config = kv_config
@@ -364,9 +349,7 @@ class VLLMServerActor(ServerActorProtocol):
 
         return self.get_server_info()
 
-    async def _wait_until_healthy(
-        self, timeout: float = SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S
-    ) -> None:
+    async def _wait_until_healthy(self, timeout: float = SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S) -> None:
         """Poll the /health endpoint until it responds OK."""
         url = f"http://{self._ip}:{self._port}/health"
         start_time = time.time()
@@ -389,9 +372,7 @@ class VLLMServerActor(ServerActorProtocol):
                     pass
 
                 if time.time() - start_time > timeout:
-                    raise TimeoutError(
-                        f"Server failed to become healthy within {timeout}s"
-                    )
+                    raise TimeoutError(f"Server failed to become healthy within {timeout}s")
 
                 await asyncio.sleep(1.0)
 
@@ -435,9 +416,7 @@ class VLLMServerActor(ServerActorProtocol):
             except Exception:
                 data = {}
             reset_running_requests = data.get("reset_running_requests", False)
-            await engine.reset_prefix_cache(
-                reset_running_requests=reset_running_requests
-            )
+            await engine.reset_prefix_cache(reset_running_requests=reset_running_requests)
             return {"status": "ok"}
 
         @app.post("/fetch_weights")
@@ -446,9 +425,7 @@ class VLLMServerActor(ServerActorProtocol):
             body = await request.json()
             target_version = body.get("target_version")
             if target_version is None:
-                raise HTTPException(
-                    status_code=400, detail="'target_version' is required"
-                )
+                raise HTTPException(status_code=400, detail="'target_version' is required")
 
             kwargs = {"target_version": int(target_version)}
             if body.get("sync_dir") is not None:
@@ -561,9 +538,7 @@ class VLLMServerActor(ServerActorProtocol):
         async def _skyrl_generate(request: Request):
             """SkyRL generate endpoint that returns routed_experts alongside token output."""
             if getattr(cli_args, "enable_lora", False):
-                raise HTTPException(
-                    status_code=400, detail="/skyrl/v1/generate does not support LoRA."
-                )
+                raise HTTPException(status_code=400, detail="/skyrl/v1/generate does not support LoRA.")
 
             body = await request.json()
             token_ids = body["token_ids"]
@@ -579,9 +554,7 @@ class VLLMServerActor(ServerActorProtocol):
             request_id = random_uuid()
 
             final_res = None
-            async for res in engine.generate(
-                prompt, sampling_params, request_id=request_id
-            ):
+            async for res in engine.generate(prompt, sampling_params, request_id=request_id):
                 final_res = res
 
             if final_res is None:
@@ -593,9 +566,7 @@ class VLLMServerActor(ServerActorProtocol):
 
             logprobs = None
             if resp.logprobs is not None:
-                content, num_clamped = build_logprobs_content(
-                    token_ids_out, resp.logprobs
-                )
+                content, num_clamped = build_logprobs_content(token_ids_out, resp.logprobs)
                 if num_clamped:
                     logger.warning(
                         f"request {request_id}: clamped {num_clamped}/{len(token_ids_out)} missing or "
@@ -617,9 +588,7 @@ class VLLMServerActor(ServerActorProtocol):
                     }
                 ]
             }
-            return Response(
-                content=orjson.dumps(payload), media_type="application/json"
-            )
+            return Response(content=orjson.dumps(payload), media_type="application/json")
 
     async def shutdown(self) -> None:
         """Gracefully shutdown the server."""
@@ -700,9 +669,7 @@ async def _build_and_serve_vllm_server(
         usage_context=UsageContext.OPENAI_API_SERVER,
         stat_loggers=stat_loggers,
     )
-    logger.info(
-        f"Engine initialized on {cli_args.host}:{cli_args.port}, adding custom endpoints..."
-    )
+    logger.info(f"Engine initialized on {cli_args.host}:{cli_args.port}, adding custom endpoints...")
 
     # Add custom SkyRL endpoints
     VLLMServerActor._add_custom_endpoints(app, engine, cli_args)
@@ -778,12 +745,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     if not cli_args.host:
         cli_args.host = "0.0.0.0"
     set_ulimit()
-    logger.info(
-        f"Starting standalone SkyRL vLLM server on {cli_args.host}:{cli_args.port}"
-    )
-    asyncio.run(
-        _build_and_serve_vllm_server(cli_args, enable_ray_prometheus_stats=False)
-    )
+    logger.info(f"Starting standalone SkyRL vLLM server on {cli_args.host}:{cli_args.port}")
+    asyncio.run(_build_and_serve_vllm_server(cli_args, enable_ray_prometheus_stats=False))
 
 
 if __name__ == "__main__":
