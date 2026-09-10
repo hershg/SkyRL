@@ -50,6 +50,7 @@ class Glm5NextModelProvider(MLAModelProvider):
     # DSA indexer k-pool compression: the indexer scores groups of ``dsa_indexer_kpool``
     # consecutive keys and selects ``dsa_indexer_topk // dsa_indexer_kpool`` groups (plus the
     # incomplete tail group when ``dsa_indexer_kpool_always_select_tail``). Recorded from the HF
-    # config; see ``glm5_next.dsa`` for what the Megatron path currently supports.
+    # config. The checkpoint's serving indexer uses an FP8 K-pool scoring input.
+    dsa_indexer_kpool_fp8: bool = True
     dsa_indexer_kpool: int = 1
     dsa_indexer_kpool_always_select_tail: bool = True

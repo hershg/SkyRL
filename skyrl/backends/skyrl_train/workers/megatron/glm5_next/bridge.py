@@ -172,12 +172,13 @@ class Glm5NextBridge(MegatronModelBridge):
         provider.dsa_indexer_n_heads = text_config.index_n_heads
         provider.dsa_indexer_topk = text_config.index_topk
         provider.dsa_indexer_rotate_activation = False
-        provider.dsa_indexer_scoring_relu = True
+        provider.dsa_indexer_scoring_relu = False
         provider.dsa_indexer_k_norm_epsilon = 1e-6
         provider.dsa_indexer_rope_interleaved = bool(getattr(text_config, "indexer_rope_interleave", False))
         provider.dsa_indexer_loss_coeff = 0.0
         provider.dsa_indexer_kpool = text_config.index_kpool
         provider.dsa_indexer_kpool_always_select_tail = text_config.index_kpool_always_select_tail
+        provider.dsa_indexer_kpool_fp8 = True
         indexer_types = [
             t for t, layer_type in zip(text_config.indexer_types, layer_types) if layer_type != "linear_attention"
         ]
@@ -236,12 +237,14 @@ class Glm5NextBridge(MegatronModelBridge):
             f"{megatron_attn}.linear_kv_up_proj.weight": f"{hf_attn}.kv_b_proj.weight",
             f"{megatron_attn}.kv_layernorm.weight": f"{hf_attn}.kv_a_layernorm.weight",
             f"{megatron_attn}.linear_proj.weight": f"{hf_attn}.o_proj.weight",
-            # DSA lightning indexer (the k-pool compression parameters have no Megatron counterpart).
+            # DSA lightning indexer, including the GLM K-pool parameters.
             f"{megatron_attn}.core_attention.indexer.linear_wq_b.weight": f"{hf_attn}.indexer.wq_b.weight",
             f"{megatron_attn}.core_attention.indexer.linear_wk.weight": f"{hf_attn}.indexer.wk.weight",
             f"{megatron_attn}.core_attention.indexer.k_norm.weight": f"{hf_attn}.indexer.k_norm.weight",
             f"{megatron_attn}.core_attention.indexer.k_norm.bias": f"{hf_attn}.indexer.k_norm.bias",
             f"{megatron_attn}.core_attention.indexer.linear_weights_proj.weight": f"{hf_attn}.indexer.weights_proj.weight",
+            f"{megatron_attn}.core_attention.indexer.index_kpool_compress_ape": f"{hf_attn}.indexer.index_kpool_compress_ape",
+            f"{megatron_attn}.core_attention.indexer.index_kpool_compress_gate": f"{hf_attn}.indexer.index_kpool_compress_gate",
             # MoE router and down projections.
             f"{megatron_layer}.mlp.router.weight": f"{hf_layer}.mlp.gate.weight",
             f"{megatron_layer}.mlp.router.expert_bias": f"{hf_layer}.mlp.gate.e_score_correction_bias",
