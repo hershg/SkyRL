@@ -6,6 +6,7 @@ from typing import Mapping
 import ray
 import torch
 
+from .bridge_sources import LoRABridgeSourceLayout
 from .contracts import LoRAAdapterLayout, LoRAUpdateRequest
 
 
@@ -19,7 +20,11 @@ class _PublishedGeneration:
 class LoRardtProducer:
     """Retain one rank's FP32 LoRA tensors until every receiver acknowledges them."""
 
-    def __init__(self, source_rank: int, layout: LoRAAdapterLayout) -> None:
+    def __init__(
+        self,
+        source_rank: int,
+        layout: LoRAAdapterLayout | LoRABridgeSourceLayout,
+    ) -> None:
         self._source_rank = source_rank
         self._layout = layout
         self._generations: dict[int, _PublishedGeneration] = {}
@@ -47,12 +52,8 @@ class LoRardtProducer:
             raise ValueError(
                 f"LoRA generation {request.generation} is stale; latest generation is {self._latest_generation}"
             )
-        expected = {
-            tensor.key
-            for tensor in self._layout.tensors
-            if tensor.source_rank == self._source_rank
-        }
-        if set(tensors) != expected:
+        expected = self._owned_tensor_shapes()
+        if set(tensors) != set(expected):
             raise ValueError(
                 f"LoRA producer rank {self._source_rank} expected tensors {sorted(expected)}, got {sorted(tensors)}"
             )
@@ -60,6 +61,11 @@ class LoRardtProducer:
             if tensor.dtype is not torch.float32:
                 raise ValueError(
                     f"lora_rdt requires float32 source tensor {name!r}, got {tensor.dtype}"
+                )
+            if tuple(tensor.shape) != expected[name]:
+                raise ValueError(
+                    f"LoRA producer rank {self._source_rank} returned {name!r} with shape "
+                    f"{tuple(tensor.shape)}, expected {expected[name]}"
                 )
         self._generations[request.generation] = _PublishedGeneration(
             dict(tensors), set(), consumer_count
@@ -103,6 +109,21 @@ class LoRardtProducer:
     def retained_generations(self) -> list[int]:
         """Return generations whose source buffers remain available to receivers."""
         return sorted(self._generations)
+
+    def _owned_tensor_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Return this producer's fixed source names and shapes."""
+        if isinstance(self._layout, LoRABridgeSourceLayout):
+            owned = [
+                source
+                for source in self._layout.sources
+                if source.source_rank == self._source_rank
+            ]
+            return {source.key: source.shape for source in owned}
+        return {
+            tensor.key: tensor.shape
+            for tensor in self._layout.tensors
+            if tensor.source_rank == self._source_rank
+        }
 
     def _validate_request(self, request: LoRAUpdateRequest) -> None:
         if request.adapter_name != self._layout.adapter_name:

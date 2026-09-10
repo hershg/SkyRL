@@ -3,6 +3,8 @@ import torch
 
 from skyrl.backends.skyrl_train.weight_sync.lora_rdt import (
     LoRAAdapterLayout,
+    LoRABridgeSource,
+    LoRABridgeSourceLayout,
     LoRardtProducer,
     LoRATensorSlice,
     LoRAUpdateRequest,
@@ -54,4 +56,55 @@ def test_producer_rejects_wrong_owner_stale_generation_and_duplicate_acknowledge
             LoRAUpdateRequest.from_layout(layout, generation=3),
             {"a": torch.tensor([1.0, 2.0])},
             2,
+        )
+
+
+def test_bridge_source_producer_validates_its_rank_local_fp32_snapshot():
+    key = "decoder.layers.0.mlp.linear_fc2.adapter.linear_out.weight"
+    layout = LoRABridgeSourceLayout(
+        "adapter",
+        (
+            LoRABridgeSource(
+                key=key,
+                source_rank=0,
+                hf_param_names=("down_proj.lora_B.weight",),
+                component="linear_out",
+                transform="identity",
+                shape=(1, 2),
+                tensor_parallel_axis=0,
+                tensor_parallel_rank=0,
+                tensor_parallel_size=2,
+                expert_parallel_axis=None,
+                expert_parallel_rank=0,
+                expert_parallel_size=1,
+                transform_config=(),
+            ),
+            LoRABridgeSource(
+                key=key,
+                source_rank=1,
+                hf_param_names=("down_proj.lora_B.weight",),
+                component="linear_out",
+                transform="identity",
+                shape=(1, 2),
+                tensor_parallel_axis=0,
+                tensor_parallel_rank=1,
+                tensor_parallel_size=2,
+                expert_parallel_axis=None,
+                expert_parallel_rank=0,
+                expert_parallel_size=1,
+                transform_config=(),
+            ),
+        ),
+    )
+    request = LoRAUpdateRequest("adapter", 4, layout.layout_digest, "float32")
+    producer = LoRardtProducer(source_rank=0, layout=layout)
+
+    producer.publish(request, {key: torch.tensor([[1.0, 2.0]])}, consumer_count=1)
+
+    assert producer.pull(4, [key])[key].dtype is torch.float32
+    with pytest.raises(ValueError, match="shape"):
+        LoRardtProducer(source_rank=1, layout=layout).publish(
+            request,
+            {key: torch.tensor([1.0, 2.0])},
+            consumer_count=1,
         )
