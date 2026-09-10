@@ -2,6 +2,7 @@ import gc
 import hashlib
 import os
 import shutil
+import time
 from collections import defaultdict
 from contextlib import nullcontext
 from datetime import timedelta
@@ -1649,9 +1650,17 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         )
         from safetensors.torch import save_file
 
+        export_started = time.perf_counter()
         adapter_state = {}
         for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=True, show_progress=False):
             adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
+        logger.info(
+            "lora_publication_stage rank={} phase=bridge_export seconds={:.6f} tensors={} fp32_bytes={}",
+            torch.distributed.get_rank(),
+            time.perf_counter() - export_started,
+            len(adapter_state),
+            sum(tensor.nbytes for tensor in adapter_state.values()),
+        )
 
         if torch.distributed.get_rank() == 0:
             os.makedirs(lora_sync_path, exist_ok=True)
@@ -1660,7 +1669,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # merge_lora=False on-policy sync is accepted (otherwise
             # load_lora_adapter rejects `experts.down_proj`). See
             # _convert_moe_experts_lora_to_vllm for the layout details.
+            canonicalization_started = time.perf_counter()
             adapter_state = _convert_moe_experts_lora_to_vllm(adapter_state)
+            logger.info(
+                "lora_publication_stage rank=0 phase=canonicalization seconds={:.6f} tensors={} fp32_bytes={}",
+                time.perf_counter() - canonicalization_started,
+                len(adapter_state),
+                sum(tensor.nbytes for tensor in adapter_state.values()),
+            )
 
             target_modules = sorted(
                 set(infer_target_modules_from_adapter_weights(adapter_state.keys())) - {"base_layer"}
@@ -1676,10 +1692,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 base_model_name_or_path=base_model_name_or_path,
             )
 
+            serialization_started = time.perf_counter()
             compact_state = _compact_adapter_state(adapter_state)
             safetensors_path = os.path.join(lora_sync_path, "adapter_model.safetensors")
             if compact_state is None:
                 save_file(adapter_state, safetensors_path)
+                artifact_path = safetensors_path
             else:
                 compact_path = os.path.join(lora_sync_path, "adapter_model.bin")
                 temporary_path = compact_path + ".tmp"
@@ -1687,19 +1705,32 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 os.replace(temporary_path, compact_path)
                 if os.path.exists(safetensors_path):
                     os.remove(safetensors_path)
+                artifact_path = compact_path
             with open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
                 json.dump(adapter_config, f, ensure_ascii=False, indent=4)
+            logger.info(
+                "lora_publication_stage rank=0 phase=disk_write seconds={:.6f} artifact_bytes={} compact={}",
+                time.perf_counter() - serialization_started,
+                os.path.getsize(artifact_path),
+                compact_state is not None,
+            )
 
             # Send LoRA disk loading request to inference engine.
             from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
                 RemoteInferenceClient,
             )
 
+            receiver_load_started = time.perf_counter()
             if isinstance(inference_engine_client, RemoteInferenceClient):
                 await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
             else:
                 lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
                 await inference_engine_client.update_named_weights(lora_request)
+            logger.info(
+                "lora_publication_stage rank=0 phase=receiver_load_and_activation seconds={:.6f} adapter={}",
+                time.perf_counter() - receiver_load_started,
+                lora_name,
+            )
 
         torch.distributed.barrier()
 
