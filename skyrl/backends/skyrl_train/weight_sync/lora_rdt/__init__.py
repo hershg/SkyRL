@@ -3,6 +3,7 @@
 from .bridge_sources import (
     LoRABridgeSource,
     extract_lora_bridge_sources,
+    reconstruct_lora_bridge_tensors,
     validate_lora_bridge_source_layout,
 )
 from .contracts import (
@@ -24,6 +25,7 @@ from .vllm_adapter import (
 )
 
 __all__ = [
+    "reconstruct_lora_bridge_tensors",
     "validate_lora_bridge_source_layout",
     "extract_lora_bridge_sources",
     "LoRABridgeSource",

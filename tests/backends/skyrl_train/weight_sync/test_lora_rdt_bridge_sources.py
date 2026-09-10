@@ -5,6 +5,7 @@ import torch
 
 from skyrl.backends.skyrl_train.weight_sync.lora_rdt.bridge_sources import (
     extract_lora_bridge_sources,
+    reconstruct_lora_bridge_tensors,
     validate_lora_bridge_source_layout,
 )
 
@@ -47,3 +48,71 @@ def test_extract_lora_bridge_sources_rejects_duplicate_or_non_fp32_sources():
         extract_lora_bridge_sources(
             [_record(weight=torch.ones((2, 4), dtype=torch.bfloat16))]
         )
+
+
+def test_reconstruct_lora_bridge_tensors_assembles_tp_and_ep_shards():
+    source = _record(
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc2.adapter.linear_out.weight",
+        hf_param_names=("base_model.model.layers.0.mlp.down_proj.lora_B.weight",),
+        component="linear_out",
+        tensor_parallel_axis=1,
+        tensor_parallel_size=2,
+        expert_parallel_axis=0,
+        expert_parallel_size=2,
+        weight=torch.ones((1, 2), dtype=torch.float32),
+    )
+    records = []
+    tensors = {}
+    for ep_rank in range(2):
+        for tp_rank in range(2):
+            record = _record(
+                **{
+                    **source.__dict__,
+                    "tensor_parallel_rank": tp_rank,
+                    "expert_parallel_rank": ep_rank,
+                }
+            )
+            _, sources = extract_lora_bridge_sources([record])
+            records.extend(sources)
+            tensors[(sources[0].key, tp_rank, ep_rank)] = torch.full(
+                (1, 2), ep_rank * 10 + tp_rank, dtype=torch.float32
+            )
+
+    result = reconstruct_lora_bridge_tensors(records, tensors)
+
+    assert torch.equal(
+        result["base_model.model.layers.0.mlp.down_proj.lora_B.weight"],
+        torch.tensor([[0.0, 0.0, 1.0, 1.0], [10.0, 10.0, 11.0, 11.0]]),
+    )
+
+
+def test_reconstruct_lora_bridge_tensors_replicates_and_splits_gated_sources():
+    replicated = _record(
+        hf_param_names=("q.lora_A.weight", "k.lora_A.weight", "v.lora_A.weight"),
+        transform="replicate",
+        tensor_parallel_size=1,
+    )
+    gated = _record(
+        global_param_name="decoder.layers.0.mlp.linear_fc1.adapter.linear_out.weight",
+        hf_param_names=("gate.lora_B.weight", "up.lora_B.weight"),
+        component="linear_out",
+        transform="split_gated_mlp",
+        weight=torch.arange(8, dtype=torch.float32).reshape(4, 2),
+        tensor_parallel_size=1,
+    )
+    tensors_a, sources_a = extract_lora_bridge_sources([replicated])
+    tensors_b, sources_b = extract_lora_bridge_sources([gated])
+    tensors = {
+        (sources_a[0].key, 0, 0): tensors_a[sources_a[0].key],
+        (sources_b[0].key, 0, 0): tensors_b[sources_b[0].key],
+    }
+
+    result = reconstruct_lora_bridge_tensors((*sources_a, *sources_b), tensors)
+
+    assert result["q.lora_A.weight"] is result["k.lora_A.weight"]
+    assert torch.equal(
+        result["gate.lora_B.weight"], torch.tensor([[0.0, 1.0], [2.0, 3.0]])
+    )
+    assert torch.equal(
+        result["up.lora_B.weight"], torch.tensor([[4.0, 5.0], [6.0, 7.0]])
+    )

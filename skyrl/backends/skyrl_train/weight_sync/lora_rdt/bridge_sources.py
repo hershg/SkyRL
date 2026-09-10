@@ -98,3 +98,108 @@ def validate_lora_bridge_source_layout(
                 f"Bridge source {source.key!r} has invalid expert-parallel rank"
             )
     return layout
+
+
+def reconstruct_lora_bridge_tensors(
+    sources: Iterable[LoRABridgeSource],
+    tensors: Mapping[tuple[str, int, int], torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Reconstruct PEFT tensors from pulled rank-local Bridge source shards.
+
+    ``tensors`` keys are ``(global_param_name, tp_rank, ep_rank)``. The caller
+    obtains those tensors through NIXL; this function only performs deterministic
+    local assembly. Fused QKV and GDN sources are intentionally rejected here
+    because their conversion needs the exact Megatron transformer configuration.
+    """
+    grouped: dict[str, list[LoRABridgeSource]] = {}
+    for source in sources:
+        grouped.setdefault(source.key, []).append(source)
+    result: dict[str, torch.Tensor] = {}
+    for key, group in grouped.items():
+        first = group[0]
+        if any(
+            source.hf_param_names != first.hf_param_names
+            or source.component != first.component
+            or source.transform != first.transform
+            or source.tensor_parallel_axis != first.tensor_parallel_axis
+            or source.expert_parallel_axis != first.expert_parallel_axis
+            for source in group
+        ):
+            raise ValueError(f"Bridge source {key!r} has inconsistent shard metadata")
+        local_by_ep: list[torch.Tensor] = []
+        for ep_rank in range(first.expert_parallel_size):
+            ep_sources = [
+                source for source in group if source.expert_parallel_rank == ep_rank
+            ]
+            if not ep_sources:
+                raise ValueError(f"Bridge source {key!r} is missing EP rank {ep_rank}")
+            shards = []
+            expected_tp_ranks = range(first.tensor_parallel_size)
+            for tp_rank in expected_tp_ranks:
+                matching = [
+                    source
+                    for source in ep_sources
+                    if source.tensor_parallel_rank == tp_rank
+                ]
+                if len(matching) != 1:
+                    raise ValueError(
+                        f"Bridge source {key!r} has invalid TP ownership for rank {tp_rank}"
+                    )
+                source = matching[0]
+                tensor_key = (key, tp_rank, ep_rank)
+                tensor = tensors.get(tensor_key)
+                if tensor is None:
+                    raise ValueError(
+                        f"Bridge source {key!r} is missing pulled tensor {tensor_key!r}"
+                    )
+                if tensor.dtype is not torch.float32:
+                    raise ValueError(
+                        f"lora_rdt requires float32 Bridge source {key!r}, got {tensor.dtype}"
+                    )
+                if tuple(tensor.shape) != source.shape:
+                    raise ValueError(
+                        f"Bridge source {key!r} tensor {tensor_key!r} has shape {tuple(tensor.shape)}, "
+                        f"expected {source.shape}"
+                    )
+                shards.append(tensor)
+            if first.tensor_parallel_axis is None:
+                local_by_ep.append(shards[0])
+            else:
+                local_by_ep.append(torch.cat(shards, dim=first.tensor_parallel_axis))
+        if first.expert_parallel_axis is None:
+            assembled = local_by_ep[0]
+        else:
+            assembled = torch.cat(local_by_ep, dim=first.expert_parallel_axis)
+        _emit_reconstructed_lora_tensors(result, first, assembled)
+    return result
+
+
+def _emit_reconstructed_lora_tensors(
+    result: dict[str, torch.Tensor],
+    source: LoRABridgeSource,
+    tensor: torch.Tensor,
+) -> None:
+    """Apply a Bridge-declared post-assembly transform to one source tensor."""
+    if source.transform == "identity":
+        if len(source.hf_param_names) != 1:
+            raise ValueError(
+                f"Bridge source {source.key!r} identity transform requires one HF name"
+            )
+        result[source.hf_param_names[0]] = tensor
+        return
+    if source.transform == "replicate":
+        for name in source.hf_param_names:
+            result[name] = tensor
+        return
+    if source.transform == "split_gated_mlp":
+        if len(source.hf_param_names) != 2:
+            raise ValueError(
+                f"Bridge source {source.key!r} gated transform requires two HF names"
+            )
+        gate, up = torch.chunk(tensor, 2, dim=0)
+        result[source.hf_param_names[0]] = gate
+        result[source.hf_param_names[1]] = up
+        return
+    raise ValueError(
+        f"Bridge source {source.key!r} requires {source.transform!r} conversion with the Megatron config"
+    )
