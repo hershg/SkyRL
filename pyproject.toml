@@ -419,15 +419,15 @@ torchvision = [
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
 # megatron-bridge main branch: latest as of 9/8/26
 megatron-bridge = {git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge", rev = "8e5f0e13b7dff8a951c6676e2f7b4a1853a34845", marker = "sys_platform == 'linux'"}
-# megatron-core must match the `3rdparty/Megatron-LM` submodule pin of the
-# megatron-bridge rev above -- that is the only megatron-core commit Bridge's
-# own CI validates against. Bump the two together, reading the submodule rev with
-# `git ls-tree <bridge-rev> 3rdparty/Megatron-LM`. This one is on the Megatron-LM
-# main branch (https://github.com/NVIDIA/Megatron-LM/tree/main), dated 9/7/26. Megatron-LM main
-# is 3 commits ahead of it at the time of this bump; the extra commits rework
-# `experimental_attention_variant/dsa.py` (NVIDIA/Megatron-LM#6402), which the GLM 5 sparse
-# attention path builds on, so this stays on the rev Bridge validates rather than main's tip.
-megatron-core = {git = "https://github.com/NVIDIA/Megatron-LM", rev = "b3393bbb0b223223ee3f8becf95f408d231d0036", marker = "sys_platform == 'linux'"}
+# GLM-5.3-Flash needs K-pool DSA selection absent from Bridge's validated submodule pin.
+# This candidate begins at that pin, adds GLM architecture support, and retains
+# only bounded streaming K-pool score tiles, never a [sequence, sequence / kpool]
+# score matrix. It is deliberately an immutable pin, not a moving branch reference.
+# The Bridge revision remains independently pinned above; their import and native GLM
+# provider conversion are qualification gates, rather than an assertion of upstream CI coverage.
+# See the qualification evidence bundle for source SHA, release receipt, and test results.
+# Do not advance this pin without repeating the native 256K regression qualification.
+megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "a778d0447becbce952bc529253406e09e5beb1eb", marker = "sys_platform == 'linux'"}
 # vLLM at 98ed0856f31fa3aaf5e27464e2b4ef5a8ee6b2f5 (vllm-project/vllm#53906, "[Model] add GLM-5.3-Flash
 # support", 2026-09-03), i.e. 0.28.1rc1.dev359 -- the first vLLM with the GLM-5.3-Flash (glm5_next: KDA +
 # DSA-kpool + mHC) model. Per-commit wheels are published by vLLM's CI at wheels.vllm.ai; this one is
