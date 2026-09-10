@@ -70,6 +70,9 @@ from skyrl.backends.skyrl_train.weight_sync import (
     WeightChunk,
     WeightExtractor,
 )
+from skyrl.backends.skyrl_train.weight_sync.adapter_serialization import (
+    save_adapter_state,
+)
 from skyrl.backends.skyrl_train.weight_sync.fp8 import (
     BLOCKWISE_FP8,
     SerializedFp8Config,
@@ -1606,7 +1609,6 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             build_adapter_config_dict,
             infer_target_modules_from_adapter_weights,
         )
-        from safetensors.torch import save_file
 
         adapter_state = {}
         for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=True, show_progress=False):
@@ -1635,7 +1637,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 base_model_name_or_path=base_model_name_or_path,
             )
 
-            save_file(adapter_state, os.path.join(lora_sync_path, "adapter_model.safetensors"))
+            save_adapter_state(adapter_state, lora_sync_path)
             with open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
                 json.dump(adapter_config, f, ensure_ascii=False, indent=4)
 
