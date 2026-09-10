@@ -10,6 +10,7 @@ from .contracts import (
     materialize_bf16_adapter_tensor,
 )
 from .producer import LoRardtProducer
+from .receiver import acknowledge_lora_generation, pull_and_stage_lora_adapter
 from .vllm_adapter import (
     activate_staged_vllm_lora_model,
     build_vllm_lora_model,
@@ -24,10 +25,12 @@ __all__ = [
     "LoRardtProducer",
     "LoRATransferInitInfo",
     "LoRAUpdateRequest",
+    "acknowledge_lora_generation",
     "activate_staged_vllm_lora_model",
     "build_lora_adapter_layout",
     "build_vllm_lora_model",
     "discard_staged_vllm_lora_model",
     "materialize_bf16_adapter_tensor",
+    "pull_and_stage_lora_adapter",
     "stage_vllm_lora_model",
 ]
