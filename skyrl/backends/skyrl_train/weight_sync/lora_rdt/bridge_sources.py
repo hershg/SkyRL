@@ -213,6 +213,19 @@ def _emit_reconstructed_lora_tensors(
         result[source.hf_param_names[1]] = k
         result[source.hf_param_names[2]] = v
         return
+    if source.transform == "split_gdn_in_proj":
+        if len(source.hf_param_names) != 4:
+            raise ValueError(
+                f"Bridge source {source.key!r} GDN transform requires four HF names"
+            )
+        parts = _split_gdn_lora_tensor(
+            tensor,
+            dict(source.transform_config),
+            source.tensor_parallel_size,
+        )
+        for name, part in zip(source.hf_param_names, parts, strict=True):
+            result[name] = part
+        return
     raise ValueError(
         f"Bridge source {source.key!r} requires {source.transform!r} conversion with the Megatron config"
     )
@@ -277,4 +290,69 @@ def _split_qkv_lora_tensor(
         q.reshape(-1, feature_dim),
         qkv[k_indices].reshape(-1, feature_dim),
         qkv[v_indices].reshape(-1, feature_dim),
+    )
+
+
+def _split_gdn_lora_tensor(
+    tensor: torch.Tensor,
+    config: Mapping[str, int | bool | None],
+    tensor_parallel_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split a packed GLM DSA in-projection LoRA-B tensor into PEFT tensors."""
+    fields = (
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+    )
+    if any(config.get(field) is None for field in fields):
+        raise ValueError("GDN LoRA source is missing its Bridge transform config")
+    qk_head_dim = int(config["linear_key_head_dim"])
+    v_head_dim = int(config["linear_value_head_dim"])
+    num_qk_heads = int(config["linear_num_key_heads"])
+    num_v_heads = int(config["linear_num_value_heads"])
+    if num_qk_heads % tensor_parallel_size or num_v_heads % tensor_parallel_size:
+        raise ValueError(
+            "GDN LoRA source head counts are not divisible by tensor parallel size"
+        )
+    feature_dim = tensor.shape[-1]
+    qk_local = qk_head_dim * (num_qk_heads // tensor_parallel_size)
+    v_local = v_head_dim * (num_v_heads // tensor_parallel_size)
+    v_heads_local = num_v_heads // tensor_parallel_size
+    rows_per_rank = 2 * qk_local + 2 * v_local + 2 * v_heads_local
+    if tensor.ndim != 2 or tensor.shape[0] != tensor_parallel_size * rows_per_rank:
+        raise ValueError(
+            "GDN LoRA source shape does not match its Bridge transform config"
+        )
+    packed = tensor.reshape(tensor_parallel_size, rows_per_rank, feature_dim)
+    q, k, v, z, b, a = torch.split(
+        packed,
+        [qk_local, qk_local, v_local, v_local, v_heads_local, v_heads_local],
+        dim=1,
+    )
+    q, k, v, z, b, a = [
+        part.reshape(num_qk_heads, -1, feature_dim) for part in (q, k, v, z, b, a)
+    ]
+    qkvz = torch.cat([q, k, v, z], dim=1)
+    ba = torch.cat([b, a], dim=1)
+    v_per_group = num_v_heads // num_qk_heads
+    q_g, k_g, v_g, z_g = torch.split(
+        qkvz,
+        [qk_head_dim, qk_head_dim, v_per_group * v_head_dim, v_per_group * v_head_dim],
+        dim=1,
+    )
+    b_g, a_g = torch.split(ba, [v_per_group, v_per_group], dim=1)
+    qkv = torch.cat(
+        [
+            q_g.reshape(-1, feature_dim),
+            k_g.reshape(-1, feature_dim),
+            v_g.reshape(-1, feature_dim),
+        ],
+        dim=0,
+    )
+    return (
+        qkv,
+        z_g.reshape(-1, feature_dim),
+        b_g.reshape(-1, feature_dim),
+        a_g.reshape(-1, feature_dim),
     )

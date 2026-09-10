@@ -155,3 +155,60 @@ def test_reconstruct_lora_bridge_tensors_splits_qkv_with_bridge_layout_config():
         result["v.lora_B.weight"],
         torch.cat([source_tensor[6:8], source_tensor[14:16]], dim=0),
     )
+
+
+def test_reconstruct_lora_bridge_tensors_splits_gdn_with_bridge_layout_config():
+    source = _record(
+        global_param_name="decoder.layers.0.linear_attn.in_proj.adapter.linear_out.weight",
+        hf_param_names=(
+            "qkv.lora_B.weight",
+            "z.lora_B.weight",
+            "b.lora_B.weight",
+            "a.lora_B.weight",
+        ),
+        component="linear_out",
+        transform="split_gdn_in_proj",
+        weight=torch.ones((6, 2), dtype=torch.float32),
+        tensor_parallel_axis=0,
+        tensor_parallel_size=2,
+        transform_config=(
+            ("linear_key_head_dim", 1),
+            ("linear_value_head_dim", 1),
+            ("linear_num_key_heads", 2),
+            ("linear_num_value_heads", 2),
+        ),
+    )
+    records = []
+    tensors = {}
+    for tp_rank in range(2):
+        record = _record(**{**source.__dict__, "tensor_parallel_rank": tp_rank})
+        _, sources = extract_lora_bridge_sources([record])
+        records.extend(sources)
+        tensors[(sources[0].key, tp_rank, 0)] = torch.arange(
+            tp_rank * 12, (tp_rank + 1) * 12, dtype=torch.float32
+        ).reshape(6, 2)
+
+    result = reconstruct_lora_bridge_tensors(records, tensors)
+
+    assert torch.equal(
+        result["qkv.lora_B.weight"],
+        torch.tensor(
+            [
+                [0.0, 1.0],
+                [12.0, 13.0],
+                [2.0, 3.0],
+                [14.0, 15.0],
+                [4.0, 5.0],
+                [16.0, 17.0],
+            ]
+        ),
+    )
+    assert torch.equal(
+        result["z.lora_B.weight"], torch.tensor([[6.0, 7.0], [18.0, 19.0]])
+    )
+    assert torch.equal(
+        result["b.lora_B.weight"], torch.tensor([[8.0, 9.0], [20.0, 21.0]])
+    )
+    assert torch.equal(
+        result["a.lora_B.weight"], torch.tensor([[10.0, 11.0], [22.0, 23.0]])
+    )
