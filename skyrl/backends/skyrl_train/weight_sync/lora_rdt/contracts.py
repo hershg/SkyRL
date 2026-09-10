@@ -188,6 +188,15 @@ class LoRAUpdateRequest:
             raise ValueError("LoRA update requests require a SHA-256 layout digest")
 
 
+@dataclass(frozen=True)
+class LoRAReceiverGeneration:
+    """Retain the fixed receiver contract with its active or staged generation."""
+
+    request: LoRAUpdateRequest
+    adapter_id: int
+    adapter_config_json: str
+
+
 class LoRAAdapterGenerationState:
     """Tracks staged and active adapter buffers for a fixed receiver layout."""
 

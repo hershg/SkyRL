@@ -24,6 +24,7 @@ Usage:
         skyrl.backends.skyrl_train.inference_servers.new_inference_worker_wrap.NewInferenceWorkerWrap
 """
 
+import json
 from typing import Any
 
 import torch
@@ -243,6 +244,9 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
             pull_reconstruct_and_stage_lora_adapter,
             resolve_lora_rdt_producers,
         )
+        from skyrl.backends.skyrl_train.weight_sync.lora_rdt.contracts import (
+            LoRAReceiverGeneration,
+        )
 
         rendezvous_info = LoRardtProducerRendezvous.from_json_dict(rendezvous)
         update_request = LoRAUpdateRequest.from_json_dict(request)
@@ -253,12 +257,20 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
             raise ValueError(
                 f"LoRA adapter {adapter_name!r} already has a staged generation"
             )
+        next_record = LoRAReceiverGeneration(
+            update_request, adapter_id, json.dumps(adapter_config, sort_keys=True, separators=(",", ":"))
+        )
         active_record = active.get(adapter_name)
-        if active_record is not None and update_request.generation <= active_record[0]:
-            raise ValueError(
-                f"LoRA generation {update_request.generation} is stale; "
-                f"active generation is {active_record[0]}"
-            )
+        if active_record is not None:
+            if update_request.generation <= active_record.request.generation:
+                raise ValueError(
+                    f"LoRA generation {update_request.generation} is stale; "
+                    f"active generation is {active_record.request.generation}"
+                )
+            if update_request.layout_digest != active_record.request.layout_digest:
+                raise ValueError(f"LoRA adapter {adapter_name!r} changed its fixed receiver layout")
+            if next_record.adapter_config_json != active_record.adapter_config_json:
+                raise ValueError(f"LoRA adapter {adapter_name!r} changed its fixed receiver configuration")
         producers = resolve_lora_rdt_producers(
             rendezvous_info.actor_name_by_rank(), rendezvous_info.namespace
         )
@@ -271,7 +283,7 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
             model_runner=self.model_runner,
             device=str(self.device),
         )
-        staged[adapter_name] = (update_request.generation, adapter_id)
+        staged[adapter_name] = next_record
         self._skyrl_lora_rdt_staged = staged
         return {"adapter_id": adapter_id, "generation": update_request.generation}
 
@@ -285,7 +297,11 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
         update_request = LoRAUpdateRequest.from_json_dict(request)
         staged = getattr(self, "_skyrl_lora_rdt_staged", {})
         staged_record = staged.get(update_request.adapter_name)
-        if staged_record != (update_request.generation, adapter_id):
+        if (
+            staged_record is None
+            or staged_record.request != update_request
+            or staged_record.adapter_id != adapter_id
+        ):
             raise ValueError(
                 f"LoRA adapter {update_request.adapter_name!r} generation "
                 f"{update_request.generation} is not staged as adapter id {adapter_id}"
@@ -295,7 +311,7 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
         previous = active.get(update_request.adapter_name)
         if previous is not None:
             retained = getattr(self, "_skyrl_lora_rdt_retained", {})
-            retained[previous[1]] = (update_request.adapter_name, previous)
+            retained[previous.adapter_id] = (update_request.adapter_name, previous)
             self._skyrl_lora_rdt_retained = retained
         active[update_request.adapter_name] = staged_record
         self._skyrl_lora_rdt_active = active
@@ -311,7 +327,7 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
         retained = getattr(self, "_skyrl_lora_rdt_retained", {})
         previous = retained.get(adapter_id)
         if previous is None:
-            if not any(record[1] == adapter_id for record in active.values()):
+            if not any(record.adapter_id == adapter_id for record in active.values()):
                 raise ValueError(f"LoRA adapter id {adapter_id} has no retained generation")
         activate_staged_vllm_lora_model(self.model_runner, adapter_id)
         if previous is not None:
@@ -328,11 +344,11 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
         discard_staged_vllm_lora_model(self.model_runner, adapter_id)
         staged = getattr(self, "_skyrl_lora_rdt_staged", {})
         for adapter_name, record in tuple(staged.items()):
-            if record[1] == adapter_id:
+            if record.adapter_id == adapter_id:
                 del staged[adapter_name]
         active = getattr(self, "_skyrl_lora_rdt_active", {})
         for adapter_name, record in tuple(active.items()):
-            if record[1] == adapter_id:
+            if record.adapter_id == adapter_id:
                 del active[adapter_name]
         getattr(self, "_skyrl_lora_rdt_retained", {}).pop(adapter_id, None)
 

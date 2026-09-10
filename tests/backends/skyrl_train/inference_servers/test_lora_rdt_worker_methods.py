@@ -1,3 +1,6 @@
+import json
+from dataclasses import replace
+
 import pytest
 
 import skyrl.backends.skyrl_train.inference_servers.new_inference_worker_wrap as worker_wrap
@@ -7,6 +10,16 @@ from skyrl.backends.skyrl_train.weight_sync.lora_rdt import (
     LoRardtProducerRendezvous,
     LoRAUpdateRequest,
 )
+from skyrl.backends.skyrl_train.weight_sync.lora_rdt.contracts import (
+    LoRAReceiverGeneration,
+)
+
+
+def _record(generation, adapter_id, config=None):
+    config = {"r": 2} if config is None else config
+    return LoRAReceiverGeneration(
+        _request(generation), adapter_id, json.dumps(config, sort_keys=True, separators=(",", ":"))
+    )
 
 
 def _rendezvous():
@@ -69,18 +82,18 @@ def test_worker_stages_then_activates_only_the_requested_generation(monkeypatch)
 
     assert result == {"adapter_id": 9, "generation": 2}
     assert staged[0]["device"] == "cuda:0"
-    assert worker._skyrl_lora_rdt_staged == {"adapter": (2, 9)}
+    assert worker._skyrl_lora_rdt_staged == {"adapter": _record(2, 9)}
 
     worker.activate_lora_rdt_adapter(request.to_json_dict(), 9)
 
     assert activated == [(worker.model_runner, 9)]
-    assert worker._skyrl_lora_rdt_active == {"adapter": (2, 9)}
+    assert worker._skyrl_lora_rdt_active == {"adapter": _record(2, 9)}
     assert worker._skyrl_lora_rdt_staged == {}
 
 
 def test_worker_rejects_stale_or_unstaged_generation(monkeypatch):
     worker = _worker()
-    worker._skyrl_lora_rdt_active = {"adapter": (2, 9)}
+    worker._skyrl_lora_rdt_active = {"adapter": _record(2, 9)}
     monkeypatch.setattr(
         "skyrl.backends.skyrl_train.weight_sync.lora_rdt.resolve_lora_rdt_producers",
         lambda names, namespace: {0: "producer"},
@@ -125,14 +138,14 @@ def test_worker_rollback_restores_generation_and_allows_a_replacement(monkeypatc
     worker.discard_lora_rdt_adapter(10)
     worker.discard_lora_rdt_adapter(10)
 
-    assert worker._skyrl_lora_rdt_active == {"adapter": (1, 9)}
+    assert worker._skyrl_lora_rdt_active == {"adapter": _record(1, 9)}
     assert registered == {9}
     assert worker._skyrl_lora_rdt_retained == {}
     worker.stage_lora_rdt_adapter(_rendezvous().to_json_dict(), _request(2).to_json_dict(), 11, {"r": 2})
     worker.activate_lora_rdt_adapter(_request(2).to_json_dict(), 11)
     worker.remove_lora_rdt_adapter(9)
 
-    assert worker._skyrl_lora_rdt_active == {"adapter": (2, 11)}
+    assert worker._skyrl_lora_rdt_active == {"adapter": _record(2, 11)}
     assert worker._skyrl_lora_rdt_retained == {}
     assert registered == {11}
 
@@ -154,3 +167,59 @@ def test_worker_restoring_unknown_generation_does_not_touch_vllm(monkeypatch):
     )
     with pytest.raises(ValueError, match="no retained generation"):
         worker.restore_lora_rdt_adapter(9)
+
+
+@pytest.mark.parametrize("change", ["layout", "rank", "targets"])
+def test_changed_receiver_contract_is_rejected_before_any_pull(monkeypatch, change):
+    worker = _worker()
+    config = {"r": 2, "lora_alpha": 2, "target_modules": ["down_proj"]}
+    original = _record(1, 9, config)
+    worker._skyrl_lora_rdt_active = {"adapter": original}
+    rendezvous = _rendezvous()
+    if change == "layout":
+        source = replace(rendezvous.layout.sources[0], shape=(2, 2))
+        layout = LoRABridgeSourceLayout("adapter", (source,))
+        rendezvous = LoRardtProducerRendezvous(layout, ((0, "producer-0"),), 1)
+    elif change == "rank":
+        config["r"] = 4
+    else:
+        config["target_modules"] = ["q_proj"]
+
+    def unexpected_resolve(*args):
+        raise AssertionError("changed contracts must be rejected before producer lookup")
+
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.resolve_lora_rdt_producers",
+        unexpected_resolve,
+    )
+
+    with pytest.raises(ValueError, match="changed its fixed receiver"):
+        worker.stage_lora_rdt_adapter(
+            rendezvous.to_json_dict(),
+            LoRAUpdateRequest.from_layout(rendezvous.layout, 2).to_json_dict(),
+            10,
+            config,
+        )
+
+    assert worker._skyrl_lora_rdt_active == {"adapter": original}
+    assert not getattr(worker, "_skyrl_lora_rdt_staged", {})
+
+
+def test_activation_rejects_request_with_a_different_staged_digest(monkeypatch):
+    worker = _worker()
+    worker._skyrl_lora_rdt_staged = {"adapter": _record(2, 10)}
+    worker._skyrl_lora_rdt_active = {"adapter": _record(1, 9)}
+
+    def unexpected_activation(*args):
+        raise AssertionError("mismatched staged request must not activate")
+
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.activate_staged_vllm_lora_model",
+        unexpected_activation,
+    )
+    mismatched = replace(_request(2), layout_digest="0" * 64)
+    with pytest.raises(ValueError, match="not staged"):
+        worker.activate_lora_rdt_adapter(mismatched.to_json_dict(), 10)
+
+    assert worker._skyrl_lora_rdt_active == {"adapter": _record(1, 9)}
+    assert worker._skyrl_lora_rdt_staged == {"adapter": _record(2, 10)}
