@@ -272,10 +272,22 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
         app.state.fetch_weights_requests.append(body)
         return {"status": "ok", "server_id": server_id, "body": body}
 
-    @app.post("/skyrl/v1/load_lora_rdt_adapter")
-    async def load_lora_rdt_adapter(request: Request):
+    @app.post("/skyrl/v1/stage_lora_rdt_adapter")
+    async def stage_lora_rdt_adapter(request: Request):
         body = await request.json()
-        return {"status": "ok", "server_id": server_id, "body": body}
+        return {"status": "staged", "server_id": server_id, "lora_int_id": 100 + server_id, "body": body}
+
+    @app.post("/skyrl/v1/activate_lora_rdt_adapter")
+    async def activate_lora_rdt_adapter(request: Request):
+        return {"status": "active", "server_id": server_id, "body": await request.json()}
+
+    @app.post("/skyrl/v1/commit_lora_rdt_adapter")
+    async def commit_lora_rdt_adapter(request: Request):
+        return {"status": "committed", "server_id": server_id, "body": await request.json()}
+
+    @app.post("/skyrl/v1/rollback_lora_rdt_adapter")
+    async def rollback_lora_rdt_adapter(request: Request):
+        return {"status": "rolled_back", "server_id": server_id, "body": await request.json()}
 
     @app.post("/skyrl/v1/load_lora_adapter")
     async def load_lora_adapter(request: Request):
@@ -1071,12 +1083,7 @@ class TestLoRAControlPlane:
         assert len(result) == 2
         for response in result.values():
             assert response["status"] == 200
-            assert response["body"]["body"] == {
-                "lora_name": "lora-RDT",
-                "rendezvous": rendezvous,
-                "request": request,
-                "adapter_config": {"r": 32},
-            }
+            assert response["body"]["status"] == "active"
 
     @pytest.mark.asyncio
     async def test_load_lora_adapter_fans_out(self, client, mock_servers):

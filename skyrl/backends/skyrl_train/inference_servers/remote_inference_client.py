@@ -1276,21 +1276,38 @@ class RemoteInferenceClient(InferenceEngineInterface):
         request: Dict[str, Any],
         adapter_config: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Atomically load a named LoRA generation through NIXL/RDMA.
-
-        Each backend drains its requests, stages the NIXL-pulled BF16 adapter
-        on all TP workers, activates it collectively, and only then changes
-        the public name-to-adapter-id route.
-        """
-        return await self._call_all_servers(
-            "/skyrl/v1/load_lora_rdt_adapter",
-            {
-                "lora_name": lora_name,
-                "rendezvous": rendezvous,
-                "request": request,
-                "adapter_config": adapter_config,
-            },
+        """Stage and atomically activate a LoRA generation across the server fleet."""
+        from skyrl.backends.skyrl_train.weight_sync.lora_rdt.fleet_control import (
+            LoRardtFleetTransaction,
         )
+
+        adapter_ids: Dict[str, int] = {}
+        common = {"lora_name": lora_name, "rendezvous": rendezvous, "request": request}
+
+        async def stage(server_url: str):
+            _, response = await self._call_server(
+                server_url, "/skyrl/v1/stage_lora_rdt_adapter", {**common, "adapter_config": adapter_config}
+            )
+            adapter_ids[server_url] = int(response["body"]["lora_int_id"])
+            return response
+
+        async def call_phase(endpoint: str, server_url: str):
+            adapter_id = adapter_ids.get(server_url)
+            if adapter_id is None:
+                return {"status": "not_staged"}
+            _, response = await self._call_server(
+                server_url, endpoint, {**common, "adapter_id": adapter_id}
+            )
+            return response
+
+        return dict(await LoRardtFleetTransaction(self.server_urls).replace(
+            stage=stage,
+            pause=lambda: self.pause(mode=PauseMode.WAIT),
+            activate=lambda url: call_phase("/skyrl/v1/activate_lora_rdt_adapter", url),
+            rollback=lambda url: call_phase("/skyrl/v1/rollback_lora_rdt_adapter", url),
+            commit=lambda url: call_phase("/skyrl/v1/commit_lora_rdt_adapter", url),
+            resume=self.resume,
+        ))
 
     async def load_lora_adapter(
         self,

@@ -435,60 +435,90 @@ class VLLMServerActor(ServerActorProtocol):
             result = await engine.collective_rpc("fetch_weights", kwargs=kwargs)
             return {"status": "ok", "result": result}
 
-        @app.post("/skyrl/v1/load_lora_rdt_adapter")
-        async def _skyrl_load_lora_rdt_adapter(request: Request):
-            """Atomically replace one named adapter from NIXL-pulled FP32 sources."""
-            body = await request.json()
+        def _parse_lora_rdt(body):
             lora_name = body.get("lora_name")
             if not lora_name:
                 raise HTTPException(status_code=400, detail="'lora_name' is required")
             try:
-                rendezvous = LoRardtProducerRendezvous.from_json_dict(
-                    body["rendezvous"]
-                )
+                rendezvous = LoRardtProducerRendezvous.from_json_dict(body["rendezvous"])
                 update_request = LoRAUpdateRequest.from_json_dict(body["request"])
-                adapter_config = body["adapter_config"]
             except (KeyError, TypeError, ValueError) as error:
                 raise HTTPException(status_code=400, detail=str(error)) from error
             if lora_name != update_request.adapter_name:
-                raise HTTPException(
-                    status_code=400,
-                    detail="'lora_name' must match the LoRA update request adapter name",
-                )
+                raise HTTPException(status_code=400, detail="lora_name does not match request adapter")
+            return lora_name, rendezvous, update_request
 
+        def _lora_rdt_lifecycle(models):
+            lifecycle = getattr(models, "_skyrl_lora_rdt_lifecycle", None)
+            if lifecycle is None:
+                lifecycle = LoRardtServerLifecycle()
+                models._skyrl_lora_rdt_lifecycle = lifecycle
+            return lifecycle
+
+        @app.post("/skyrl/v1/stage_lora_rdt_adapter")
+        async def _skyrl_stage_lora_rdt_adapter(request: Request):
+            body = await request.json()
+            lora_name, rendezvous, update_request = _parse_lora_rdt(body)
+            adapter_config = body.get("adapter_config")
+            if not isinstance(adapter_config, dict):
+                raise HTTPException(status_code=400, detail="adapter_config must be an object")
             models = request.app.state.openai_serving_models
             async with models.lora_resolver_lock[lora_name]:
-                lifecycle = getattr(models, "_skyrl_lora_rdt_lifecycle", None)
-                if lifecycle is None:
-                    lifecycle = LoRardtServerLifecycle()
-                    models._skyrl_lora_rdt_lifecycle = lifecycle
                 adapter_id = models.lora_id_counter.inc(1)
                 try:
-                    await lifecycle.replace(
-                        engine=engine,
-                        rendezvous=rendezvous,
-                        request=update_request,
-                        adapter_id=adapter_id,
-                        adapter_config=adapter_config,
-                    )
+                    await _lora_rdt_lifecycle(models).stage(engine, rendezvous, update_request, adapter_id, adapter_config)
                 except Exception as error:
                     raise HTTPException(status_code=500, detail=str(error)) from error
-                # The adapter is already present on every worker. The request
-                # object supplies the newly active id to request routing; its
-                # path is never loaded because ``load_inplace`` is false.
-                models.lora_requests[lora_name] = LoRARequest(
-                    lora_name=lora_name,
-                    lora_int_id=adapter_id,
-                    lora_path=f"lora_rdt://{lora_name}",
-                    load_inplace=False,
-                )
+                previous = getattr(models, "_skyrl_lora_rdt_previous_requests", {})
+                previous[lora_name] = models.lora_requests.get(lora_name)
+                models._skyrl_lora_rdt_previous_requests = previous
+            return {"status": "staged", "lora_int_id": adapter_id}
 
-            return {
-                "status": "ok",
-                "lora_name": lora_name,
-                "lora_int_id": adapter_id,
-                "generation": update_request.generation,
-            }
+        @app.post("/skyrl/v1/activate_lora_rdt_adapter")
+        async def _skyrl_activate_lora_rdt_adapter(request: Request):
+            body = await request.json()
+            lora_name, _, update_request = _parse_lora_rdt(body)
+            adapter_id = int(body["adapter_id"])
+            models = request.app.state.openai_serving_models
+            async with models.lora_resolver_lock[lora_name]:
+                try:
+                    await _lora_rdt_lifecycle(models).activate(engine, update_request, adapter_id)
+                except Exception as error:
+                    raise HTTPException(status_code=500, detail=str(error)) from error
+                models.lora_requests[lora_name] = LoRARequest(lora_name=lora_name, lora_int_id=adapter_id, lora_path=f"lora_rdt://{lora_name}", load_inplace=False)
+            return {"status": "active", "lora_int_id": adapter_id}
+
+        @app.post("/skyrl/v1/commit_lora_rdt_adapter")
+        async def _skyrl_commit_lora_rdt_adapter(request: Request):
+            body = await request.json()
+            lora_name, _, update_request = _parse_lora_rdt(body)
+            adapter_id = int(body["adapter_id"])
+            models = request.app.state.openai_serving_models
+            async with models.lora_resolver_lock[lora_name]:
+                try:
+                    await _lora_rdt_lifecycle(models).commit(engine, update_request, adapter_id)
+                except Exception as error:
+                    raise HTTPException(status_code=500, detail=str(error)) from error
+                getattr(models, "_skyrl_lora_rdt_previous_requests", {}).pop(lora_name, None)
+            return {"status": "committed"}
+
+        @app.post("/skyrl/v1/rollback_lora_rdt_adapter")
+        async def _skyrl_rollback_lora_rdt_adapter(request: Request):
+            body = await request.json()
+            lora_name, _, update_request = _parse_lora_rdt(body)
+            adapter_id = int(body["adapter_id"])
+            models = request.app.state.openai_serving_models
+            async with models.lora_resolver_lock[lora_name]:
+                try:
+                    await _lora_rdt_lifecycle(models).rollback(engine, update_request, adapter_id)
+                except Exception as error:
+                    raise HTTPException(status_code=500, detail=str(error)) from error
+                previous = getattr(models, "_skyrl_lora_rdt_previous_requests", {}).pop(lora_name, None)
+                if previous is None:
+                    models.lora_requests.pop(lora_name, None)
+                else:
+                    models.lora_requests[lora_name] = previous
+            return {"status": "rolled_back"}
 
         @app.post("/skyrl/v1/load_lora_adapter")
         async def _skyrl_load_lora_adapter(request: Request):
