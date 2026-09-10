@@ -2,6 +2,7 @@
 
 from .bridge_sources import (
     LoRABridgeSource,
+    LoRABridgeSourceLayout,
     extract_lora_bridge_sources,
     reconstruct_lora_bridge_tensors,
     validate_lora_bridge_source_layout,
@@ -16,7 +17,11 @@ from .contracts import (
     materialize_bf16_adapter_tensor,
 )
 from .producer import LoRardtProducer
-from .receiver import acknowledge_lora_generation, pull_and_stage_lora_adapter
+from .receiver import (
+    acknowledge_lora_generation,
+    pull_and_stage_lora_adapter,
+    pull_reconstruct_and_stage_lora_adapter,
+)
 from .vllm_adapter import (
     activate_staged_vllm_lora_model,
     build_vllm_lora_model,
@@ -29,6 +34,7 @@ __all__ = [
     "validate_lora_bridge_source_layout",
     "extract_lora_bridge_sources",
     "LoRABridgeSource",
+    "LoRABridgeSourceLayout",
     "LoRAAdapterGenerationState",
     "LoRAAdapterLayout",
     "LoRATensorSlice",
@@ -42,5 +48,6 @@ __all__ = [
     "discard_staged_vllm_lora_model",
     "materialize_bf16_adapter_tensor",
     "pull_and_stage_lora_adapter",
+    "pull_reconstruct_and_stage_lora_adapter",
     "stage_vllm_lora_model",
 ]

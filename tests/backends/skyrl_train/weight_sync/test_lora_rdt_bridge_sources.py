@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from skyrl.backends.skyrl_train.weight_sync.lora_rdt.bridge_sources import (
+    LoRABridgeSourceLayout,
     extract_lora_bridge_sources,
     reconstruct_lora_bridge_tensors,
     validate_lora_bridge_source_layout,
@@ -38,7 +39,10 @@ def test_extract_lora_bridge_sources_separates_fp32_storage_from_stable_metadata
     assert sources[0].hf_param_names == (
         "base_model.model.layers.0.mlp.gate_proj.lora_A.weight",
     )
-    assert validate_lora_bridge_source_layout(sources)[sources[0].key] == sources[0]
+    assert (
+        validate_lora_bridge_source_layout(sources)[(sources[0].key, 0, 0)]
+        == sources[0]
+    )
 
 
 def test_extract_lora_bridge_sources_rejects_duplicate_or_non_fp32_sources():
@@ -212,3 +216,28 @@ def test_reconstruct_lora_bridge_tensors_splits_gdn_with_bridge_layout_config():
     assert torch.equal(
         result["a.lora_B.weight"], torch.tensor([[10.0, 11.0], [22.0, 23.0]])
     )
+
+
+def test_bridge_source_layout_digest_tracks_rank_ownership_and_rejects_duplicates():
+    _, first_sources = extract_lora_bridge_sources([_record()], source_rank=0)
+    _, second_sources = extract_lora_bridge_sources(
+        [_record(tensor_parallel_rank=1)], source_rank=1
+    )
+    layout = LoRABridgeSourceLayout("adapter", (*first_sources, *second_sources))
+
+    _, remapped_sources = extract_lora_bridge_sources(
+        [_record(tensor_parallel_rank=1)], source_rank=2
+    )
+    assert (
+        layout.layout_digest
+        != LoRABridgeSourceLayout(
+            "adapter", (*first_sources, *remapped_sources)
+        ).layout_digest
+    )
+    with pytest.raises(ValueError, match="ownership"):
+        LoRABridgeSourceLayout(
+            "adapter",
+            (*first_sources, *first_sources),
+        )
+    with pytest.raises(ValueError, match="missing shard"):
+        LoRABridgeSourceLayout("adapter", first_sources)

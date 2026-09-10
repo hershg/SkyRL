@@ -1,6 +1,8 @@
 """Normalize Megatron-Bridge rank-local adapter records for LoRA RDT."""
 
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Literal, Mapping
 
 import torch
@@ -11,6 +13,7 @@ class LoRABridgeSource:
     """Content-independent metadata for one rank-local Bridge adapter source."""
 
     key: str
+    source_rank: int
     hf_param_names: tuple[str, ...]
     component: Literal["linear_in", "linear_out"]
     transform: Literal[
@@ -26,8 +29,39 @@ class LoRABridgeSource:
     transform_config: tuple[tuple[str, int | bool | None], ...]
 
 
+@dataclass(frozen=True)
+class LoRABridgeSourceLayout:
+    """Fixed rank-local Bridge source layout for one named LoRA adapter."""
+
+    adapter_name: str
+    sources: tuple[LoRABridgeSource, ...]
+    source_dtype: str = "float32"
+    layout_digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not self.adapter_name:
+            raise ValueError("LoRA Bridge layouts require a non-empty adapter name")
+        if self.source_dtype != "float32":
+            raise ValueError(
+                f"lora_rdt requires float32 Bridge sources, got {self.source_dtype!r}"
+            )
+        sources = tuple(sorted(self.sources, key=_bridge_source_sort_key))
+        if sources != self.sources:
+            raise ValueError("LoRA Bridge layout sources must be in canonical order")
+        validate_lora_bridge_source_layout(sources)
+        _validate_complete_lora_bridge_source_layout(sources)
+        payload = {
+            "adapter_name": self.adapter_name,
+            "source_dtype": self.source_dtype,
+            "sources": [asdict(source) for source in sources],
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        object.__setattr__(self, "layout_digest", hashlib.sha256(encoded).hexdigest())
+
+
 def extract_lora_bridge_sources(
     records: Iterable[Any],
+    source_rank: int = 0,
 ) -> tuple[dict[str, torch.Tensor], tuple[LoRABridgeSource, ...]]:
     """Detach tensors from Bridge records and return stable transport metadata.
 
@@ -36,6 +70,10 @@ def extract_lora_bridge_sources(
     a producer can expose only the tensors over NIXL and publish the metadata on
     the control plane.
     """
+    if source_rank < 0:
+        raise ValueError(
+            f"lora_rdt Bridge source rank must be non-negative, got {source_rank}"
+        )
     tensors: dict[str, torch.Tensor] = {}
     sources: list[LoRABridgeSource] = []
     for record in records:
@@ -55,6 +93,7 @@ def extract_lora_bridge_sources(
         sources.append(
             LoRABridgeSource(
                 key=key,
+                source_rank=source_rank,
                 hf_param_names=tuple(record.hf_param_names),
                 component=record.component,
                 transform=record.transform,
@@ -76,30 +115,83 @@ def extract_lora_bridge_sources(
 
 def validate_lora_bridge_source_layout(
     sources: Iterable[LoRABridgeSource],
-) -> Mapping[str, LoRABridgeSource]:
+) -> Mapping[tuple[str, int, int], LoRABridgeSource]:
     """Validate a fixed Bridge source layout before publishing any generation."""
     source_tuple = tuple(sources)
-    layout = {source.key: source for source in source_tuple}
-    if not layout:
+    if not source_tuple:
         raise ValueError("lora_rdt requires at least one Bridge adapter source")
+    layout = {
+        (source.key, source.tensor_parallel_rank, source.expert_parallel_rank): source
+        for source in source_tuple
+    }
     if len(layout) != len(source_tuple):
-        raise ValueError("lora_rdt Bridge source keys must be unique")
-    for source in layout.values():
-        if any(dimension <= 0 for dimension in source.shape):
-            raise ValueError(
-                f"Bridge source {source.key!r} has invalid shape {source.shape!r}"
-            )
-        if source.tensor_parallel_size <= 0 or source.expert_parallel_size <= 0:
-            raise ValueError(f"Bridge source {source.key!r} has invalid parallel sizes")
-        if not 0 <= source.tensor_parallel_rank < source.tensor_parallel_size:
-            raise ValueError(
-                f"Bridge source {source.key!r} has invalid tensor-parallel rank"
-            )
-        if not 0 <= source.expert_parallel_rank < source.expert_parallel_size:
-            raise ValueError(
-                f"Bridge source {source.key!r} has invalid expert-parallel rank"
-            )
+        raise ValueError("lora_rdt Bridge source shard ownership must be unique")
+    for source in source_tuple:
+        _validate_lora_bridge_source(source)
     return layout
+
+
+def _validate_lora_bridge_source(source: LoRABridgeSource) -> None:
+    """Validate metadata that is meaningful for an individual local shard."""
+    if source.source_rank < 0:
+        raise ValueError(f"Bridge source {source.key!r} has invalid source rank")
+    if any(dimension <= 0 for dimension in source.shape):
+        raise ValueError(
+            f"Bridge source {source.key!r} has invalid shape {source.shape!r}"
+        )
+    if source.tensor_parallel_size <= 0 or source.expert_parallel_size <= 0:
+        raise ValueError(f"Bridge source {source.key!r} has invalid parallel sizes")
+    if not 0 <= source.tensor_parallel_rank < source.tensor_parallel_size:
+        raise ValueError(
+            f"Bridge source {source.key!r} has invalid tensor-parallel rank"
+        )
+    if not 0 <= source.expert_parallel_rank < source.expert_parallel_size:
+        raise ValueError(
+            f"Bridge source {source.key!r} has invalid expert-parallel rank"
+        )
+
+
+def _validate_complete_lora_bridge_source_layout(
+    sources: Iterable[LoRABridgeSource],
+) -> None:
+    """Require every TP/EP shard before a receiver can accept the layout."""
+    grouped: dict[str, list[LoRABridgeSource]] = {}
+    for source in sources:
+        grouped.setdefault(source.key, []).append(source)
+    for key, group in grouped.items():
+        first = group[0]
+        if any(
+            source.hf_param_names != first.hf_param_names
+            or source.component != first.component
+            or source.transform != first.transform
+            or source.tensor_parallel_axis != first.tensor_parallel_axis
+            or source.tensor_parallel_size != first.tensor_parallel_size
+            or source.expert_parallel_axis != first.expert_parallel_axis
+            or source.expert_parallel_size != first.expert_parallel_size
+            or source.transform_config != first.transform_config
+            for source in group
+        ):
+            raise ValueError(f"Bridge source {key!r} has inconsistent shard metadata")
+        expected = {
+            (tensor_parallel_rank, expert_parallel_rank)
+            for tensor_parallel_rank in range(first.tensor_parallel_size)
+            for expert_parallel_rank in range(first.expert_parallel_size)
+        }
+        actual = {
+            (source.tensor_parallel_rank, source.expert_parallel_rank)
+            for source in group
+        }
+        if actual != expected:
+            raise ValueError(f"Bridge source {key!r} is missing shard ownership")
+
+
+def _bridge_source_sort_key(source: LoRABridgeSource) -> tuple[str, int, int, int]:
+    return (
+        source.key,
+        source.expert_parallel_rank,
+        source.tensor_parallel_rank,
+        source.source_rank,
+    )
 
 
 def reconstruct_lora_bridge_tensors(
@@ -110,8 +202,7 @@ def reconstruct_lora_bridge_tensors(
 
     ``tensors`` keys are ``(global_param_name, tp_rank, ep_rank)``. The caller
     obtains those tensors through NIXL; this function only performs deterministic
-    local assembly. Fused QKV and GDN sources are intentionally rejected here
-    because their conversion needs the exact Megatron transformer configuration.
+    local assembly using the immutable Bridge transformer configuration.
     """
     grouped: dict[str, list[LoRABridgeSource]] = {}
     for source in sources:
