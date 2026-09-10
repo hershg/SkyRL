@@ -21,7 +21,9 @@ from .receiver import (
     acknowledge_lora_generation,
     pull_and_stage_lora_adapter,
     pull_reconstruct_and_stage_lora_adapter,
+    resolve_lora_rdt_producers,
 )
+from .rendezvous import LoRardtProducerRendezvous
 from .vllm_adapter import (
     activate_staged_vllm_lora_model,
     build_vllm_lora_model,
@@ -39,6 +41,7 @@ __all__ = [
     "LoRAAdapterLayout",
     "LoRATensorSlice",
     "LoRardtProducer",
+    "LoRardtProducerRendezvous",
     "LoRATransferInitInfo",
     "LoRAUpdateRequest",
     "acknowledge_lora_generation",
@@ -49,5 +52,6 @@ __all__ = [
     "materialize_bf16_adapter_tensor",
     "pull_and_stage_lora_adapter",
     "pull_reconstruct_and_stage_lora_adapter",
+    "resolve_lora_rdt_producers",
     "stage_vllm_lora_model",
 ]

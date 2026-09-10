@@ -108,6 +108,17 @@ def _validate_request(layout: LoRAAdapterLayout, request: LoRAUpdateRequest) -> 
         raise ValueError("LoRA request source dtype does not match receiver layout")
 
 
+def resolve_lora_rdt_producers(
+    actor_names_by_rank: Mapping[int, str],
+    namespace: str | None,
+) -> dict[int, Any]:
+    """Resolve the validated named NIXL producer actors for one update."""
+    return {
+        source_rank: ray.get_actor(actor_name, namespace=namespace)
+        for source_rank, actor_name in actor_names_by_rank.items()
+    }
+
+
 def pull_reconstruct_and_stage_lora_adapter(
     producers: Mapping[int, Any],
     layout: "LoRABridgeSourceLayout",
