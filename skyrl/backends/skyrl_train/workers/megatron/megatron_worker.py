@@ -1772,6 +1772,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         from skyrl.backends.skyrl_train.weight_sync.lora_rdt.publication import (
             LoRardtPublicationPlanner,
             make_lora_rdt_producer_name,
+            publish_lora_sources,
         )
 
         if not isinstance(inference_engine_client, RemoteInferenceClient):
@@ -1836,13 +1837,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             planners[lora_name] = planner
             self._lora_rdt_planners = planners
         publication = planner.plan(records, gathered_sources, actor_names)
-        ray.get(
-            producer.publish.remote(
-                publication.request,
-                publication.local_tensors,
-                len(inference_engine_client.server_urls),
-            )
-        )
+        publish_lora_sources(producer, publication, SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
         publication_error = None
         if rank == 0:
             target_modules = sorted(
