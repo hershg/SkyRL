@@ -25,16 +25,11 @@ def build_vllm_lora_model(
         raise ValueError(f"lora_rdt requires bfloat16 inference buffers, got {dtype}")
     for name, tensor in source_tensors.items():
         if tensor.dtype is not torch.float32:
-            raise ValueError(
-                f"lora_rdt requires float32 source tensor {name!r}, got {tensor.dtype}"
-            )
+            raise ValueError(f"lora_rdt requires float32 source tensor {name!r}, got {tensor.dtype}")
     peft_helper = PEFTHelper.from_dict(dict(adapter_config))
     return LoRAModel.from_lora_tensors(
         adapter_id,
-        {
-            name: tensor.to(device=device, dtype=dtype).clone()
-            for name, tensor in source_tensors.items()
-        },
+        {name: tensor.to(device=device, dtype=dtype).clone() for name, tensor in source_tensors.items()},
         peft_helper,
         device=device,
         dtype=dtype,
@@ -50,6 +45,10 @@ def stage_vllm_lora_model(model_runner: Any, lora_model: Any) -> None:
     adapter_manager = manager._adapter_manager
     if lora_model.id in manager.list_adapters():
         raise ValueError(f"LoRA adapter id {lora_model.id} is already registered")
+    if len(manager.list_adapters()) >= adapter_manager.capacity:
+        raise ValueError("lora_rdt requires a free registered adapter slot to retain the previous generation")
+    if len(manager.list_adapters()) >= adapter_manager.lora_slots:
+        raise ValueError("lora_rdt requires a free GPU adapter slot to retain the previous generation")
     if not adapter_manager.add_adapter(lora_model):
         raise RuntimeError(f"vLLM declined LoRA adapter id {lora_model.id}")
 
@@ -59,8 +58,8 @@ def activate_staged_vllm_lora_model(model_runner: Any, adapter_id: int) -> None:
     manager = _get_vllm_lora_manager(model_runner)
     if adapter_id not in manager.list_adapters():
         raise ValueError(f"LoRA adapter id {adapter_id} was not staged")
-    if not manager._adapter_manager.activate_adapter(adapter_id):
-        raise RuntimeError(f"vLLM declined activation for LoRA adapter id {adapter_id}")
+    # vLLM returns False when this adapter is already active, including rollback.
+    manager._adapter_manager.activate_adapter(adapter_id)
 
 
 def discard_staged_vllm_lora_model(model_runner: Any, adapter_id: int) -> None:

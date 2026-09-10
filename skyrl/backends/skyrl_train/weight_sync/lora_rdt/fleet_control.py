@@ -36,29 +36,28 @@ class LoRardtFleetTransaction:
         if isinstance(staged, BaseException):
             await self._rollback_all(rollback)
             raise staged
-        paused = False
         try:
             await pause()
-            paused = True
+        except BaseException:
+            await self._rollback_all(rollback)
+            raise
+        resume_after_update = False
+        try:
             activated = await self._run_phase(activate)
             if isinstance(activated, BaseException):
                 await self._rollback_all(rollback)
+                resume_after_update = True
                 raise activated
+            resume_after_update = True
             committed = await self._run_phase(commit)
             if isinstance(committed, BaseException):
                 # Old adapters are retained through activation. A commit failure
                 # cannot expose a mixed generation, but it must stop a later
                 # replacement until the retained old buffer is reconciled.
-                raise RuntimeError(
-                    "LoRA RDT activated everywhere but failed to retire an old adapter"
-                ) from committed
+                raise RuntimeError("LoRA RDT activated everywhere but failed to retire an old adapter") from committed
             return activated
-        except BaseException:
-            if not paused:
-                await self._rollback_all(rollback)
-            raise
         finally:
-            if paused:
+            if resume_after_update:
                 await resume()
 
     async def _run_phase(self, operation: ServerCall) -> Mapping[str, Any] | BaseException:
