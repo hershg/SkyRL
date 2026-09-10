@@ -1,4 +1,5 @@
 import gc
+import hashlib
 import os
 import shutil
 from collections import defaultdict
@@ -121,6 +122,33 @@ if TYPE_CHECKING:
         InferenceEngineInterface,
     )
     from skyrl.train.config.config import InferenceEngineConfig
+
+
+def _compact_adapter_state(
+    adapter_state: Dict[str, torch.Tensor],
+) -> Optional[Dict[str, torch.Tensor]]:
+    canonical_tensors = {}
+    identities = {}
+    logical_bytes = 0
+    unique_bytes = 0
+    for name, tensor in adapter_state.items():
+        tensor = tensor.contiguous()
+        logical_bytes += tensor.nbytes
+        identity = (
+            tensor.dtype,
+            tuple(tensor.shape),
+            hashlib.sha256(tensor.view(torch.uint8).numpy()).digest(),
+        )
+        if identity not in canonical_tensors:
+            canonical_tensors[identity] = tensor
+            unique_bytes += tensor.nbytes
+        identities[name] = identity
+    if unique_bytes * 2 >= logical_bytes:
+        return None
+    canonical_tensors = {
+        identity: tensor.clone() for identity, tensor in canonical_tensors.items()
+    }
+    return {name: canonical_tensors[identity] for name, identity in identities.items()}
 
 
 class MegatronWeightExtractor(WeightExtractor):
@@ -1648,7 +1676,17 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 base_model_name_or_path=base_model_name_or_path,
             )
 
-            save_file(adapter_state, os.path.join(lora_sync_path, "adapter_model.safetensors"))
+            compact_state = _compact_adapter_state(adapter_state)
+            safetensors_path = os.path.join(lora_sync_path, "adapter_model.safetensors")
+            if compact_state is None:
+                save_file(adapter_state, safetensors_path)
+            else:
+                compact_path = os.path.join(lora_sync_path, "adapter_model.bin")
+                temporary_path = compact_path + ".tmp"
+                torch.save(compact_state, temporary_path)
+                os.replace(temporary_path, compact_path)
+                if os.path.exists(safetensors_path):
+                    os.remove(safetensors_path)
             with open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
                 json.dump(adapter_config, f, ensure_ascii=False, indent=4)
 
