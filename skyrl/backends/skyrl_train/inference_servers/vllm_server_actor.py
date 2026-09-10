@@ -461,7 +461,12 @@ class VLLMServerActor(ServerActorProtocol):
                     lora_path=lora_path,
                     load_inplace=True,
                 )
-                await models.engine_client.add_lora(lora_request)
+                engine_loaded = await models.engine_client.add_lora(lora_request)
+                if not engine_loaded:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"vLLM did not load LoRA adapter {lora_name!r} on every engine rank.",
+                    )
                 lora_request.load_inplace = False
                 models.lora_requests[lora_name] = lora_request
 
@@ -469,6 +474,7 @@ class VLLMServerActor(ServerActorProtocol):
                 "status": "ok",
                 "lora_name": lora_name,
                 "lora_int_id": lora_int_id,
+                "engine_loaded": engine_loaded,
             }
 
         # NOTE (sumanthrh): We use a custom generate endpoint /skyrl/v1/generate because the native

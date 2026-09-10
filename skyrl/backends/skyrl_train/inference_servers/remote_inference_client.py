@@ -1313,7 +1313,9 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
         results = await asyncio.gather(*[_load_on_server(url) for url in self.server_urls])
 
-        logger.info(f"Loaded LoRA adapter '{lora_name}' from {lora_path}")
+        logger.info(
+            f"Loaded LoRA adapter '{lora_name}' from {lora_path}; per-engine responses: {results}"
+        )
 
         return {url: resp for url, resp in results}
 
