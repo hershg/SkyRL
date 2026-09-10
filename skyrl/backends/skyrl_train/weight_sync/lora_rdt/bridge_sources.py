@@ -38,6 +38,46 @@ class LoRABridgeSourceLayout:
     source_dtype: str = "float32"
     layout_digest: str = field(init=False)
 
+    def to_json_dict(self) -> dict[str, Any]:
+        """Return JSON-safe control-plane metadata without adapter values."""
+        return {
+            "adapter_name": self.adapter_name,
+            "source_dtype": self.source_dtype,
+            "layout_digest": self.layout_digest,
+            "sources": [asdict(source) for source in self.sources],
+        }
+
+    @classmethod
+    def from_json_dict(cls, data: Mapping[str, Any]) -> "LoRABridgeSourceLayout":
+        """Reconstruct and verify immutable layout metadata from the control plane."""
+        source_layout = cls(
+            adapter_name=data["adapter_name"],
+            source_dtype=data["source_dtype"],
+            sources=tuple(
+                LoRABridgeSource(
+                    key=source["key"],
+                    source_rank=source["source_rank"],
+                    hf_param_names=tuple(source["hf_param_names"]),
+                    component=source["component"],
+                    transform=source["transform"],
+                    shape=tuple(source["shape"]),
+                    tensor_parallel_axis=source["tensor_parallel_axis"],
+                    tensor_parallel_rank=source["tensor_parallel_rank"],
+                    tensor_parallel_size=source["tensor_parallel_size"],
+                    expert_parallel_axis=source["expert_parallel_axis"],
+                    expert_parallel_rank=source["expert_parallel_rank"],
+                    expert_parallel_size=source["expert_parallel_size"],
+                    transform_config=tuple(
+                        (name, value) for name, value in source["transform_config"]
+                    ),
+                )
+                for source in data["sources"]
+            ),
+        )
+        if data["layout_digest"] != source_layout.layout_digest:
+            raise ValueError("LoRA Bridge layout digest does not match its metadata")
+        return source_layout
+
     def __post_init__(self) -> None:
         if not self.adapter_name:
             raise ValueError("LoRA Bridge layouts require a non-empty adapter name")

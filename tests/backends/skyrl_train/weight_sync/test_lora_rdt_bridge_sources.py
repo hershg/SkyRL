@@ -241,3 +241,18 @@ def test_bridge_source_layout_digest_tracks_rank_ownership_and_rejects_duplicate
         )
     with pytest.raises(ValueError, match="missing shard"):
         LoRABridgeSourceLayout("adapter", first_sources)
+
+
+def test_bridge_source_layout_round_trips_over_the_control_plane_and_verifies_digest():
+    _, first_sources = extract_lora_bridge_sources([_record()], source_rank=0)
+    _, second_sources = extract_lora_bridge_sources(
+        [_record(tensor_parallel_rank=1)], source_rank=1
+    )
+    layout = LoRABridgeSourceLayout("adapter", (*first_sources, *second_sources))
+    payload = layout.to_json_dict()
+
+    assert LoRABridgeSourceLayout.from_json_dict(payload) == layout
+
+    payload["sources"][0]["source_rank"] = 7
+    with pytest.raises(ValueError, match="digest"):
+        LoRABridgeSourceLayout.from_json_dict(payload)
