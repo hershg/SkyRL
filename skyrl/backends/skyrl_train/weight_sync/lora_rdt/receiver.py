@@ -5,6 +5,10 @@ from typing import TYPE_CHECKING, Any, Mapping
 import ray
 import torch
 
+from skyrl.backends.skyrl_train.weight_sync.lora_layout import (
+    convert_moe_experts_lora_to_vllm,
+)
+
 from .contracts import LoRAAdapterLayout, LoRAUpdateRequest
 from .vllm_adapter import build_vllm_lora_model, stage_vllm_lora_model
 
@@ -173,7 +177,13 @@ def pull_reconstruct_and_stage_lora_adapter(
         if key in tensors:
             raise ValueError(f"LoRA Bridge pull returned duplicate shard {key!r}")
         tensors[key] = tensor
-    peft_tensors = reconstruct_lora_bridge_tensors(layout.sources, tensors)
+    bridge_tensors = reconstruct_lora_bridge_tensors(layout.sources, tensors)
+    peft_tensors = convert_moe_experts_lora_to_vllm(
+        {
+            name if name.startswith("base_model.model.") else f"base_model.model.{name}": tensor
+            for name, tensor in bridge_tensors.items()
+        }
+    )
     model = build_vllm_lora_model(
         adapter_id=adapter_id,
         adapter_config=adapter_config,
