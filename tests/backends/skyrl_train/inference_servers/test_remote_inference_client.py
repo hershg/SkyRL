@@ -233,10 +233,12 @@ def create_mock_vllm_server(server_id: int) -> FastAPI:
         return {"prompt": "hello world"}
 
     # Control plane endpoints
+    @app.post("/skyrl/v1/pause_lora_rdt")
     @app.post("/pause")
     async def pause(request: Request, mode: str = "abort", clear_cache: str = "true"):
         return {"status": "paused", "server_id": server_id, "mode": mode, "clear_cache": clear_cache}
 
+    @app.post("/skyrl/v1/resume_lora_rdt")
     @app.post("/resume")
     async def resume():
         return {"status": "resumed", "server_id": server_id}

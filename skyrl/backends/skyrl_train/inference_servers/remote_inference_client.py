@@ -1302,11 +1302,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
         return dict(await LoRardtFleetTransaction(self.server_urls).replace(
             stage=stage,
-            pause=lambda: self.pause(mode=PauseMode.WAIT),
+            pause=lambda: self._call_all_servers("/skyrl/v1/pause_lora_rdt"),
             activate=lambda url: call_phase("/skyrl/v1/activate_lora_rdt_adapter", url),
             rollback=lambda url: call_phase("/skyrl/v1/rollback_lora_rdt_adapter", url),
             commit=lambda url: call_phase("/skyrl/v1/commit_lora_rdt_adapter", url),
-            resume=self.resume,
+            resume=lambda: self._call_all_servers("/skyrl/v1/resume_lora_rdt"),
         ))
 
     async def load_lora_adapter(

@@ -47,7 +47,12 @@ from skyrl.backends.skyrl_train.weight_sync.lora_rdt import (
     LoRardtServerLifecycle,
     LoRAUpdateRequest,
 )
+from skyrl.backends.skyrl_train.weight_sync.lora_rdt.request_gate import (
+    LoRardtAdmissionGate,
+    LoRardtAdmissionMiddleware,
+)
 from skyrl.env_vars import (
+    SKYRL_FORWARDING_INFERENCE_TIMEOUT_SEC,
     SKYRL_HTTP_CONNECTION_LIMIT,
     SKYRL_VLLM_DP_PORT_OFFSET,
     SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S,
@@ -407,6 +412,31 @@ class VLLMServerActor(ServerActorProtocol):
         # Most weight-sync endpoints are registered by vLLM dev mode. SkyRL
         # adds /fetch_weights because checkpoint-delta pulls and applies
         # payloads before the paused /update_weights reload.
+
+        gate = LoRardtAdmissionGate()
+        app.state.lora_rdt_admission_gate = gate
+        app.add_middleware(LoRardtAdmissionMiddleware, gate=gate)
+
+        @app.post("/skyrl/v1/pause_lora_rdt")
+        async def _pause_lora_rdt():
+            gate.close()
+            try:
+                async with asyncio.timeout(SKYRL_FORWARDING_INFERENCE_TIMEOUT_SEC):
+                    await gate.wait_until_idle()
+            except TimeoutError as error:
+                gate.open()
+                raise HTTPException(status_code=504, detail="Timed out draining LoRA RDT requests") from error
+            except asyncio.CancelledError:
+                gate.open()
+                raise
+            await engine.pause_generation(mode="wait", clear_cache=False)
+            return {"status": "paused"}
+
+        @app.post("/skyrl/v1/resume_lora_rdt")
+        async def _resume_lora_rdt():
+            await engine.resume_generation()
+            gate.open()
+            return {"status": "resumed"}
 
         @app.post("/reset_prefix_cache")
         async def _reset_prefix_cache(request: Request):
