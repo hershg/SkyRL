@@ -15,16 +15,10 @@ class _Engine:
         self.calls = []
         self.fail_methods = set(fail_methods)
 
-    async def pause_generation(self, mode):
-        self.calls.append(("pause", mode))
-
     async def collective_rpc(self, method, kwargs):
         self.calls.append((method, kwargs))
         if method in self.fail_methods:
             raise RuntimeError(f"forced {method} failure")
-
-    async def resume_generation(self):
-        self.calls.append(("resume",))
 
 
 def _rendezvous():
@@ -64,54 +58,66 @@ def _request(generation=1):
 
 
 @pytest.mark.asyncio
-async def test_server_lifecycle_drains_stages_activates_and_retires_old_adapter():
+async def test_server_lifecycle_commits_only_an_activated_generation():
     lifecycle = LoRardtServerLifecycle()
     engine = _Engine()
     lifecycle._active_ids["adapter"] = 3
 
-    assert await lifecycle.replace(engine, _rendezvous(), _request(), 4, {"r": 2}) == 4
+    await lifecycle.stage(engine, _rendezvous(), _request(), 4, {"r": 2})
+    with pytest.raises(ValueError, match="has not been activated"):
+        await lifecycle.commit(engine, _request(), 4)
+    assert lifecycle.get_active_adapter_id("adapter") == 3
+
+    await lifecycle.activate(engine, _request(), 4)
+    assert await lifecycle.commit(engine, _request(), 4)
     assert lifecycle.get_active_adapter_id("adapter") == 4
     assert [call[0] for call in engine.calls] == [
-        "pause",
         "stage_lora_rdt_adapter",
         "activate_lora_rdt_adapter",
         "remove_lora_rdt_adapter",
-        "resume",
     ]
-    assert engine.calls[0] == ("pause", "wait")
-    assert engine.calls[1][1]["adapter_id"] == 4
 
 
 @pytest.mark.asyncio
-async def test_server_lifecycle_rolls_back_staged_adapter_before_resuming():
+async def test_server_lifecycle_rolls_back_without_replaying_cleanup():
     lifecycle = LoRardtServerLifecycle()
     lifecycle._active_ids["adapter"] = 3
     engine = _Engine(fail_methods={"activate_lora_rdt_adapter"})
+    await lifecycle.stage(engine, _rendezvous(), _request(), 4, {"r": 2})
 
     with pytest.raises(RuntimeError, match="forced"):
-        await lifecycle.replace(engine, _rendezvous(), _request(), 4, {"r": 2})
+        await lifecycle.activate(engine, _request(), 4)
+    assert await lifecycle.rollback(engine, _request(), 4)
+    assert not await lifecycle.rollback(engine, _request(), 4)
 
     assert lifecycle.get_active_adapter_id("adapter") == 3
     assert [call[0] for call in engine.calls] == [
-        "pause",
         "stage_lora_rdt_adapter",
         "activate_lora_rdt_adapter",
         "restore_lora_rdt_adapter",
         "discard_lora_rdt_adapter",
-        "resume",
     ]
 
 
 @pytest.mark.asyncio
-async def test_server_lifecycle_leaves_engine_paused_when_rollback_fails():
+async def test_terminal_replay_preserves_a_newer_staging_transaction():
     lifecycle = LoRardtServerLifecycle()
-    lifecycle._active_ids["adapter"] = 3
-    engine = _Engine(fail_methods={"activate_lora_rdt_adapter", "restore_lora_rdt_adapter"})
+    engine = _Engine()
+    await lifecycle.stage(engine, _rendezvous(), _request(), 4, {"r": 2})
+    await lifecycle.activate(engine, _request(), 4)
+    assert await lifecycle.commit(engine, _request(), 4)
+    await lifecycle.stage(engine, _rendezvous(), _request(2), 5, {"r": 2})
+    before = list(engine.calls)
 
-    with pytest.raises(LoRardtRollbackError, match="remains paused"):
-        await lifecycle.replace(engine, _rendezvous(), _request(), 4, {"r": 2})
+    assert not await lifecycle.commit(engine, _request(), 4)
+    with pytest.raises(ValueError, match="already committed"):
+        await lifecycle.rollback(engine, _request(), 4)
+    with pytest.raises(ValueError, match="does not match"):
+        await lifecycle.rollback(engine, _request(), 5)
 
-    assert "resume" not in [call[0] for call in engine.calls]
+    assert engine.calls == before
+    assert lifecycle.get_active_adapter_id("adapter") == 4
+    assert lifecycle._staged["adapter"][:2] == (_request(2), 5)
 
 
 @pytest.mark.asyncio

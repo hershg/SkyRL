@@ -526,10 +526,11 @@ class VLLMServerActor(ServerActorProtocol):
             models = request.app.state.openai_serving_models
             async with models.lora_resolver_lock[lora_name]:
                 try:
-                    await _lora_rdt_lifecycle(models).commit(engine, update_request, adapter_id)
+                    changed = await _lora_rdt_lifecycle(models).commit(engine, update_request, adapter_id)
                 except Exception as error:
                     raise HTTPException(status_code=500, detail=str(error)) from error
-                getattr(models, "_skyrl_lora_rdt_previous_requests", {}).pop(lora_name, None)
+                if changed:
+                    getattr(models, "_skyrl_lora_rdt_previous_requests", {}).pop(lora_name, None)
             return {"status": "committed"}
 
         @app.post("/skyrl/v1/rollback_lora_rdt_adapter")
@@ -540,14 +541,15 @@ class VLLMServerActor(ServerActorProtocol):
             models = request.app.state.openai_serving_models
             async with models.lora_resolver_lock[lora_name]:
                 try:
-                    await _lora_rdt_lifecycle(models).rollback(engine, update_request, adapter_id)
+                    changed = await _lora_rdt_lifecycle(models).rollback(engine, update_request, adapter_id)
                 except Exception as error:
                     raise HTTPException(status_code=500, detail=str(error)) from error
-                previous = getattr(models, "_skyrl_lora_rdt_previous_requests", {}).pop(lora_name, None)
-                if previous is None:
-                    models.lora_requests.pop(lora_name, None)
-                else:
-                    models.lora_requests[lora_name] = previous
+                if changed:
+                    previous = getattr(models, "_skyrl_lora_rdt_previous_requests", {}).pop(lora_name, None)
+                    if previous is None:
+                        models.lora_requests.pop(lora_name, None)
+                    else:
+                        models.lora_requests[lora_name] = previous
             return {"status": "rolled_back"}
 
         @app.post("/skyrl/v1/load_lora_adapter")
