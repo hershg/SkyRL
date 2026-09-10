@@ -212,9 +212,26 @@ def validate_megatron_cfg(cfg: SkyRLTrainConfig):
         "nccl",
         "delta",
         "sharded_rdt",
-    }, "only nccl, delta and sharded_rdt are supported for megatron weight sync"
+        "lora_rdt",
+    }, "only nccl, delta, sharded_rdt and lora_rdt are supported for megatron weight sync"
     assert ie_cfg.backend == "vllm", "only vllm is supported for with megatron"
     assert cfg.trainer.critic.model.path is None, "only GRPO training is currently supported for megatron"
+
+    if ie_cfg.weight_sync_backend == "lora_rdt":
+        lora = cfg.trainer.policy.model.lora
+        megatron = cfg.trainer.policy.megatron_config
+        if cfg.trainer.placement.colocate_all:
+            raise ValueError("lora_rdt requires non-colocated training and inference")
+        if lora.rank <= 0 or megatron.lora_config.merge_lora:
+            raise ValueError("lora_rdt requires rank > 0 and merge_lora=false")
+        if lora.max_loras < 2:
+            raise ValueError("lora_rdt requires max_loras >= 2 for staging")
+        if megatron.pipeline_model_parallel_size != 1 or ie_cfg.pipeline_parallel_size != 1:
+            raise ValueError("lora_rdt currently supports pipeline parallel size 1 only")
+        if cfg.trainer.mtp.enabled or ie_cfg.fully_sharded_loras:
+            raise ValueError("lora_rdt does not support MTP or fully_sharded_loras")
+        if megatron.transformer_config_kwargs.get("fp8"):
+            raise ValueError("lora_rdt requires FP32 LoRA publication; FP8 is unsupported")
 
     policy_cfg = cfg.trainer.policy
     policy_fp8_param = is_fp8_enabled(policy_cfg.megatron_config.transformer_config_kwargs.get("fp8_param"))

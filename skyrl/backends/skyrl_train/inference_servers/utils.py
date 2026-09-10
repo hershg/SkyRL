@@ -217,12 +217,11 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
 
     # The sharded_rdt backend pulls weight slices from a named trainer actor over
     # Ray's NIXL tensor transport, so the inference workers MUST be Ray actors.
-    if get_transfer_strategy(ie_cfg.weight_sync_backend, cfg.trainer.placement.colocate_all) == "sharded_rdt":
+    if ie_cfg.weight_sync_backend in {"sharded_rdt", "lora_rdt"}:
         if cfg.trainer.placement.colocate_all:
             raise ValueError(
-                "weight_sync_backend='sharded_rdt' requires non-colocated training/"
-                "inference (placement.colocate_all=false); workers pull from a "
-                "separate named trainer actor over NIXL."
+                "NIXL/RDMA weight sync requires non-colocated training/inference "
+                "(placement.colocate_all=false)."
             )
         args.distributed_executor_backend = "ray"
 

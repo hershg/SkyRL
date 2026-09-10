@@ -118,6 +118,15 @@ from skyrl.utils.tok import get_tokenizer
 
 patch_mla_thd_v_pad()
 
+
+class _LoRardtNoopSender:
+    """Carries common sender capability flags for direct LoRA RDT publication."""
+
+    handles_prefix_cache_reset = False
+    force_disable_expandable_segments = False
+    empty_cache_after_send = True
+
+
 if TYPE_CHECKING:
     from skyrl.backends.skyrl_train.inference_servers.base import (
         InferenceEngineInterface,
@@ -1614,6 +1623,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 param_group["lr"] = learning_rate
 
     async def init_weight_sync_state(self, inference_engine_client, inference_engine_cfg: "InferenceEngineConfig"):
+        # lora_rdt publishes only rank-local adapter snapshots. It must not
+        # initialize the ordinary whole-model weight-transfer sender.
+        if inference_engine_cfg.weight_sync_backend == "lora_rdt":
+            self._weight_sync_inference_client = inference_engine_client
+            self._weight_transfer_sender = _LoRardtNoopSender()
+            torch.distributed.barrier()
+            return
+
         # Initialize the weight extractor BEFORE super(): a strategy that
         # rendezvouses at init (sharded_rdt) is handed this extractor by
         # create_sender. It only depends on
@@ -1734,6 +1751,138 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         torch.distributed.barrier()
 
+    async def _publish_lora_rdt_adapter(self, inference_engine_client, lora_name: str) -> None:
+        """Publish one rank-local Bridge snapshot through named NIXL sidecars."""
+        from megatron.bridge.models.conversion.peft_bridge import (
+            build_adapter_config_dict,
+            infer_target_modules_from_adapter_weights,
+        )
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+            RemoteInferenceClient,
+        )
+        from skyrl.backends.skyrl_train.weight_sync.lora_rdt.bridge_sources import (
+            LoRABridgeSourceLayout,
+            extract_lora_bridge_sources,
+        )
+        from skyrl.backends.skyrl_train.weight_sync.lora_rdt.producer import (
+            LoRardtProducer,
+        )
+        from skyrl.backends.skyrl_train.weight_sync.lora_rdt.publication import (
+            LoRardtPublicationPlanner,
+            make_lora_rdt_producer_name,
+        )
+
+        if not isinstance(inference_engine_client, RemoteInferenceClient):
+            raise TypeError("lora_rdt requires RemoteInferenceClient")
+        export = getattr(self.bridge, "export_local_adapter_weights", None)
+        if export is None:
+            raise RuntimeError(
+                "lora_rdt requires Megatron-Bridge export_local_adapter_weights; "
+                "install the SkyRL Bridge fork before enabling this backend"
+            )
+        rank = torch.distributed.get_rank()
+        records = list(export(self.actor_module))
+        _, local_sources = extract_lora_bridge_sources(records, source_rank=rank)
+        gathered_sources = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered_sources, local_sources)
+        sources = tuple(
+            sorted(
+                (source for rank_sources in gathered_sources for source in rank_sources),
+                key=lambda source: (
+                    source.key,
+                    source.expert_parallel_rank,
+                    source.tensor_parallel_rank,
+                    source.source_rank,
+                ),
+            )
+        )
+        layout = LoRABridgeSourceLayout(lora_name, sources)
+        namespace = ray.get_runtime_context().namespace
+        actor_name = make_lora_rdt_producer_name(layout, rank)
+        try:
+            producer = ray.get_actor(actor_name, namespace=namespace)
+        except ValueError:
+            env_vars = {
+                key: os.environ[key]
+                for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "NCCL_CUMEM_ENABLE", "VLLM_NCCL_SO_PATH", "PATH")
+                if key in os.environ
+            }
+            gpu_ids = ray.get_gpu_ids()
+            if gpu_ids:
+                env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+                env_vars["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[0])
+            producer = ray.remote(LoRardtProducer).options(
+                name=actor_name,
+                namespace=namespace,
+                num_cpus=0,
+                num_gpus=0,
+                max_concurrency=len(inference_engine_client.server_urls) + 4,
+                enable_tensor_transport=True,
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=ray.get_runtime_context().get_node_id(), soft=False
+                ),
+                runtime_env={"env_vars": env_vars},
+            ).remote(rank, layout)
+        actor_names = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(actor_names, actor_name)
+        planner = getattr(self, "_lora_rdt_planners", {}).get(lora_name)
+        if planner is None:
+            planner = LoRardtPublicationPlanner(
+                lora_name, rank, len(inference_engine_client.server_urls), namespace
+            )
+            planners = getattr(self, "_lora_rdt_planners", {})
+            planners[lora_name] = planner
+            self._lora_rdt_planners = planners
+        publication = planner.plan(records, gathered_sources, actor_names)
+        ray.get(
+            producer.publish.remote(
+                publication.request,
+                publication.local_tensors,
+                len(inference_engine_client.server_urls),
+            )
+        )
+        publication_error = None
+        if rank == 0:
+            target_modules = sorted(
+                set(
+                    infer_target_modules_from_adapter_weights(
+                        f"base_model.model.{name}"
+                        for source in publication.layout.sources
+                        for name in source.hf_param_names
+                    )
+                ) - {"base_layer"}
+            )
+            adapter_config = build_adapter_config_dict(
+                self.lora_cls,
+                target_modules=target_modules,
+                base_model_name_or_path=str(getattr(self, "_logical_model_path", "")),
+            )
+            producers = [ray.get_actor(name, namespace=namespace) for name in actor_names]
+            try:
+                await inference_engine_client.load_lora_rdt_adapter(
+                    lora_name,
+                    publication.rendezvous.to_json_dict(),
+                    publication.request.to_json_dict(),
+                    adapter_config,
+                )
+                ray.get(
+                    [
+                        producer_actor.acknowledge.remote(publication.request.generation, consumer_id)
+                        for producer_actor in producers
+                        for consumer_id in range(len(inference_engine_client.server_urls))
+                    ]
+                )
+            except Exception as error:
+                publication_error = str(error)
+                ray.get([producer_actor.discard.remote(publication.request.generation) for producer_actor in producers])
+        errors = [publication_error]
+        torch.distributed.broadcast_object_list(errors, src=0)
+        if errors[0] is not None:
+            raise RuntimeError(f"lora_rdt publication failed: {errors[0]}")
+        torch.distributed.barrier()
+
     async def broadcast_to_inference_engines(
         self,
         inference_engine_client: "InferenceEngineInterface",
@@ -1764,7 +1913,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # so sample(model=<model_id>) routes correctly. Single-tenant
             # (model_id=None) keeps the legacy shared path + name.
             lora_name, lora_sync_path = self._resolve_lora_sync_target(model_id)
-            await self._save_lora_adapters_and_sync(lora_sync_path, inference_engine_client, lora_name=lora_name)
+            if inference_engine_cfg.weight_sync_backend == "lora_rdt":
+                await self._publish_lora_rdt_adapter(inference_engine_client, lora_name)
+            else:
+                await self._save_lora_adapters_and_sync(lora_sync_path, inference_engine_client, lora_name=lora_name)
         else:
             # Send with the sender created at init time. Disable expandable_segments
             # around it: under colocate_all the CUDA-IPC path calls

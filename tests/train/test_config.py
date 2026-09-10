@@ -321,6 +321,30 @@ def test_power_2_mode_rejects_persistent_fp8_without_serialized_sync(monkeypatch
         prepare_runtime_environment(cfg)
 
 
+def test_megatron_validation_accepts_fixed_layout_lora_rdt():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.placement.colocate_all = False
+    cfg.trainer.policy.model.lora.rank = 32
+    cfg.trainer.policy.model.lora.max_loras = 2
+    cfg.trainer.policy.megatron_config.lora_config.merge_lora = False
+    cfg.generator.inference_engine.weight_sync_backend = "lora_rdt"
+
+    train_utils.validate_megatron_cfg(cfg)
+
+
+def test_megatron_validation_rejects_lora_rdt_with_merged_adapter():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.placement.colocate_all = False
+    cfg.trainer.policy.model.lora.rank = 32
+    cfg.trainer.policy.model.lora.max_loras = 2
+    cfg.generator.inference_engine.weight_sync_backend = "lora_rdt"
+
+    with pytest.raises(ValueError, match="merge_lora=false"):
+        train_utils.validate_megatron_cfg(cfg)
+
+
 def test_megatron_validation_requires_fp8_param_gather_for_training():
     cfg = _make_validated_test_config()
     cfg.trainer.strategy = "megatron"
