@@ -1,5 +1,10 @@
 """Contracts for the LoRA-specific NIXL/RDMA weight-sync backend."""
 
+from .bridge_sources import (
+    LoRABridgeSource,
+    extract_lora_bridge_sources,
+    validate_lora_bridge_source_layout,
+)
 from .contracts import (
     LoRAAdapterGenerationState,
     LoRAAdapterLayout,
@@ -19,6 +24,9 @@ from .vllm_adapter import (
 )
 
 __all__ = [
+    "validate_lora_bridge_source_layout",
+    "extract_lora_bridge_sources",
+    "LoRABridgeSource",
     "LoRAAdapterGenerationState",
     "LoRAAdapterLayout",
     "LoRATensorSlice",
