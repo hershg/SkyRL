@@ -9,7 +9,12 @@ from .contracts import (
     build_lora_adapter_layout,
     materialize_bf16_adapter_tensor,
 )
-from .vllm_adapter import build_vllm_lora_model
+from .vllm_adapter import (
+    activate_staged_vllm_lora_model,
+    build_vllm_lora_model,
+    discard_staged_vllm_lora_model,
+    stage_vllm_lora_model,
+)
 
 __all__ = [
     "LoRAAdapterGenerationState",
@@ -17,7 +22,10 @@ __all__ = [
     "LoRATensorSlice",
     "LoRATransferInitInfo",
     "LoRAUpdateRequest",
+    "activate_staged_vllm_lora_model",
     "build_lora_adapter_layout",
     "build_vllm_lora_model",
+    "discard_staged_vllm_lora_model",
     "materialize_bf16_adapter_tensor",
+    "stage_vllm_lora_model",
 ]

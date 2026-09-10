@@ -42,3 +42,35 @@ def build_vllm_lora_model(
         weights_mapper=weights_mapper,
         skip_prefixes=skip_prefixes,
     )
+
+
+def stage_vllm_lora_model(model_runner: Any, lora_model: Any) -> None:
+    """Register a new adapter id without changing the active vLLM slots."""
+    manager = _get_vllm_lora_manager(model_runner)
+    adapter_manager = manager._adapter_manager
+    if lora_model.id in manager.list_adapters():
+        raise ValueError(f"LoRA adapter id {lora_model.id} is already registered")
+    if not adapter_manager.add_adapter(lora_model):
+        raise RuntimeError(f"vLLM declined LoRA adapter id {lora_model.id}")
+
+
+def activate_staged_vllm_lora_model(model_runner: Any, adapter_id: int) -> None:
+    """Activate a previously staged adapter id in an unused vLLM LoRA slot."""
+    manager = _get_vllm_lora_manager(model_runner)
+    if adapter_id not in manager.list_adapters():
+        raise ValueError(f"LoRA adapter id {adapter_id} was not staged")
+    if not manager._adapter_manager.activate_adapter(adapter_id):
+        raise RuntimeError(f"vLLM declined activation for LoRA adapter id {adapter_id}")
+
+
+def discard_staged_vllm_lora_model(model_runner: Any, adapter_id: int) -> None:
+    """Release a staged adapter id after a failed generation."""
+    manager = _get_vllm_lora_manager(model_runner)
+    manager.remove_adapter(adapter_id)
+
+
+def _get_vllm_lora_manager(model_runner: Any) -> Any:
+    manager = getattr(model_runner, "lora_manager", None)
+    if manager is None:
+        raise RuntimeError("lora_rdt requires a vLLM model runner with LoRA enabled")
+    return manager
