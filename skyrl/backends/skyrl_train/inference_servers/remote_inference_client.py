@@ -1292,22 +1292,25 @@ class RemoteInferenceClient(InferenceEngineInterface):
             return response
 
         async def call_phase(endpoint: str, server_url: str):
-            adapter_id = adapter_ids.get(server_url)
-            if adapter_id is None:
-                return {"status": "not_staged"}
-            _, response = await self._call_server(
-                server_url, endpoint, {**common, "adapter_id": adapter_id}
-            )
+            payload = dict(common)
+            if endpoint == "/skyrl/v1/rollback_lora_rdt_adapter":
+                if server_url in adapter_ids:
+                    payload["adapter_id"] = adapter_ids[server_url]
+            else:
+                payload["adapter_id"] = adapter_ids[server_url]
+            _, response = await self._call_server(server_url, endpoint, payload)
             return response
 
-        return dict(await LoRardtFleetTransaction(self.server_urls).replace(
-            stage=stage,
-            pause=lambda: self._call_all_servers("/skyrl/v1/pause_lora_rdt"),
-            activate=lambda url: call_phase("/skyrl/v1/activate_lora_rdt_adapter", url),
-            rollback=lambda url: call_phase("/skyrl/v1/rollback_lora_rdt_adapter", url),
-            commit=lambda url: call_phase("/skyrl/v1/commit_lora_rdt_adapter", url),
-            resume=lambda: self._call_all_servers("/skyrl/v1/resume_lora_rdt"),
-        ))
+        return dict(
+            await LoRardtFleetTransaction(self.server_urls).replace(
+                stage=stage,
+                pause=lambda: self._call_all_servers("/skyrl/v1/pause_lora_rdt"),
+                activate=lambda url: call_phase("/skyrl/v1/activate_lora_rdt_adapter", url),
+                rollback=lambda url: call_phase("/skyrl/v1/rollback_lora_rdt_adapter", url),
+                commit=lambda url: call_phase("/skyrl/v1/commit_lora_rdt_adapter", url),
+                resume=lambda: self._call_all_servers("/skyrl/v1/resume_lora_rdt"),
+            )
+        )
 
     async def load_lora_adapter(
         self,

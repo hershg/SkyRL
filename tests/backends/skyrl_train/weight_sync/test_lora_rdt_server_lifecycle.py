@@ -220,3 +220,59 @@ async def test_unload_requires_pending_replacement_to_finish_before_removing_buf
     await lifecycle.rollback(engine, _request(), 4)
     await lifecycle.unload(engine, "adapter")
     assert lifecycle.get_active_adapter_id("adapter") is None
+
+
+@pytest.mark.asyncio
+async def test_abort_before_delayed_stage_prevents_generation_revival():
+    lifecycle = LoRardtServerLifecycle()
+    engine = _Engine()
+    assert not await lifecycle.abort(engine, _request())
+    with pytest.raises(ValueError, match="completed transaction"):
+        await lifecycle.stage(engine, _rendezvous(), _request(), 4, {"r": 2})
+    assert engine.calls == []
+    await lifecycle.stage(engine, _rendezvous(), _request(2), 5, {"r": 2})
+    before = list(engine.calls)
+    assert not await lifecycle.abort(engine, _request())
+    assert engine.calls == before
+    await lifecycle.activate(engine, _request(2), 5)
+    assert lifecycle.get_active_adapter_id("adapter") == 5
+
+
+@pytest.mark.asyncio
+async def test_abort_preserves_committed_and_mismatched_generations():
+    lifecycle = LoRardtServerLifecycle()
+    engine = _Engine()
+    await lifecycle.stage(engine, _rendezvous(), _request(), 4, {"r": 2})
+    await lifecycle.activate(engine, _request(), 4)
+    await lifecycle.commit(engine, _request(), 4)
+    with pytest.raises(ValueError, match="already committed"):
+        await lifecycle.abort(engine, _request())
+    await lifecycle.stage(engine, _rendezvous(), _request(2), 5, {"r": 2})
+    before = list(engine.calls)
+    mismatch = LoRAUpdateRequest.from_json_dict(
+        {
+            **_request(2).to_json_dict(),
+            "layout_digest": "0" * 64,
+        }
+    )
+    with pytest.raises(ValueError, match="not staged"):
+        await lifecycle.abort(engine, mismatch)
+    assert engine.calls == before
+    assert lifecycle.get_active_adapter_id("adapter") == 4
+
+
+@pytest.mark.asyncio
+async def test_failed_stage_retains_cleanup_id_without_becoming_activatable():
+    lifecycle = LoRardtServerLifecycle()
+    engine = _Engine(fail_methods={"stage_lora_rdt_adapter", "discard_lora_rdt_adapter"})
+    with pytest.raises(LoRardtRollbackError):
+        await lifecycle.stage(engine, _rendezvous(), _request(), 4, {"r": 2})
+    before = list(engine.calls)
+    with pytest.raises(ValueError, match="did not finish staging"):
+        await lifecycle.activate(engine, _request(), 4)
+    assert engine.calls == before
+    engine.fail_methods.clear()
+    assert await lifecycle.abort(engine, _request())
+    assert engine.calls[-1] == ("discard_lora_rdt_adapter", {"adapter_id": 4})
+    assert not await lifecycle.abort(engine, _request())
+    await lifecycle.stage(engine, _rendezvous(), _request(2), 5, {"r": 2})

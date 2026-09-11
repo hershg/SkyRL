@@ -496,7 +496,9 @@ class VLLMServerActor(ServerActorProtocol):
             async with models.lora_resolver_lock[lora_name]:
                 adapter_id = models.lora_id_counter.inc(1)
                 try:
-                    await _lora_rdt_lifecycle(models).stage(engine, rendezvous, update_request, adapter_id, adapter_config)
+                    await _lora_rdt_lifecycle(models).stage(
+                        engine, rendezvous, update_request, adapter_id, adapter_config
+                    )
                 except Exception as error:
                     raise HTTPException(status_code=500, detail=str(error)) from error
                 previous = getattr(models, "_skyrl_lora_rdt_previous_requests", {})
@@ -515,7 +517,9 @@ class VLLMServerActor(ServerActorProtocol):
                     await _lora_rdt_lifecycle(models).activate(engine, update_request, adapter_id)
                 except Exception as error:
                     raise HTTPException(status_code=500, detail=str(error)) from error
-                models.lora_requests[lora_name] = LoRARequest(lora_name=lora_name, lora_int_id=adapter_id, lora_path=f"lora_rdt://{lora_name}", load_inplace=False)
+                models.lora_requests[lora_name] = LoRARequest(
+                    lora_name=lora_name, lora_int_id=adapter_id, lora_path=f"lora_rdt://{lora_name}", load_inplace=False
+                )
             return {"status": "active", "lora_int_id": adapter_id}
 
         @app.post("/skyrl/v1/commit_lora_rdt_adapter")
@@ -537,18 +541,25 @@ class VLLMServerActor(ServerActorProtocol):
         async def _skyrl_rollback_lora_rdt_adapter(request: Request):
             body = await request.json()
             lora_name, _, update_request = _parse_lora_rdt(body)
-            adapter_id = int(body["adapter_id"])
             models = request.app.state.openai_serving_models
             async with models.lora_resolver_lock[lora_name]:
+                lifecycle = _lora_rdt_lifecycle(models)
                 try:
-                    changed = await _lora_rdt_lifecycle(models).rollback(engine, update_request, adapter_id)
+                    if "adapter_id" in body:
+                        changed = await lifecycle.rollback(engine, update_request, int(body["adapter_id"]))
+                    else:
+                        changed = await lifecycle.abort(engine, update_request)
                 except Exception as error:
                     raise HTTPException(status_code=500, detail=str(error)) from error
                 if changed:
                     previous = getattr(models, "_skyrl_lora_rdt_previous_requests", {}).pop(lora_name, None)
-                    if previous is None:
+                    active_id = lifecycle.get_active_adapter_id(lora_name)
+                    current = models.lora_requests.get(lora_name)
+                    if active_id is None:
                         models.lora_requests.pop(lora_name, None)
-                    else:
+                    elif current is None or current.lora_int_id != active_id:
+                        if previous is None or previous.lora_int_id != active_id:
+                            raise HTTPException(status_code=500, detail="Restored LoRA route is unavailable")
                         models.lora_requests[lora_name] = previous
             return {"status": "rolled_back"}
 

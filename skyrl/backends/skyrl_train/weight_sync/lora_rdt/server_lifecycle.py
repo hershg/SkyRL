@@ -1,6 +1,6 @@
 """Atomic named-adapter replacement over vLLM's pause and collective RPC APIs."""
 
-from typing import Any, Mapping
+from typing import Any, Mapping, NamedTuple
 
 from .contracts import LoRAUpdateRequest
 from .control_protocol import (
@@ -17,12 +17,19 @@ class LoRardtRollbackError(RuntimeError):
     """A generation could not be safely restored or discarded."""
 
 
+class LoRardtStagedGeneration(NamedTuple):
+    request: LoRAUpdateRequest
+    adapter_id: int
+    previous_id: int | None
+    prepared: bool = False
+
+
 class LoRardtServerLifecycle:
     """Own named active adapter ids while the server owns request admission."""
 
     def __init__(self) -> None:
         self._active_ids: dict[str, int] = {}
-        self._staged: dict[str, tuple[LoRAUpdateRequest, int, int | None]] = {}
+        self._staged: dict[str, LoRardtStagedGeneration] = {}
         self._terminal: dict[str, tuple[LoRAUpdateRequest, int, str]] = {}
         self._unloaded: set[str] = set()
 
@@ -46,6 +53,8 @@ class LoRardtServerLifecycle:
             raise ValueError(f"LoRA generation {request.generation} has already completed")
         if request.adapter_name in self._staged:
             raise ValueError(f"LoRA adapter {request.adapter_name!r} already has a staged generation")
+        staged = LoRardtStagedGeneration(request, adapter_id, self._active_ids.get(request.adapter_name))
+        self._staged[request.adapter_name] = staged
         try:
             await engine.collective_rpc(
                 LORA_RDT_STAGE_METHOD,
@@ -63,12 +72,14 @@ class LoRardtServerLifecycle:
                 raise LoRardtRollbackError(
                     f"lora_rdt could not discard partially staged adapter id {adapter_id}"
                 ) from cleanup_error
+            del self._staged[request.adapter_name]
             raise
-        self._staged[request.adapter_name] = (request, adapter_id, self._active_ids.get(request.adapter_name))
+        self._staged[request.adapter_name] = staged._replace(prepared=True)
 
     async def activate(self, engine: Any, request: LoRAUpdateRequest, adapter_id: int) -> None:
         """Activate a staged local generation while fleet admission is closed."""
-        self._get_staged(request, adapter_id)
+        if not self._get_staged(request, adapter_id).prepared:
+            raise ValueError(f"LoRA generation {request.generation} did not finish staging")
         if self._active_ids.get(request.adapter_name) == adapter_id:
             return
         await engine.collective_rpc(
@@ -84,7 +95,7 @@ class LoRardtServerLifecycle:
             return False
         if outcome is not None:
             raise ValueError(f"LoRA generation {request.generation} was already rolled back")
-        _, _, previous_id = self._get_staged(request, adapter_id)
+        previous_id = self._get_staged(request, adapter_id).previous_id
         if self._active_ids.get(request.adapter_name) != adapter_id:
             raise ValueError(f"LoRA generation {request.generation} has not been activated")
         if previous_id is not None:
@@ -93,6 +104,22 @@ class LoRardtServerLifecycle:
         self._terminal[request.adapter_name] = (request, adapter_id, "committed")
         return True
 
+    async def abort(self, engine: Any, request: LoRAUpdateRequest) -> bool:
+        """Cancel a generation even when its stage response never reached the caller."""
+        terminal = self._terminal.get(request.adapter_name)
+        if terminal is not None:
+            outcome = self._get_terminal_outcome(request, terminal[1])
+            if outcome == "rolled_back":
+                return False
+            if outcome is not None:
+                raise ValueError(f"LoRA generation {request.generation} was already committed")
+        staged = self._staged.get(request.adapter_name)
+        if staged is not None:
+            return await self.rollback(engine, request, staged[1])
+        # No adapter id was allocated; prevent a delayed stage from reviving this generation.
+        self._terminal[request.adapter_name] = (request, 0, "rolled_back")
+        return False
+
     async def rollback(self, engine: Any, request: LoRAUpdateRequest, adapter_id: int) -> bool:
         """Restore the prior route once without replaying destructive cleanup."""
         outcome = self._get_terminal_outcome(request, adapter_id)
@@ -100,7 +127,7 @@ class LoRardtServerLifecycle:
             return False
         if outcome is not None:
             raise ValueError(f"LoRA generation {request.generation} was already committed")
-        _, _, previous_id = self._get_staged(request, adapter_id)
+        previous_id = self._get_staged(request, adapter_id).previous_id
         if previous_id is not None:
             await engine.collective_rpc(LORA_RDT_RESTORE_METHOD, kwargs={"adapter_id": previous_id})
             self._active_ids[request.adapter_name] = previous_id
@@ -147,7 +174,7 @@ class LoRardtServerLifecycle:
         if adapter_id <= 0:
             raise ValueError(f"LoRA adapter ids must be positive, got {adapter_id}")
 
-    def _get_staged(self, request: LoRAUpdateRequest, adapter_id: int) -> tuple[LoRAUpdateRequest, int, int | None]:
+    def _get_staged(self, request: LoRAUpdateRequest, adapter_id: int) -> LoRardtStagedGeneration:
         staged = self._staged.get(request.adapter_name)
         if staged is None or staged[:2] != (request, adapter_id):
             raise ValueError(f"LoRA adapter {request.adapter_name!r} generation {request.generation} is not staged")
