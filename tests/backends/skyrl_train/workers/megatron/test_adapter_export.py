@@ -8,6 +8,7 @@ import torch
 from skyrl.backends.skyrl_train.workers.megatron.megatron_worker import (
     MegatronPolicyWorkerBase,
     _compact_adapter_state,
+    _LoRardtPublicationState,
 )
 
 
@@ -65,8 +66,8 @@ def test_rdt_delete_releases_owned_producer_before_training_slot(
     )
     worker.adapter_store = Mock()
     actor = object()
-    worker._lora_rdt_producers = {"adapter": actor}
-    worker._lora_rdt_planners = {"adapter": object()}
+    state = _LoRardtPublicationState(object(), actor, None, None)
+    worker._lora_rdt_publication_states = {"adapter": state}
     events = []
 
     def kill(handle, no_restart):
@@ -83,10 +84,9 @@ def test_rdt_delete_releases_owned_producer_before_training_slot(
     if kill_fails:
         with pytest.raises(RuntimeError, match="producer teardown failed"):
             worker.delete_adapter("adapter")
-        assert worker._lora_rdt_producers == {"adapter": actor}
+        assert worker._lora_rdt_publication_states == {"adapter": state}
         assert events == ["producer"]
     else:
         worker.delete_adapter("adapter")
-        assert worker._lora_rdt_producers == {}
-        assert worker._lora_rdt_planners == {}
+        assert worker._lora_rdt_publication_states == {}
         assert events == ["producer", "trainer"]

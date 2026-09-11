@@ -30,7 +30,7 @@ def test_publication_planner_keeps_layout_and_advances_generation():
     planner = LoRardtPublicationPlanner("adapter", 0, 1, "test")
     records = [_record(torch.ones((2, 1), dtype=torch.float32))]
     first = planner.plan(records, [records_to_sources(records)], ["producer-0"])
-    second = planner.plan(records, [records_to_sources(records)], ["producer-0"])
+    second = planner.plan(records)
 
     assert first.request.generation == 0
     assert second.request.generation == 1
@@ -45,8 +45,26 @@ def test_publication_planner_rejects_layout_change():
     planner.plan(first, [records_to_sources(first)], ["producer-0"])
     changed = [_record(torch.ones((3, 1), dtype=torch.float32))]
 
-    with pytest.raises(ValueError, match="changed its fixed source layout"):
-        planner.plan(changed, [records_to_sources(changed)], ["producer-0"])
+    with pytest.raises(ValueError, match="changed its fixed local source layout"):
+        planner.plan(changed)
+
+
+def test_publication_planner_requires_static_metadata_once():
+    planner = LoRardtPublicationPlanner("adapter", 0, 1, None)
+    records = [_record(torch.ones((2, 1), dtype=torch.float32))]
+
+    with pytest.raises(ValueError, match="first publication requires"):
+        planner.plan(records)
+
+
+def test_publication_planner_rejects_reinitialization():
+    planner = LoRardtPublicationPlanner("adapter", 0, 1, None)
+    records = [_record(torch.ones((2, 1), dtype=torch.float32))]
+    sources = [records_to_sources(records)]
+    planner.plan(records, sources, ["producer-0"])
+
+    with pytest.raises(ValueError, match="already initialized"):
+        planner.plan(records, sources, ["producer-0"])
 
 
 def records_to_sources(records):

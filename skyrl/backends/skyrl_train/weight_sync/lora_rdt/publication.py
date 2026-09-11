@@ -41,12 +41,7 @@ def make_lora_rdt_producer_name(
 
 
 class LoRardtPublicationPlanner:
-    """Build immutable generations from one rank-local Bridge export.
-
-    Distributed collectives and Ray actor creation stay outside this class. That
-    lets Megatron own process-group ordering while this planner enforces the
-    fixed-layout and monotonically increasing-generation contracts.
-    """
+    """Build immutable generations for one fixed global Bridge layout."""
 
     def __init__(
         self,
@@ -61,19 +56,55 @@ class LoRardtPublicationPlanner:
         self._source_rank = source_rank
         self._consumer_count = consumer_count
         self._namespace = namespace
-        self._layout_digest: str | None = None
+        self._layout: LoRABridgeSourceLayout | None = None
+        self._rendezvous: LoRardtProducerRendezvous | None = None
         self._generation = -1
 
     def plan(
         self,
         records: Iterable[Any],
-        gathered_sources: Sequence[Sequence[LoRABridgeSource]],
-        gathered_actor_names: Sequence[str],
+        gathered_sources: Sequence[Sequence[LoRABridgeSource]] | None = None,
+        gathered_actor_names: Sequence[str] | None = None,
     ) -> LoRardtPublication:
-        """Validate a rank-local export and build its next fleet-visible generation."""
+        """Validate fresh local values and build the next generation."""
         local_tensors, local_sources = extract_lora_bridge_sources(
             records, self._source_rank
         )
+        if self._layout is None:
+            self._initialize(gathered_sources, gathered_actor_names)
+        elif gathered_sources is not None or gathered_actor_names is not None:
+            raise ValueError(
+                "lora_rdt static publication metadata is already initialized"
+            )
+
+        assert self._layout is not None
+        assert self._rendezvous is not None
+        expected_local_sources = tuple(
+            source
+            for source in self._layout.sources
+            if source.source_rank == self._source_rank
+        )
+        if local_sources != expected_local_sources:
+            raise ValueError(
+                f"lora_rdt adapter {self._adapter_name!r} changed its fixed local source layout"
+            )
+
+        self._generation += 1
+        request = LoRAUpdateRequest.from_layout(self._layout, self._generation)
+        return LoRardtPublication(
+            local_tensors, self._layout, request, self._rendezvous
+        )
+
+    def _initialize(
+        self,
+        gathered_sources: Sequence[Sequence[LoRABridgeSource]] | None,
+        gathered_actor_names: Sequence[str] | None,
+    ) -> None:
+        """Freeze global layout and producer rendezvous on first publication."""
+        if gathered_sources is None or gathered_actor_names is None:
+            raise ValueError(
+                "lora_rdt first publication requires global sources and producer names"
+            )
         sources = tuple(
             sorted(
                 (
@@ -90,27 +121,19 @@ class LoRardtPublicationPlanner:
             )
         )
         layout = LoRABridgeSourceLayout(self._adapter_name, sources)
-        if self._layout_digest is None:
-            self._layout_digest = layout.layout_digest
-        elif self._layout_digest != layout.layout_digest:
-            raise ValueError(
-                f"lora_rdt adapter {self._adapter_name!r} changed its fixed source layout"
-            )
         if len(gathered_actor_names) != len(
             {source.source_rank for source in layout.sources}
         ):
             raise ValueError(
                 "lora_rdt requires exactly one producer actor name per source rank"
             )
-        self._generation += 1
-        request = LoRAUpdateRequest.from_layout(layout, self._generation)
-        rendezvous = LoRardtProducerRendezvous(
+        self._layout = layout
+        self._rendezvous = LoRardtProducerRendezvous(
             layout=layout,
             producer_actor_names=tuple(enumerate(gathered_actor_names)),
             consumer_count=self._consumer_count,
             namespace=self._namespace,
         )
-        return LoRardtPublication(local_tensors, layout, request, rendezvous)
 
 
 def publish_lora_sources(

@@ -5,6 +5,7 @@ import shutil
 import time
 from collections import defaultdict
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -125,6 +126,16 @@ class _LoRardtNoopSender:
     handles_prefix_cache_reset = False
     force_disable_expandable_segments = False
     empty_cache_after_send = True
+
+
+@dataclass
+class _LoRardtPublicationState:
+    """Static trainer-side state for one named adapter."""
+
+    planner: Any
+    producer: Any
+    fleet_producers: Optional[List[Any]]
+    adapter_config: Optional[Dict[str, Any]]
 
 
 if TYPE_CHECKING:
@@ -1751,7 +1762,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         torch.distributed.barrier()
 
-    async def _publish_lora_rdt_adapter(self, inference_engine_client, lora_name: str) -> None:
+    async def _publish_lora_rdt_adapter(
+        self, inference_engine_client, lora_name: str
+    ) -> None:
         """Publish one rank-local Bridge snapshot through named NIXL sidecars."""
         from megatron.bridge.models.conversion.peft_bridge import (
             build_adapter_config_dict,
@@ -1762,7 +1775,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
             RemoteInferenceClient,
         )
-        from skyrl.backends.skyrl_train.weight_sync.lora_layout import convert_moe_expert_lora_key
+        from skyrl.backends.skyrl_train.weight_sync.lora_layout import (
+            convert_moe_expert_lora_key,
+        )
         from skyrl.backends.skyrl_train.weight_sync.lora_rdt.bridge_sources import (
             LoRABridgeSourceLayout,
             extract_lora_bridge_sources,
@@ -1784,99 +1799,150 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 "lora_rdt requires Megatron-Bridge export_local_adapter_weights; "
                 "install the SkyRL Bridge fork before enabling this backend"
             )
+
         rank = torch.distributed.get_rank()
         records = list(export(self.actor_module))
-        _, local_sources = extract_lora_bridge_sources(records, source_rank=rank)
-        gathered_sources = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(gathered_sources, local_sources)
-        sources = tuple(
-            sorted(
-                (source for rank_sources in gathered_sources for source in rank_sources),
-                key=lambda source: (
-                    source.key,
-                    source.expert_parallel_rank,
-                    source.tensor_parallel_rank,
-                    source.source_rank,
-                ),
+        publication_states = getattr(self, "_lora_rdt_publication_states", {})
+        state = publication_states.get(lora_name)
+        if state is None:
+            _, local_sources = extract_lora_bridge_sources(records, source_rank=rank)
+            gathered_sources = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered_sources, local_sources)
+            sources = tuple(
+                sorted(
+                    (
+                        source
+                        for rank_sources in gathered_sources
+                        for source in rank_sources
+                    ),
+                    key=lambda source: (
+                        source.key,
+                        source.expert_parallel_rank,
+                        source.tensor_parallel_rank,
+                        source.source_rank,
+                    ),
+                )
             )
-        )
-        layout = LoRABridgeSourceLayout(lora_name, sources)
-        namespace = ray.get_runtime_context().namespace
-        actor_name = make_lora_rdt_producer_name(layout, rank)
-        try:
-            producer = ray.get_actor(actor_name, namespace=namespace)
-        except ValueError:
-            env_vars = {
-                key: os.environ[key]
-                for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "NCCL_CUMEM_ENABLE", "VLLM_NCCL_SO_PATH", "PATH")
-                if key in os.environ
-            }
-            gpu_ids = ray.get_gpu_ids()
-            if not gpu_ids:
-                raise RuntimeError("LoRA RDT producer requires a GPU assigned to its trainer rank")
-            env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
-            env_vars["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[0])
-            producer = ray.remote(LoRardtProducer).options(
-                name=actor_name,
-                namespace=namespace,
-                num_cpus=0,
-                num_gpus=0,
-                max_concurrency=len(inference_engine_client.server_urls) + 4,
-                enable_tensor_transport=True,
-                scheduling_strategy=NodeAffinitySchedulingStrategy(
-                    node_id=ray.get_runtime_context().get_node_id(), soft=False
-                ),
-                runtime_env={"env_vars": env_vars},
-            ).remote(rank, layout)
-        producer_handles = getattr(self, "_lora_rdt_producers", {})
-        producer_handles[lora_name] = producer
-        self._lora_rdt_producers = producer_handles
-        actor_names = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(actor_names, actor_name)
-        planner = getattr(self, "_lora_rdt_planners", {}).get(lora_name)
-        if planner is None:
+            layout = LoRABridgeSourceLayout(lora_name, sources)
+            namespace = ray.get_runtime_context().namespace
+            actor_name = make_lora_rdt_producer_name(layout, rank)
+            try:
+                producer = ray.get_actor(actor_name, namespace=namespace)
+            except ValueError:
+                env_vars = {
+                    key: os.environ[key]
+                    for key in (
+                        "LD_LIBRARY_PATH",
+                        "LD_PRELOAD",
+                        "NCCL_CUMEM_ENABLE",
+                        "VLLM_NCCL_SO_PATH",
+                        "PATH",
+                    )
+                    if key in os.environ
+                }
+                gpu_ids = ray.get_gpu_ids()
+                if not gpu_ids:
+                    raise RuntimeError(
+                        "LoRA RDT producer requires a GPU assigned to its trainer rank"
+                    )
+                env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+                env_vars["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[0])
+                producer = (
+                    ray.remote(LoRardtProducer)
+                    .options(
+                        name=actor_name,
+                        namespace=namespace,
+                        num_cpus=0,
+                        num_gpus=0,
+                        max_concurrency=len(inference_engine_client.server_urls) + 4,
+                        enable_tensor_transport=True,
+                        scheduling_strategy=NodeAffinitySchedulingStrategy(
+                            node_id=ray.get_runtime_context().get_node_id(), soft=False
+                        ),
+                        runtime_env={"env_vars": env_vars},
+                    )
+                    .remote(rank, layout)
+                )
+            actor_names = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(actor_names, actor_name)
             planner = LoRardtPublicationPlanner(
-                lora_name, rank, len(inference_engine_client.server_urls), namespace
+                lora_name,
+                rank,
+                len(inference_engine_client.server_urls),
+                namespace,
             )
-            planners = getattr(self, "_lora_rdt_planners", {})
-            planners[lora_name] = planner
-            self._lora_rdt_planners = planners
-        publication = planner.plan(records, gathered_sources, actor_names)
-        publish_lora_sources(producer, publication, SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
+            publication = planner.plan(records, gathered_sources, actor_names)
+            fleet_producers = None
+            adapter_config = None
+            if rank == 0:
+                fleet_producers = [
+                    ray.get_actor(name, namespace=namespace) for name in actor_names
+                ]
+                target_modules = sorted(
+                    set(
+                        infer_target_modules_from_adapter_weights(
+                            convert_moe_expert_lora_key(
+                                f"base_model.model.{name}", len(source.shape)
+                            )
+                            for source in publication.layout.sources
+                            for name in source.hf_param_names
+                        )
+                    )
+                    - {"base_layer"}
+                )
+                adapter_config = build_adapter_config_dict(
+                    self.lora_cls,
+                    target_modules=target_modules,
+                    base_model_name_or_path=str(
+                        getattr(self, "_logical_model_path", "")
+                    ),
+                )
+            state = _LoRardtPublicationState(
+                planner=planner,
+                producer=producer,
+                fleet_producers=fleet_producers,
+                adapter_config=adapter_config,
+            )
+            publication_states[lora_name] = state
+            self._lora_rdt_publication_states = publication_states
+        else:
+            publication = state.planner.plan(records)
+
+        publish_lora_sources(
+            state.producer, publication, SKYRL_WORKER_NCCL_TIMEOUT_IN_S
+        )
         publication_error = None
         if rank == 0:
-            target_modules = sorted(
-                set(
-                    infer_target_modules_from_adapter_weights(
-                        convert_moe_expert_lora_key(f"base_model.model.{name}", len(source.shape))
-                        for source in publication.layout.sources
-                        for name in source.hf_param_names
-                    )
-                ) - {"base_layer"}
-            )
-            adapter_config = build_adapter_config_dict(
-                self.lora_cls,
-                target_modules=target_modules,
-                base_model_name_or_path=str(getattr(self, "_logical_model_path", "")),
-            )
-            producers = [ray.get_actor(name, namespace=namespace) for name in actor_names]
+            assert state.fleet_producers is not None
+            assert state.adapter_config is not None
             try:
                 await inference_engine_client.load_lora_rdt_adapter(
                     lora_name,
                     publication.rendezvous.to_json_dict(),
                     publication.request.to_json_dict(),
-                    adapter_config,
+                    state.adapter_config,
                 )
                 ray.get(
                     [
-                        producer_actor.acknowledge.remote(publication.request.generation, consumer_id)
-                        for producer_actor in producers
-                        for consumer_id in range(len(inference_engine_client.server_urls))
+                        producer_actor.acknowledge.remote(
+                            publication.request.generation, consumer_id
+                        )
+                        for producer_actor in state.fleet_producers
+                        for consumer_id in range(
+                            len(inference_engine_client.server_urls)
+                        )
                     ]
                 )
             except Exception as error:
                 publication_error = str(error)
-                ray.get([producer_actor.discard.remote(publication.request.generation) for producer_actor in producers])
+                ray.get(
+                    [
+                        producer_actor.discard.remote(
+                            publication.request.generation
+                        )
+                        for producer_actor in state.fleet_producers
+                    ]
+                )
         errors = [publication_error]
         torch.distributed.broadcast_object_list(errors, src=0)
         if errors[0] is not None:
@@ -1994,11 +2060,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         if self.adapter_store is None:
             raise RuntimeError("AdapterStore not initialised (FFT path)")
         lora_name, _ = self._resolve_lora_sync_target(model_id)
-        producers = getattr(self, "_lora_rdt_producers", {})
-        if lora_name in producers:
-            ray.kill(producers[lora_name], no_restart=True)
-            del producers[lora_name]
-            getattr(self, "_lora_rdt_planners", {}).pop(lora_name, None)
+        publication_states = getattr(self, "_lora_rdt_publication_states", {})
+        state = publication_states.get(lora_name)
+        if state is not None:
+            ray.kill(state.producer, no_restart=True)
+            del publication_states[lora_name]
         self.adapter_store.delete(model_id)
         # Drop the per-tenant safetensors subdir written by
         # _save_lora_adapters_and_sync. Rank 0 wrote it; rank 0 cleans it.
