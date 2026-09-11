@@ -237,14 +237,6 @@ class Glm5NextBridge(MegatronModelBridge):
             f"{megatron_attn}.linear_kv_up_proj.weight": f"{hf_attn}.kv_b_proj.weight",
             f"{megatron_attn}.kv_layernorm.weight": f"{hf_attn}.kv_a_layernorm.weight",
             f"{megatron_attn}.linear_proj.weight": f"{hf_attn}.o_proj.weight",
-            # DSA lightning indexer, including the GLM K-pool parameters.
-            f"{megatron_attn}.core_attention.indexer.linear_wq_b.weight": f"{hf_attn}.indexer.wq_b.weight",
-            f"{megatron_attn}.core_attention.indexer.linear_wk.weight": f"{hf_attn}.indexer.wk.weight",
-            f"{megatron_attn}.core_attention.indexer.k_norm.weight": f"{hf_attn}.indexer.k_norm.weight",
-            f"{megatron_attn}.core_attention.indexer.k_norm.bias": f"{hf_attn}.indexer.k_norm.bias",
-            f"{megatron_attn}.core_attention.indexer.linear_weights_proj.weight": f"{hf_attn}.indexer.weights_proj.weight",
-            f"{megatron_attn}.core_attention.indexer.index_kpool_compress_ape": f"{hf_attn}.indexer.index_kpool_compress_ape",
-            f"{megatron_attn}.core_attention.indexer.index_kpool_compress_gate": f"{hf_attn}.indexer.index_kpool_compress_gate",
             # MoE router and down projections.
             f"{megatron_layer}.mlp.router.weight": f"{hf_layer}.mlp.gate.weight",
             f"{megatron_layer}.mlp.router.expert_bias": f"{hf_layer}.mlp.gate.e_score_correction_bias",
@@ -254,6 +246,24 @@ class Glm5NextBridge(MegatronModelBridge):
             f"{megatron_layer}.mlp.experts.local_experts.*.linear_fc2.weight": f"{hf_layer}.mlp.experts.*.down_proj.weight",
         }
         mappings = [AutoMapping(megatron_param=m, hf_param=h) for m, h in auto_mappings.items()]
+
+        # The DSA indexer is built with ``parallel_mode="duplicated"`` in Megatron-Core.
+        # Its custom DSAIndexer container is not part of Megatron Bridge's AutoMapping
+        # module registry, so preserve the upstream GLM-5.3 bridge's explicit layout.
+        megatron_indexer = f"{megatron_attn}.core_attention.indexer"
+        hf_indexer = f"{hf_attn}.indexer"
+        mappings += [
+            ReplicatedMapping(f"{megatron_indexer}.{megatron_name}", f"{hf_indexer}.{hf_name}")
+            for megatron_name, hf_name in (
+                ("linear_wq_b.weight", "wq_b.weight"),
+                ("linear_wk.weight", "wk.weight"),
+                ("k_norm.weight", "k_norm.weight"),
+                ("k_norm.bias", "k_norm.bias"),
+                ("linear_weights_proj.weight", "weights_proj.weight"),
+                ("index_kpool_compress_ape", "index_kpool_compress_ape"),
+                ("index_kpool_compress_gate", "index_kpool_compress_gate"),
+            )
+        ]
 
         # KDA layers: explicit TP layouts for the custom module.
         mappings += [
