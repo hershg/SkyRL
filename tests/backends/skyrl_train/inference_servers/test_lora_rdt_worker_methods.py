@@ -15,6 +15,11 @@ from skyrl.backends.skyrl_train.weight_sync.lora_rdt.contracts import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _mock_cuda_fence(monkeypatch):
+    monkeypatch.setattr(worker_wrap.torch.cuda, "synchronize", lambda device: None)
+
+
 def _record(generation, adapter_id, config=None):
     config = {"r": 2} if config is None else config
     return LoRAReceiverGeneration(
@@ -223,3 +228,54 @@ def test_activation_rejects_request_with_a_different_staged_digest(monkeypatch):
 
     assert worker._skyrl_lora_rdt_active == {"adapter": _record(1, 9)}
     assert worker._skyrl_lora_rdt_staged == {"adapter": _record(2, 10)}
+
+
+@pytest.mark.parametrize("phase", ["stage", "activate", "restore"])
+def test_failed_cuda_completion_does_not_acknowledge_generation(monkeypatch, phase):
+    worker = _worker()
+    old_record = _record(1, 9)
+    next_record = _record(2, 10)
+    worker._skyrl_lora_rdt_active = {"adapter": old_record}
+    worker._skyrl_lora_rdt_staged = {}
+    worker._skyrl_lora_rdt_retained = {}
+    queued = []
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.resolve_lora_rdt_producers",
+        lambda names, namespace: {0: "producer"},
+    )
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.pull_reconstruct_and_stage_lora_adapter",
+        lambda **kwargs: queued.append(kwargs["adapter_id"]),
+    )
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.activate_staged_vllm_lora_model",
+        lambda runner, adapter_id: queued.append(adapter_id),
+    )
+    if phase == "activate":
+        worker._skyrl_lora_rdt_staged["adapter"] = next_record
+    elif phase == "restore":
+        worker._skyrl_lora_rdt_active["adapter"] = next_record
+        worker._skyrl_lora_rdt_retained[9] = ("adapter", old_record)
+    active_before = worker._skyrl_lora_rdt_active.copy()
+    staged_before = worker._skyrl_lora_rdt_staged.copy()
+    retained_before = worker._skyrl_lora_rdt_retained.copy()
+
+    def fail_completion(device):
+        assert device == worker.device
+        assert queued == [9 if phase == "restore" else 10]
+        assert worker._skyrl_lora_rdt_active == active_before
+        assert worker._skyrl_lora_rdt_staged == staged_before
+        raise RuntimeError("injected asynchronous copy failure")
+
+    monkeypatch.setattr(worker_wrap.torch.cuda, "synchronize", fail_completion)
+    with pytest.raises(RuntimeError, match="asynchronous copy failure"):
+        if phase == "stage":
+            worker.stage_lora_rdt_adapter(_rendezvous().to_json_dict(), _request(2).to_json_dict(), 10, {"r": 2})
+        elif phase == "activate":
+            worker.activate_lora_rdt_adapter(_request(2).to_json_dict(), 10)
+        else:
+            worker.restore_lora_rdt_adapter(9)
+
+    assert worker._skyrl_lora_rdt_active == active_before
+    assert worker._skyrl_lora_rdt_staged == staged_before
+    assert worker._skyrl_lora_rdt_retained == retained_before
