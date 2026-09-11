@@ -427,7 +427,7 @@ megatron-bridge = {git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge", rev =
 # provider conversion are qualification gates, rather than an assertion of upstream CI coverage.
 # See the qualification evidence bundle for source SHA, release receipt, and test results.
 # Do not advance this pin without repeating the native 256K regression qualification.
-megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "a778d0447becbce952bc529253406e09e5beb1eb", marker = "sys_platform == 'linux'"}
+megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "ba89914deb194c4d968b14cb427110730d2c7869", marker = "sys_platform == 'linux'"}
 # vLLM at 98ed0856f31fa3aaf5e27464e2b4ef5a8ee6b2f5 (vllm-project/vllm#53906, "[Model] add GLM-5.3-Flash
 # support", 2026-09-03), i.e. 0.28.1rc1.dev359 -- the first vLLM with the GLM-5.3-Flash (glm5_next: KDA +
 # DSA-kpool + mHC) model. Per-commit wheels are published by vLLM's CI at wheels.vllm.ai; this one is
