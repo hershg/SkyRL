@@ -41,6 +41,7 @@ from skyrl.backends.skyrl_train.utils.io import io
 from skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper import (
     MegatronModelWrapper,
 )
+from skyrl.env_vars import SKYRL_WORKER_NCCL_TIMEOUT_IN_S
 
 # Seed offset per pipeline-parallel rank, matching Megatron's standard practice.
 _PP_SEED_OFFSET = 100
@@ -216,6 +217,7 @@ class MegatronStrategy(DistributedStrategy):
             use_sharp=False,
             context_parallel_size=self.megatron_config.context_parallel_size,
             nccl_communicator_config_path=None,
+            distributed_timeout_minutes=(SKYRL_WORKER_NCCL_TIMEOUT_IN_S + 59) // 60,
         )
         self.set_seed(self.seed)
         self.world_size = dist.get_world_size()

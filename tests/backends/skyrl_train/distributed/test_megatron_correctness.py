@@ -132,3 +132,29 @@ class TestSeedVariation:
             with patch("random.seed", side_effect=lambda s: captured.append(s)):
                 strategy.set_seed(42)
             assert captured[0] == expected_seed
+
+
+@pytest.mark.skipif(not _has_megatron, reason="megatron-core not installed")
+def test_model_parallel_groups_use_worker_nccl_timeout():
+    from skyrl.backends.skyrl_train.distributed.megatron.megatron_strategy import (
+        MegatronStrategy,
+    )
+
+    config = SimpleNamespace(
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=8,
+        expert_tensor_parallel_size=1,
+        context_parallel_size=1,
+    )
+    strategy = MegatronStrategy(megatron_config=config)
+    module = "skyrl.backends.skyrl_train.distributed.megatron.megatron_strategy"
+    with (
+        patch(f"{module}.SKYRL_WORKER_NCCL_TIMEOUT_IN_S", 3601),
+        patch(f"{module}.mpu") as mock_mpu,
+        patch(f"{module}.dist.get_world_size", return_value=8),
+        patch.object(strategy, "set_seed"),
+    ):
+        strategy.setup_distributed()
+
+    assert mock_mpu.initialize_model_parallel.call_args.kwargs["distributed_timeout_minutes"] == 61
