@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
@@ -1281,17 +1282,27 @@ class RemoteInferenceClient(InferenceEngineInterface):
             LoRardtFleetTransaction,
         )
 
+        transaction_started = time.perf_counter()
+        generation = int(request["generation"])
         adapter_ids: Dict[str, int] = {}
         common = {"lora_name": lora_name, "rendezvous": rendezvous, "request": request}
 
         async def stage(server_url: str):
+            stage_started = time.perf_counter()
             _, response = await self._call_server(
                 server_url, "/skyrl/v1/stage_lora_rdt_adapter", {**common, "adapter_config": adapter_config}
             )
             adapter_ids[server_url] = int(response["body"]["lora_int_id"])
+            logger.info(
+                "lora_rdt_fleet_stage generation=%s server=%s phase=stage seconds=%.6f",
+                generation,
+                server_url,
+                time.perf_counter() - stage_started,
+            )
             return response
 
         async def call_phase(endpoint: str, server_url: str):
+            phase_started = time.perf_counter()
             payload = dict(common)
             if endpoint == "/skyrl/v1/rollback_lora_rdt_adapter":
                 if server_url in adapter_ids:
@@ -1299,18 +1310,52 @@ class RemoteInferenceClient(InferenceEngineInterface):
             else:
                 payload["adapter_id"] = adapter_ids[server_url]
             _, response = await self._call_server(server_url, endpoint, payload)
+            phase = endpoint.removeprefix("/skyrl/v1/").removesuffix("_lora_rdt_adapter")
+            logger.info(
+                "lora_rdt_fleet_stage generation=%s server=%s phase=%s seconds=%.6f",
+                generation,
+                server_url,
+                phase,
+                time.perf_counter() - phase_started,
+            )
             return response
 
-        return dict(
+        async def pause():
+            phase_started = time.perf_counter()
+            response = await self._call_all_servers("/skyrl/v1/pause_lora_rdt")
+            logger.info(
+                "lora_rdt_fleet_stage generation=%s phase=pause seconds=%.6f",
+                generation,
+                time.perf_counter() - phase_started,
+            )
+            return response
+
+        async def resume():
+            phase_started = time.perf_counter()
+            response = await self._call_all_servers("/skyrl/v1/resume_lora_rdt")
+            logger.info(
+                "lora_rdt_fleet_stage generation=%s phase=resume seconds=%.6f",
+                generation,
+                time.perf_counter() - phase_started,
+            )
+            return response
+
+        result = dict(
             await LoRardtFleetTransaction(self.server_urls).replace(
                 stage=stage,
-                pause=lambda: self._call_all_servers("/skyrl/v1/pause_lora_rdt"),
+                pause=pause,
                 activate=lambda url: call_phase("/skyrl/v1/activate_lora_rdt_adapter", url),
                 rollback=lambda url: call_phase("/skyrl/v1/rollback_lora_rdt_adapter", url),
                 commit=lambda url: call_phase("/skyrl/v1/commit_lora_rdt_adapter", url),
-                resume=lambda: self._call_all_servers("/skyrl/v1/resume_lora_rdt"),
+                resume=resume,
             )
         )
+        logger.info(
+            "lora_rdt_fleet_stage generation=%s phase=transaction_envelope seconds=%.6f",
+            generation,
+            time.perf_counter() - transaction_started,
+        )
+        return result
 
     async def load_lora_adapter(
         self,

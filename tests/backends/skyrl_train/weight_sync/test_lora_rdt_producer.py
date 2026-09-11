@@ -1,4 +1,5 @@
 import gc
+import logging
 import weakref
 
 import pytest
@@ -164,7 +165,8 @@ def test_discard_serializes_with_inflight_publish(layout, monkeypatch):
     assert producer.retained_generations() == []
 
 
-def test_slice_pull_packs_only_consumed_fp32_bytes_and_releases_after_last_ack():
+def test_slice_pull_packs_only_consumed_fp32_bytes_and_releases_after_last_ack(caplog):
+    caplog.set_level(logging.INFO, logger="skyrl.backends.skyrl_train.weight_sync.lora_rdt.producer")
     layout = LoRAAdapterLayout("adapter", "float32", (LoRATensorSlice("a", (4, 16), 0, 0, 0, 0, 256),))
     producer = LoRardtProducer(0, layout)
     source = torch.arange(64, dtype=torch.float32).reshape(4, 16) + 0.03125
@@ -183,6 +185,9 @@ def test_slice_pull_packs_only_consumed_fp32_bytes_and_releases_after_last_ack()
     assert sum(tensor.numel() * 4 for tensor in packed) == 160
     repeated = producer.pull_slices(1, selections)
     assert all(first is second for first, second in zip(packed, repeated))
+    receipts = [record.message for record in caplog.records if "lora_rdt_producer_stage" in record.message]
+    assert "new_slices=2 new_bytes=160" in receipts[0]
+    assert "new_slices=0 new_bytes=0" in receipts[1]
     references = [weakref.ref(tensor) for tensor in packed]
     del packed, repeated, tensor
     gc.collect()

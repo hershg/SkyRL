@@ -1,5 +1,7 @@
 """Rank-local NIXL producer for one fixed LoRA adapter layout."""
 
+import logging
+import time
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Mapping
@@ -10,6 +12,8 @@ from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from .bridge_sources import LoRABridgeSourceLayout
 from .contracts import LoRAAdapterLayout, LoRASourceSlice, LoRAUpdateRequest
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -97,6 +101,7 @@ class LoRardtProducer:
     @ray.method(tensor_transport="nixl")
     def pull_slices(self, generation: int, slices: list[LoRASourceSlice]) -> list[torch.Tensor]:
         """Pack only requested rectangles into retained, exact-sized FP32 allocations."""
+        pull_started = time.perf_counter()
         with self._lock:
             published = self._generations.get(generation)
             if published is None:
@@ -108,17 +113,33 @@ class LoRardtProducer:
                     raise ValueError(f"LoRA producer rank {self._source_rank} does not own {selection.key!r}")
                 selection.validate_shape(tuple(published.tensors[selection.key].shape))
             copied_devices = set()
+            packed_bytes = 0
+            packed_slices = 0
             for selection in slices:
                 if selection not in published.slices:
                     source = published.tensors[selection.key]
                     # contiguous() alone can retain a view's full source allocation.
                     packed = source[selection.indices].clone(memory_format=torch.contiguous_format)
                     published.slices[selection] = packed
+                    packed_bytes += packed.nbytes
+                    packed_slices += 1
                     if packed.is_cuda:
                         copied_devices.add(packed.device)
             for device in copied_devices:
                 torch.cuda.current_stream(device).synchronize()
-            return [published.slices[selection] for selection in slices]
+            result = [published.slices[selection] for selection in slices]
+        logger.info(
+            "lora_rdt_producer_stage source_rank=%s generation=%s "
+            "phase=slice_pack_and_fence seconds=%.6f requested_slices=%s "
+            "new_slices=%s new_bytes=%s",
+            self._source_rank,
+            generation,
+            time.perf_counter() - pull_started,
+            len(slices),
+            packed_slices,
+            packed_bytes,
+        )
+        return result
 
     def acknowledge(self, generation: int, consumer_id: int) -> bool:
         """Record one completed receiver and release source storage after the final acknowledgement."""

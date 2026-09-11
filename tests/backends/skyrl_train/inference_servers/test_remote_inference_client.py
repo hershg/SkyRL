@@ -1072,7 +1072,7 @@ class TestLoRAControlPlane:
     """Test load_lora_adapter / unload_lora_adapter fan-out and bookkeeping."""
 
     @pytest.mark.asyncio
-    async def test_load_lora_rdt_adapter_fans_out(self, client):
+    async def test_load_lora_rdt_adapter_fans_out(self, client, caplog):
         rendezvous = {"layout": {"adapter_name": "lora-RDT"}}
         request = {"adapter_name": "lora-RDT", "generation": 4}
         result = await client.load_lora_rdt_adapter(
@@ -1086,6 +1086,9 @@ class TestLoRAControlPlane:
         for response in result.values():
             assert response["status"] == 200
             assert response["body"]["status"] == "active"
+        receipts = [record.message for record in caplog.records if "lora_rdt_fleet_stage" in record.message]
+        for phase in ("stage", "pause", "activate", "commit", "resume", "transaction_envelope"):
+            assert any(f"phase={phase}" in message and "generation=4" in message for message in receipts)
 
     @pytest.mark.asyncio
     async def test_load_lora_adapter_fans_out(self, client, mock_servers):

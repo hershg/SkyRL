@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -215,3 +216,84 @@ def test_receiver_rejects_bridge_source_layout_mismatch_without_pulling(monkeypa
         )
 
     assert producer.pull.calls == []
+
+
+def test_local_receiver_emits_reconciled_stage_receipts(monkeypatch, caplog):
+    from skyrl.backends.skyrl_train.weight_sync.lora_rdt import consumer_plan
+    from skyrl.backends.skyrl_train.weight_sync.lora_rdt.consumer_plan import (
+        LoRAConsumerPlan,
+        LoRAConsumerPull,
+    )
+    from skyrl.backends.skyrl_train.weight_sync.lora_rdt.contracts import (
+        LoRASourceSlice,
+    )
+
+    source = _bridge_source(0, 0)
+    source = LoRABridgeSource(
+        key=source.key,
+        source_rank=0,
+        hf_param_names=source.hf_param_names,
+        component=source.component,
+        transform=source.transform,
+        shape=(1, 2),
+        tensor_parallel_axis=None,
+        tensor_parallel_rank=0,
+        tensor_parallel_size=1,
+        expert_parallel_axis=None,
+        expert_parallel_rank=0,
+        expert_parallel_size=1,
+        transform_config=source.transform_config,
+    )
+    layout = LoRABridgeSourceLayout("adapter", (source,))
+    selection = LoRASourceSlice(source.key, (0, 0), (1, 2))
+    plan = LoRAConsumerPlan(
+        layout.layout_digest,
+        receiver_plan=object(),
+        pulls=(LoRAConsumerPull(0, selection),),
+        copies=(),
+    )
+    producer = SimpleNamespace(
+        pull_slices=_RemoteMethod([torch.ones((1, 2), dtype=torch.float32)])
+    )
+    staged = []
+    monkeypatch.setattr(receiver.ray, "get", lambda refs: refs)
+    monkeypatch.setattr(
+        consumer_plan,
+        "assemble_lora_consumer_factors",
+        lambda plan, pulled, device: {"factor": ([], [])},
+    )
+    monkeypatch.setattr(
+        receiver,
+        "stage_vllm_local_lora_factors",
+        lambda runner, adapter_id, receiver_plan, factors: staged.append(adapter_id),
+    )
+    caplog.set_level(
+        logging.INFO,
+        logger="skyrl.backends.skyrl_train.weight_sync.lora_rdt.receiver",
+    )
+
+    receiver.pull_and_stage_local_lora_adapter(
+        {0: producer},
+        layout,
+        LoRAUpdateRequest.from_layout(layout, 3),
+        plan,
+        9,
+        object(),
+        "cpu",
+    )
+
+    receipts = [
+        record.message
+        for record in caplog.records
+        if "lora_rdt_receiver_stage" in record.message
+    ]
+    assert any(
+        "generation=3" in message
+        and "phase=nixl_pull" in message
+        and "source_bytes=8" in message
+        for message in receipts
+    )
+    assert any("phase=bf16_assembly_submit" in message for message in receipts)
+    assert any("phase=vllm_registration_submit" in message for message in receipts)
+    assert any("phase=local_stage_envelope" in message for message in receipts)
+    assert staged == [9]

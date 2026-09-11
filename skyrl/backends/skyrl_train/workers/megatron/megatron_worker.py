@@ -1801,10 +1801,15 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             )
 
         rank = torch.distributed.get_rank()
+        publication_started = time.perf_counter()
+        local_export_started = time.perf_counter()
         records = list(export(self.actor_module))
+        local_export_seconds = time.perf_counter() - local_export_started
+        local_bytes = sum(record.weight.nbytes for record in records)
         publication_states = getattr(self, "_lora_rdt_publication_states", {})
         state = publication_states.get(lora_name)
         if state is None:
+            static_initialization_started = time.perf_counter()
             _, local_sources = extract_lora_bridge_sources(records, source_rank=rank)
             gathered_sources = [None] * torch.distributed.get_world_size()
             torch.distributed.all_gather_object(gathered_sources, local_sources)
@@ -1905,23 +1910,56 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             )
             publication_states[lora_name] = state
             self._lora_rdt_publication_states = publication_states
+            logger.info(
+                "lora_rdt_publication_stage rank={} generation={} "
+                "phase=static_initialization seconds={:.6f}",
+                rank,
+                publication.request.generation,
+                time.perf_counter() - static_initialization_started,
+            )
         else:
             publication = state.planner.plan(records)
 
+        logger.info(
+            "lora_rdt_publication_stage rank={} generation={} "
+            "phase=bridge_local_export_submit seconds={:.6f} "
+            "local_tensors={} local_bytes={}",
+            rank,
+            publication.request.generation,
+            local_export_seconds,
+            len(records),
+            local_bytes,
+        )
+        source_readiness_started = time.perf_counter()
         publish_lora_sources(
             state.producer, publication, SKYRL_WORKER_NCCL_TIMEOUT_IN_S
+        )
+        logger.info(
+            "lora_rdt_publication_stage rank={} generation={} "
+            "phase=source_readiness seconds={:.6f}",
+            rank,
+            publication.request.generation,
+            time.perf_counter() - source_readiness_started,
         )
         publication_error = None
         if rank == 0:
             assert state.fleet_producers is not None
             assert state.adapter_config is not None
             try:
+                receiver_transaction_started = time.perf_counter()
                 await inference_engine_client.load_lora_rdt_adapter(
                     lora_name,
                     publication.rendezvous.to_json_dict(),
                     publication.request.to_json_dict(),
                     state.adapter_config,
                 )
+                logger.info(
+                    "lora_rdt_publication_stage rank=0 generation={} "
+                    "phase=receiver_transaction seconds={:.6f}",
+                    publication.request.generation,
+                    time.perf_counter() - receiver_transaction_started,
+                )
+                source_acknowledgement_started = time.perf_counter()
                 ray.get(
                     [
                         producer_actor.acknowledge.remote(
@@ -1933,6 +1971,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                         )
                     ]
                 )
+                logger.info(
+                    "lora_rdt_publication_stage rank=0 generation={} "
+                    "phase=source_acknowledgement seconds={:.6f}",
+                    publication.request.generation,
+                    time.perf_counter() - source_acknowledgement_started,
+                )
             except Exception as error:
                 publication_error = str(error)
                 ray.get(
@@ -1943,11 +1987,26 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                         for producer_actor in state.fleet_producers
                     ]
                 )
+        final_synchronization_started = time.perf_counter()
         errors = [publication_error]
         torch.distributed.broadcast_object_list(errors, src=0)
         if errors[0] is not None:
             raise RuntimeError(f"lora_rdt publication failed: {errors[0]}")
         torch.distributed.barrier()
+        logger.info(
+            "lora_rdt_publication_stage rank={} generation={} "
+            "phase=final_synchronization seconds={:.6f}",
+            rank,
+            publication.request.generation,
+            time.perf_counter() - final_synchronization_started,
+        )
+        logger.info(
+            "lora_rdt_publication_stage rank={} generation={} "
+            "phase=publication_envelope seconds={:.6f}",
+            rank,
+            publication.request.generation,
+            time.perf_counter() - publication_started,
+        )
 
     async def broadcast_to_inference_engines(
         self,

@@ -1,5 +1,7 @@
 """Pull rank-owned LoRA slices through NIXL and stage a vLLM adapter."""
 
+import logging
+import time
 from typing import Any, Mapping
 
 import ray
@@ -18,6 +20,8 @@ from .vllm_adapter import (
     stage_vllm_local_lora_factors,
     stage_vllm_lora_model,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def pull_and_stage_lora_adapter(
@@ -196,22 +200,63 @@ def pull_and_stage_local_lora_adapter(
     missing_producers = sorted(set(pulls_by_source) - set(producers))
     if missing_producers:
         raise ValueError(f"LoRA consumer plan requires unavailable producer ranks {missing_producers}")
+    local_stage_started = time.perf_counter()
+    pull_started = time.perf_counter()
     groups = ray.get(
         [
             producers[rank].pull_slices.remote(request.generation, [pull.source_slice for pull in pulls])
             for rank, pulls in pulls_by_source.items()
         ]
     )
+    logger.info(
+        "lora_rdt_receiver_stage generation=%s adapter_id=%s phase=nixl_pull "
+        "seconds=%.6f pulls=%s source_bytes=%s",
+        request.generation,
+        adapter_id,
+        time.perf_counter() - pull_started,
+        len(consumer_plan.pulls),
+        consumer_plan.source_bytes,
+    )
     pulled = {}
     for pulls, tensors in zip(pulls_by_source.values(), groups, strict=True):
         if len(tensors) != len(pulls):
             raise ValueError("LoRA producer returned an incorrect number of source slices")
         pulled.update(zip(pulls, tensors, strict=True))
+    assembly_started = time.perf_counter()
     factors = assemble_lora_consumer_factors(consumer_plan, pulled, device)
+    logger.info(
+        "lora_rdt_receiver_stage generation=%s adapter_id=%s "
+        "phase=bf16_assembly_submit seconds=%.6f",
+        request.generation,
+        adapter_id,
+        time.perf_counter() - assembly_started,
+    )
+    registration_started = time.perf_counter()
     stage_vllm_local_lora_factors(model_runner, adapter_id, consumer_plan.receiver_plan, factors)
-    # Keep Ray receive buffers alive until all dependent CUDA copies complete.
+    logger.info(
+        "lora_rdt_receiver_stage generation=%s adapter_id=%s "
+        "phase=vllm_registration_submit seconds=%.6f",
+        request.generation,
+        adapter_id,
+        time.perf_counter() - registration_started,
+    )
     if torch.device(device).type == "cuda":
+        completion_started = time.perf_counter()
         torch.cuda.synchronize(device)
+        logger.info(
+            "lora_rdt_receiver_stage generation=%s adapter_id=%s "
+            "phase=cuda_completion seconds=%.6f",
+            request.generation,
+            adapter_id,
+            time.perf_counter() - completion_started,
+        )
+    logger.info(
+        "lora_rdt_receiver_stage generation=%s adapter_id=%s "
+        "phase=local_stage_envelope seconds=%.6f",
+        request.generation,
+        adapter_id,
+        time.perf_counter() - local_stage_started,
+    )
 
 
 def build_vllm_lora_consumer_plan(
