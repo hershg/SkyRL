@@ -28,6 +28,10 @@ class Glm5NextModelProvider(MLAModelProvider):
 
     transformer_layer_spec: Union[ModuleSpec, Callable] = build_glm5_next_layer_spec
 
+    # DSA's PyTorch fallback materializes the dense attention matrix. GLM-5.3-Flash requires
+    # the bundled TileLang SparseMLA kernel for its native context length.
+    dsa_kernel_backend: str = "tilelang"
+
     # Manifold-Constrained Hyper-Connections.
     enable_mhc_connections: bool = True
     mhc_num_residual_streams: int = 4
