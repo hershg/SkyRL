@@ -25,9 +25,7 @@ class LoRATensorSlice:
         if not self.key:
             raise ValueError("LoRA tensor slices require a non-empty key")
         if any(dimension <= 0 for dimension in self.shape):
-            raise ValueError(
-                f"LoRA tensor {self.key!r} has an invalid shape {self.shape!r}"
-            )
+            raise ValueError(f"LoRA tensor {self.key!r} has an invalid shape {self.shape!r}")
         if (
             min(
                 self.source_rank,
@@ -43,6 +41,29 @@ class LoRATensorSlice:
 
 
 @dataclass(frozen=True)
+class LoRASourceSlice:
+    """A rectangular selection from one producer-owned adapter tensor."""
+
+    key: str
+    starts: tuple[int, ...]
+    stops: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.key or not self.starts or len(self.starts) != len(self.stops):
+            raise ValueError("LoRA source slices require a key and matching nonempty bounds")
+        if any(start < 0 or stop <= start for start, stop in zip(self.starts, self.stops)):
+            raise ValueError("LoRA source slice bounds must be nonnegative and nonempty")
+
+    def validate_shape(self, shape: tuple[int, ...]) -> None:
+        if len(shape) != len(self.stops) or any(stop > size for stop, size in zip(self.stops, shape)):
+            raise ValueError(f"LoRA source slice {self.key!r} exceeds source shape {shape}")
+
+    @property
+    def indices(self) -> tuple[slice, ...]:
+        return tuple(slice(start, stop) for start, stop in zip(self.starts, self.stops))
+
+
+@dataclass(frozen=True)
 class LoRAAdapterLayout:
     """The fixed, content-independent transport layout for one named adapter."""
 
@@ -55,21 +76,14 @@ class LoRAAdapterLayout:
         if not self.adapter_name:
             raise ValueError("LoRA adapter layouts require a non-empty adapter name")
         if self.source_dtype != "float32":
-            raise ValueError(
-                f"lora_rdt requires float32 sources, got {self.source_dtype!r}"
-            )
+            raise ValueError(f"lora_rdt requires float32 sources, got {self.source_dtype!r}")
         if not self.tensors:
             raise ValueError("LoRA adapter layouts require at least one tensor")
         keys = [tensor.key for tensor in self.tensors]
         if keys != sorted(keys) or len(keys) != len(set(keys)):
-            raise ValueError(
-                "LoRA adapter layout tensor keys must be sorted and unique"
-            )
+            raise ValueError("LoRA adapter layout tensor keys must be sorted and unique")
         for tensor in self.tensors:
-            expected_bytes = (
-                prod(tensor.shape)
-                * torch.tensor([], dtype=torch.float32).element_size()
-            )
+            expected_bytes = prod(tensor.shape) * torch.tensor([], dtype=torch.float32).element_size()
             if tensor.byte_length != expected_bytes:
                 raise ValueError(
                     f"LoRA tensor {tensor.key!r} has byte_length={tensor.byte_length}, expected {expected_bytes} "
@@ -80,9 +94,7 @@ class LoRAAdapterLayout:
             "source_dtype": self.source_dtype,
             "tensors": [asdict(tensor) for tensor in self.tensors],
         }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         object.__setattr__(self, "layout_digest", hashlib.sha256(encoded).hexdigest())
 
 
@@ -105,9 +117,7 @@ def build_lora_adapter_layout(
     for key in sorted(tensors):
         tensor = tensors[key]
         if tensor.dtype is not torch.float32:
-            raise ValueError(
-                f"lora_rdt requires float32 source tensor {key!r}, got {tensor.dtype}"
-            )
+            raise ValueError(f"lora_rdt requires float32 source tensor {key!r}, got {tensor.dtype}")
         source_rank, destination_rank = ownership[key]
         byte_length = tensor.numel() * tensor.element_size()
         source_offset = source_offsets.get(source_rank, 0)
@@ -125,9 +135,7 @@ def build_lora_adapter_layout(
         )
         source_offsets[source_rank] = source_offset + byte_length
         destination_offsets[destination_rank] = destination_offset + byte_length
-    return LoRAAdapterLayout(
-        adapter_name=adapter_name, source_dtype="float32", tensors=tuple(slices)
-    )
+    return LoRAAdapterLayout(adapter_name=adapter_name, source_dtype="float32", tensors=tuple(slices))
 
 
 @dataclass(frozen=True)
@@ -156,9 +164,7 @@ class LoRAUpdateRequest:
     source_dtype: str
 
     @classmethod
-    def from_layout(
-        cls, layout: LoRAAdapterLayout, generation: int
-    ) -> "LoRAUpdateRequest":
+    def from_layout(cls, layout: LoRAAdapterLayout, generation: int) -> "LoRAUpdateRequest":
         return cls(
             adapter_name=layout.adapter_name,
             generation=generation,
@@ -177,13 +183,9 @@ class LoRAUpdateRequest:
         if not self.adapter_name:
             raise ValueError("LoRA update requests require a non-empty adapter name")
         if self.generation < 0:
-            raise ValueError(
-                f"LoRA generation must be non-negative, got {self.generation}"
-            )
+            raise ValueError(f"LoRA generation must be non-negative, got {self.generation}")
         if self.source_dtype != "float32":
-            raise ValueError(
-                f"lora_rdt requires float32 sources, got {self.source_dtype!r}"
-            )
+            raise ValueError(f"lora_rdt requires float32 sources, got {self.source_dtype!r}")
         if len(self.layout_digest) != 64:
             raise ValueError("LoRA update requests require a SHA-256 layout digest")
 
@@ -214,21 +216,14 @@ class LoRAAdapterGenerationState:
     def active_buffers(self) -> Mapping[int, Any]:
         return dict(self._active_buffers)
 
-    def stage(
-        self, request: LoRAUpdateRequest, inference_rank: int, buffer: Any
-    ) -> None:
+    def stage(self, request: LoRAUpdateRequest, inference_rank: int, buffer: Any) -> None:
         """Record one fully validated staging buffer before group activation."""
         self._validate_request(request)
         if inference_rank not in self._init_info.inference_ranks:
-            raise ValueError(
-                f"Inference rank {inference_rank} is not part of this adapter receiver"
-            )
+            raise ValueError(f"Inference rank {inference_rank} is not part of this adapter receiver")
         if buffer is None:
             raise ValueError("lora_rdt cannot stage an empty adapter buffer")
-        if (
-            self._active_generation is not None
-            and request.generation <= self._active_generation
-        ):
+        if self._active_generation is not None and request.generation <= self._active_generation:
             raise ValueError(
                 f"LoRA generation {request.generation} is stale; active generation is {self._active_generation}"
             )
@@ -269,17 +264,11 @@ class LoRAAdapterGenerationState:
     def _validate_request(self, request: LoRAUpdateRequest) -> None:
         layout = self._init_info.layout
         if request.adapter_name != layout.adapter_name:
-            raise ValueError(
-                f"LoRA request adapter {request.adapter_name!r} does not match {layout.adapter_name!r}"
-            )
+            raise ValueError(f"LoRA request adapter {request.adapter_name!r} does not match {layout.adapter_name!r}")
         if request.layout_digest != layout.layout_digest:
-            raise ValueError(
-                "LoRA request layout digest does not match the initialized receiver layout"
-            )
+            raise ValueError("LoRA request layout digest does not match the initialized receiver layout")
         if request.source_dtype != layout.source_dtype:
-            raise ValueError(
-                "LoRA request source dtype does not match the initialized receiver layout"
-            )
+            raise ValueError("LoRA request source dtype does not match the initialized receiver layout")
 
 
 def materialize_bf16_adapter_tensor(source: torch.Tensor) -> torch.Tensor:

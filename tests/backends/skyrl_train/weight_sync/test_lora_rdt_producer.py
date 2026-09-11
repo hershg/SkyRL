@@ -1,3 +1,6 @@
+import gc
+import weakref
+
 import pytest
 import torch
 
@@ -9,6 +12,7 @@ from skyrl.backends.skyrl_train.weight_sync.lora_rdt import (
     LoRATensorSlice,
     LoRAUpdateRequest,
 )
+from skyrl.backends.skyrl_train.weight_sync.lora_rdt.contracts import LoRASourceSlice
 
 
 @pytest.fixture
@@ -147,9 +151,7 @@ def test_discard_serializes_with_inflight_publish(layout, monkeypatch):
 
     monkeypatch.setattr(producer, "_validate_request", delayed_validate)
     with ThreadPoolExecutor(max_workers=2) as executor:
-        publication = executor.submit(
-            producer.publish, request, {"a": torch.ones(2)}, 1
-        )
+        publication = executor.submit(producer.publish, request, {"a": torch.ones(2)}, 1)
         try:
             assert entered.wait(5)
             cleanup = executor.submit(discard)
@@ -160,3 +162,55 @@ def test_discard_serializes_with_inflight_publish(layout, monkeypatch):
         cleanup.result(timeout=5)
 
     assert producer.retained_generations() == []
+
+
+def test_slice_pull_packs_only_consumed_fp32_bytes_and_releases_after_last_ack():
+    layout = LoRAAdapterLayout("adapter", "float32", (LoRATensorSlice("a", (4, 16), 0, 0, 0, 0, 256),))
+    producer = LoRardtProducer(0, layout)
+    source = torch.arange(64, dtype=torch.float32).reshape(4, 16) + 0.03125
+    producer.publish(LoRAUpdateRequest.from_layout(layout, 1), {"a": source}, 2)
+    selections = [
+        LoRASourceSlice("a", (1, 0), (3, 16)),
+        LoRASourceSlice("a", (0, 5), (4, 7)),
+    ]
+    packed = producer.pull_slices(1, selections)
+    for selection, tensor in zip(selections, packed):
+        assert torch.equal(tensor, source[selection.indices])
+        assert tensor.dtype == torch.float32
+        assert tensor.is_contiguous() and tensor.storage_offset() == 0
+        assert tensor.untyped_storage().nbytes() == tensor.numel() * 4
+        assert tensor.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+    assert sum(tensor.numel() * 4 for tensor in packed) == 160
+    repeated = producer.pull_slices(1, selections)
+    assert all(first is second for first, second in zip(packed, repeated))
+    references = [weakref.ref(tensor) for tensor in packed]
+    del packed, repeated, tensor
+    gc.collect()
+    assert not producer.acknowledge(1, 0)
+    assert all(reference() is not None for reference in references)
+    assert producer.acknowledge(1, 1)
+    gc.collect()
+    assert all(reference() is None for reference in references)
+    with pytest.raises(ValueError, match="not retained"):
+        producer.pull_slices(1, selections)
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        LoRASourceSlice("missing", (0,), (1,)),
+        LoRASourceSlice("a", (0, 0), (1, 1)),
+        LoRASourceSlice("a", (0,), (3,)),
+    ],
+)
+def test_invalid_slice_pull_does_not_change_published_source(layout, selection):
+    producer = LoRardtProducer(0, layout)
+    source = torch.tensor([1.03125, 2.03125])
+    producer.publish(LoRAUpdateRequest.from_layout(layout, 1), {"a": source}, 1)
+    with pytest.raises(ValueError, match="does not own|exceeds source shape"):
+        producer.pull_slices(1, [LoRASourceSlice("a", (0,), (1,)), selection])
+    assert torch.equal(producer.pull(1, ["a"])["a"], source)
+    assert producer.retained_generations() == [1]
+    producer.discard(1)
+    with pytest.raises(ValueError, match="not retained"):
+        producer.pull_slices(1, [LoRASourceSlice("a", (0,), (1,))])
