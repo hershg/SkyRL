@@ -17,6 +17,7 @@ checkpoints and HF bridges carry over unchanged.
 from typing import Optional
 
 import torch
+from megatron.core import tensor_parallel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
@@ -68,24 +69,26 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             **kwargs,
         )
         if not getattr(config, "enable_mhc_connections", False):
-            raise ValueError("HyperConnectionTransformerLayer requires enable_mhc_connections=True.")
+            raise ValueError(
+                "HyperConnectionTransformerLayer requires enable_mhc_connections=True."
+            )
         if not isinstance(self.cross_attention, IdentityOp):
-            raise ValueError("HyperConnectionTransformerLayer does not support cross-attention.")
-        if self.recompute_input_layernorm or self.recompute_pre_mlp_layernorm or self.recompute_mlp:
+            raise ValueError(
+                "HyperConnectionTransformerLayer does not support cross-attention."
+            )
+        if (
+            self.recompute_input_layernorm
+            or self.recompute_pre_mlp_layernorm
+            or self.recompute_mlp
+        ):
             raise NotImplementedError(
                 "Selective 'layernorm'/'mlp' activation recompute is not supported by "
                 "HyperConnectionTransformerLayer."
             )
-        # megatron-core's mHC layer threads a CheckpointWithoutOutputManager through every mHC
-        # site; this layer does not, and TransformerBlock builds those managers purely from the
-        # config, so accepting 'mhc' here would silently drop the recompute rather than apply it.
-        if config.recompute_granularity == "selective" and "mhc" in (config.recompute_modules or ()):
-            raise NotImplementedError(
-                "'mhc' in recompute_modules is not supported by this layer; drop it from "
-                "recompute_modules (selective recompute of the other modules still applies)."
-            )
         if config.fp32_residual_connection:
-            raise NotImplementedError("fp32_residual_connection is not supported with mHC streams.")
+            raise NotImplementedError(
+                "fp32_residual_connection is not supported with mHC streams."
+            )
 
         # megatron-core builds these from ``submodules.self_attention_hyper_connection`` /
         # ``mlp_hyper_connection`` specs; ``TransformerLayerSubmodules`` has no such slots, so
@@ -97,11 +100,33 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             else HyperConnectionModule
         )
         with torch.device(torch.cuda.current_device()):
-            self.self_attention_hyper_connection = hyper_connection_cls(config=config, layer_number=self.layer_number)
-            self.mlp_hyper_connection = hyper_connection_cls(config=config, layer_number=self.layer_number)
+            self.self_attention_hyper_connection = hyper_connection_cls(
+                config=config, layer_number=self.layer_number
+            )
+            self.mlp_hyper_connection = hyper_connection_cls(
+                config=config, layer_number=self.layer_number
+            )
         if config.params_dtype is not None:
-            convert_module_to_dtype_except_fp32_marked(self.self_attention_hyper_connection, config.params_dtype)
-            convert_module_to_dtype_except_fp32_marked(self.mlp_hyper_connection, config.params_dtype)
+            convert_module_to_dtype_except_fp32_marked(
+                self.self_attention_hyper_connection, config.params_dtype
+            )
+            convert_module_to_dtype_except_fp32_marked(
+                self.mlp_hyper_connection, config.params_dtype
+            )
+
+        self.mhc_checkpoint_input_layernorm = not isinstance(
+            self.input_layernorm, IdentityOp
+        )
+        self.mhc_checkpoint_pre_mlp_layernorm = not isinstance(
+            self.pre_mlp_layernorm, IdentityOp
+        )
+        self._mhc_recompute_manager = None
+
+    def __call__(self, *args, **kwargs):
+        # CheckpointWithoutOutputManager is not a supported CUDA-graph kwarg. Match MCore's mHC
+        # layer by removing it before the inherited graph dispatch and reading it from the layer.
+        self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
+        return super().__call__(*args, **kwargs)
 
     @staticmethod
     def _reject_residual_returning_norm(layernorm_output, norm_name: str):
@@ -134,18 +159,28 @@ class HyperConnectionTransformerLayer(TransformerLayer):
     ):
         """Run one mHC block over n-stream hidden states (``[s, b, n * hidden_size]``)."""
         if context is not None:
-            raise ValueError("HyperConnectionTransformerLayer does not support cross-attention context.")
-        if mhc_recompute_manager is not None:
-            raise NotImplementedError(
-                "HyperConnectionTransformerLayer does not implement mHC activation recompute; "
-                "drop 'mhc' from recompute_modules."
+            raise ValueError(
+                "HyperConnectionTransformerLayer does not support cross-attention context."
             )
+        mhc_recompute_manager = self._mhc_recompute_manager or mhc_recompute_manager
 
         # Self-attention site.
         residual = hidden_states
-        aggregated, h_res, h_post = self.self_attention_hyper_connection(hidden_states)
+        aggregated, h_res, h_post = self.self_attention_hyper_connection(
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+        )
+        if mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm:
+            input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=mhc_recompute_manager
+            )
+            input_layernorm_output = input_layernorm_checkpoint.checkpoint(
+                self.input_layernorm, aggregated
+            )
+        else:
+            input_layernorm_checkpoint = None
+            input_layernorm_output = self.input_layernorm(aggregated)
         input_layernorm_output = self._reject_residual_returning_norm(
-            self.input_layernorm(aggregated), "input_layernorm"
+            input_layernorm_output, "input_layernorm"
         )
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
@@ -159,6 +194,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
+        if input_layernorm_checkpoint is not None:
+            input_layernorm_checkpoint.discard_output_and_register_recompute(
+                attention_output_with_bias[0]
+            )
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.self_attention_hyper_connection.fused_h_res_h_post_bda(
                 h_res,
@@ -168,22 +207,54 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 self.hidden_dropout,
                 self.training,
                 self.config.bias_dropout_fusion,
+                mhc_recompute_manager,
             )
 
         # MLP / MoE site.
         residual = hidden_states
-        aggregated, h_res, h_post = self.mlp_hyper_connection(hidden_states)
+        aggregated, h_res, h_post = self.mlp_hyper_connection(
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+        )
+        if mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm:
+            pre_mlp_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=mhc_recompute_manager
+            )
+            pre_mlp_layernorm_output = pre_mlp_layernorm_checkpoint.checkpoint(
+                self.pre_mlp_layernorm, aggregated
+            )
+        else:
+            pre_mlp_layernorm_checkpoint = None
+            pre_mlp_layernorm_output = self.pre_mlp_layernorm(aggregated)
         pre_mlp_layernorm_output = self._reject_residual_returning_norm(
-            self.pre_mlp_layernorm(aggregated), "pre_mlp_layernorm"
+            pre_mlp_layernorm_output, "pre_mlp_layernorm"
         )
-        pre_mlp_layernorm_output, moe_padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
-            pre_mlp_layernorm_output, padding_mask, packed_seq_params
+        pre_mlp_layernorm_output, moe_padding_mask, moe_unflatten_mbs = (
+            self._maybe_unflatten_for_moe(
+                pre_mlp_layernorm_output, padding_mask, packed_seq_params
+            )
         )
-        mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=moe_padding_mask)
+        mlp_output_with_bias = self.mlp(
+            pre_mlp_layernorm_output, padding_mask=moe_padding_mask
+        )
         if moe_unflatten_mbs is not None:
             mlp_output, mlp_bias = mlp_output_with_bias
-            mlp_output = self._maybe_reflatten_from_moe(mlp_output, packed_seq_params, moe_unflatten_mbs)
+            mlp_output = self._maybe_reflatten_from_moe(
+                mlp_output, packed_seq_params, moe_unflatten_mbs
+            )
             mlp_output_with_bias = (mlp_output, mlp_bias)
+        is_last_in_recompute_block = bool(
+            mhc_recompute_manager is not None
+            and getattr(
+                mhc_recompute_manager, "is_last_layer_in_recompute_block", False
+            )
+        )
+        mhc_mlp_bda_manager = (
+            None if is_last_in_recompute_block else mhc_recompute_manager
+        )
+        if pre_mlp_layernorm_checkpoint is not None and mhc_mlp_bda_manager is not None:
+            pre_mlp_layernorm_checkpoint.discard_output_and_register_recompute(
+                mlp_output_with_bias[0]
+            )
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
                 h_res,
@@ -193,7 +264,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 self.hidden_dropout,
                 self.training,
                 self.config.bias_dropout_fusion,
+                mhc_mlp_bda_manager,
             )
 
-        output = make_viewless_tensor(inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True)
+        output = make_viewless_tensor(
+            inp=hidden_states,
+            requires_grad=hidden_states.requires_grad,
+            keep_graph=True,
+        )
         return output, None
