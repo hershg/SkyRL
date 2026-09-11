@@ -559,13 +559,15 @@ class SkyRLTrainBackend(AbstractBackend):
         return ResolvedPlacementGroup(pg)
 
     def _unload_inference_adapter(self, model_id: str) -> None:
-        """Drop a deleted tenant's LoRA adapter from the inference engines.
+        """Release inference state before deleting the trainer slot.
 
-        Only adapters actually registered on vLLM (via save_sampler_checkpoint)
-        are unloaded. Best-effort: vLLM may have LRU-evicted the adapter
-        already, and an inference-side failure must not block the tenant's
-        removal from the training runtime.
+        RDT cleanup errors leave admission closed and prevent trainer deletion.
+        Disk-backed adapters retain their existing best-effort unload behavior.
         """
+        if self._cfg.generator.inference_engine.weight_sync_backend == "lora_rdt":
+            asyncio.run(self._inference_engine_client.unload_lora_rdt_adapter(model_id))
+            self._inference_adapter_ids.discard(model_id)
+            return
         if model_id not in self._inference_adapter_ids:
             return
         try:

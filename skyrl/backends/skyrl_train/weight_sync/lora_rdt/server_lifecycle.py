@@ -24,6 +24,7 @@ class LoRardtServerLifecycle:
         self._active_ids: dict[str, int] = {}
         self._staged: dict[str, tuple[LoRAUpdateRequest, int, int | None]] = {}
         self._terminal: dict[str, tuple[LoRAUpdateRequest, int, str]] = {}
+        self._unloaded: set[str] = set()
 
     def get_active_adapter_id(self, adapter_name: str) -> int | None:
         """Return the currently routable adapter id for one adapter name."""
@@ -38,6 +39,8 @@ class LoRardtServerLifecycle:
         adapter_config: Mapping[str, Any],
     ) -> None:
         """Stage local TP buffers without changing the named request route."""
+        if request.adapter_name in self._unloaded:
+            raise ValueError(f"LoRA adapter {request.adapter_name!r} has been unloaded")
         self._validate_update(rendezvous, request, adapter_id)
         if self._get_terminal_outcome(request, adapter_id) is not None:
             raise ValueError(f"LoRA generation {request.generation} has already completed")
@@ -107,6 +110,17 @@ class LoRardtServerLifecycle:
         self._staged.pop(request.adapter_name, None)
         self._terminal[request.adapter_name] = (request, adapter_id, "rolled_back")
         return True
+
+    async def unload(self, engine: Any, adapter_name: str) -> None:
+        """Release the active buffer while admission is closed, retaining a name tombstone."""
+        if adapter_name in self._staged:
+            raise ValueError(f"LoRA adapter {adapter_name!r} has an unfinished replacement")
+        self._unloaded.add(adapter_name)
+        adapter_id = self._active_ids.get(adapter_name)
+        if adapter_id is not None:
+            await engine.collective_rpc(LORA_RDT_REMOVE_METHOD, kwargs={"adapter_id": adapter_id})
+        self._active_ids.pop(adapter_name, None)
+        self._terminal.pop(adapter_name, None)
 
     def _get_terminal_outcome(self, request: LoRAUpdateRequest, adapter_id: int) -> str | None:
         terminal = self._terminal.get(request.adapter_name)

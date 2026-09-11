@@ -552,6 +552,20 @@ class VLLMServerActor(ServerActorProtocol):
                         models.lora_requests[lora_name] = previous
             return {"status": "rolled_back"}
 
+        @app.post("/skyrl/v1/unload_lora_rdt_adapter")
+        async def _skyrl_unload_lora_rdt_adapter(request: Request):
+            body = await request.json()
+            lora_name = body["lora_name"]
+            models = request.app.state.openai_serving_models
+            async with models.lora_resolver_lock[lora_name]:
+                try:
+                    await _lora_rdt_lifecycle(models).unload(engine, lora_name)
+                except Exception as error:
+                    raise HTTPException(status_code=500, detail=str(error)) from error
+                models.lora_requests.pop(lora_name, None)
+                getattr(models, "_skyrl_lora_rdt_previous_requests", {}).pop(lora_name, None)
+            return {"status": "unloaded"}
+
         @app.post("/skyrl/v1/load_lora_adapter")
         async def _skyrl_load_lora_adapter(request: Request):
             """Load a LoRA adapter from disk, replacing any existing adapter

@@ -106,3 +106,12 @@ async def test_terminal_http_replays_preserve_restored_route_and_newer_transacti
         assert models.lora_requests["adapter"] is new_route
         assert models._skyrl_lora_rdt_previous_requests == previous_requests
         assert models._skyrl_lora_rdt_lifecycle._staged["adapter"][1] == later["adapter_id"]
+
+        assert (await phase("rollback", later)).status_code == 200
+        response = await client.post("/skyrl/v1/unload_lora_rdt_adapter", json={"lora_name": "adapter"})
+        assert response.status_code == 200
+        assert "adapter" not in models.lora_requests
+        assert "adapter" not in models._skyrl_lora_rdt_previous_requests
+        calls_after_unload = list(calls)
+        assert (await client.post("/skyrl/v1/unload_lora_rdt_adapter", json={"lora_name": "adapter"})).status_code == 200
+        assert calls == calls_after_unload

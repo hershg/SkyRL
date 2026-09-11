@@ -1357,6 +1357,13 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
         return {url: resp for url, resp in results}
 
+    async def unload_lora_rdt_adapter(self, lora_name: str) -> Dict[str, Any]:
+        """Drain the fleet and release receiver buffers before reopening admission."""
+        await self._call_all_servers("/skyrl/v1/pause_lora_rdt")
+        result = await self._call_all_servers("/skyrl/v1/unload_lora_rdt_adapter", {"lora_name": lora_name})
+        await self._call_all_servers("/skyrl/v1/resume_lora_rdt")
+        return result
+
     async def unload_lora_adapter(self, lora_name: str) -> Dict[str, Any]:
         """
         Unload a previously-loaded LoRA adapter on all backend servers via /v1/unload_lora_adapter.

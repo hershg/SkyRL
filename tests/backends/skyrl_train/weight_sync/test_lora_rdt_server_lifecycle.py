@@ -165,3 +165,58 @@ async def test_partial_stage_cleanup_failure_is_explicit():
 
     with pytest.raises(LoRardtRollbackError, match="could not discard partially staged"):
         await lifecycle.stage(engine, _rendezvous(), _request(), 4, {"r": 2})
+
+
+@pytest.mark.asyncio
+async def test_unload_releases_active_buffer_once_and_rejects_late_publication():
+    lifecycle = LoRardtServerLifecycle()
+    engine = _Engine()
+    await lifecycle.stage(engine, _rendezvous(), _request(), 4, {"r": 2})
+    await lifecycle.activate(engine, _request(), 4)
+    await lifecycle.commit(engine, _request(), 4)
+
+    await lifecycle.unload(engine, "adapter")
+    calls = list(engine.calls)
+    await lifecycle.unload(engine, "adapter")
+    with pytest.raises(ValueError, match="unloaded"):
+        await lifecycle.stage(engine, _rendezvous(), _request(2), 5, {"r": 2})
+
+    assert engine.calls == calls
+    assert calls[-1] == ("remove_lora_rdt_adapter", {"adapter_id": 4})
+    assert lifecycle.get_active_adapter_id("adapter") is None
+
+
+@pytest.mark.asyncio
+async def test_failed_unload_can_retry_without_admitting_another_generation():
+    lifecycle = LoRardtServerLifecycle()
+    engine = _Engine()
+    await lifecycle.stage(engine, _rendezvous(), _request(), 4, {"r": 2})
+    await lifecycle.activate(engine, _request(), 4)
+    await lifecycle.commit(engine, _request(), 4)
+    engine.fail_methods.add("remove_lora_rdt_adapter")
+
+    with pytest.raises(RuntimeError, match="forced"):
+        await lifecycle.unload(engine, "adapter")
+    with pytest.raises(ValueError, match="unloaded"):
+        await lifecycle.stage(engine, _rendezvous(), _request(2), 5, {"r": 2})
+
+    assert lifecycle.get_active_adapter_id("adapter") == 4
+    engine.fail_methods.clear()
+    await lifecycle.unload(engine, "adapter")
+    assert lifecycle.get_active_adapter_id("adapter") is None
+
+
+@pytest.mark.asyncio
+async def test_unload_requires_pending_replacement_to_finish_before_removing_buffers():
+    lifecycle = LoRardtServerLifecycle()
+    engine = _Engine()
+    await lifecycle.stage(engine, _rendezvous(), _request(), 4, {"r": 2})
+    before = list(engine.calls)
+
+    with pytest.raises(ValueError, match="unfinished replacement"):
+        await lifecycle.unload(engine, "adapter")
+
+    assert engine.calls == before
+    await lifecycle.rollback(engine, _request(), 4)
+    await lifecycle.unload(engine, "adapter")
+    assert lifecycle.get_active_adapter_id("adapter") is None

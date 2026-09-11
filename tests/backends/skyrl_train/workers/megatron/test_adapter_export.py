@@ -1,8 +1,12 @@
 import tempfile
+from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
 import torch
 
 from skyrl.backends.skyrl_train.workers.megatron.megatron_worker import (
+    MegatronPolicyWorkerBase,
     _compact_adapter_state,
 )
 
@@ -46,3 +50,43 @@ def test_compact_adapter_state_keeps_nonduplicated_state_in_safetensors_path():
     }
 
     assert _compact_adapter_state(state) is None
+
+
+@pytest.mark.parametrize("kill_fails", [False, True])
+def test_rdt_delete_releases_owned_producer_before_training_slot(
+    monkeypatch, kill_fails
+):
+    worker = object.__new__(MegatronPolicyWorkerBase)
+    worker._rank = 1
+    worker.cfg = SimpleNamespace(
+        policy=SimpleNamespace(
+            model=SimpleNamespace(lora=SimpleNamespace(lora_sync_path="/unused"))
+        )
+    )
+    worker.adapter_store = Mock()
+    actor = object()
+    worker._lora_rdt_producers = {"adapter": actor}
+    worker._lora_rdt_planners = {"adapter": object()}
+    events = []
+
+    def kill(handle, no_restart):
+        assert handle is actor
+        assert no_restart
+        events.append("producer")
+        if kill_fails:
+            raise RuntimeError("producer teardown failed")
+
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.workers.megatron.megatron_worker.ray.kill", kill
+    )
+    worker.adapter_store.delete.side_effect = lambda name: events.append("trainer")
+    if kill_fails:
+        with pytest.raises(RuntimeError, match="producer teardown failed"):
+            worker.delete_adapter("adapter")
+        assert worker._lora_rdt_producers == {"adapter": actor}
+        assert events == ["producer"]
+    else:
+        worker.delete_adapter("adapter")
+        assert worker._lora_rdt_producers == {}
+        assert worker._lora_rdt_planners == {}
+        assert events == ["producer", "trainer"]

@@ -37,10 +37,13 @@ def _backend(
 ) -> SkyRLTrainBackend:
     """Build a backend in the post-create_model state without running __init__."""
     backend = object.__new__(SkyRLTrainBackend)
-    backend.config = MegatronBackendOverrides(keep_runtime_warm_on_last_unload=keep_runtime_warm)
+    backend.config = MegatronBackendOverrides(
+        keep_runtime_warm_on_last_unload=keep_runtime_warm
+    )
     backend._model_ids_to_role = {model_id: "policy" for model_id in model_ids}
     backend._model_metadata = {
-        model_id: types.ModelMetadata(adapter_index=0, lora_config=LORA_CONFIG) for model_id in model_ids
+        model_id: types.ModelMetadata(adapter_index=0, lora_config=LORA_CONFIG)
+        for model_id in model_ids
     }
     backend._cfg = Mock()
     backend._cfg.trainer.strategy = strategy
@@ -53,7 +56,9 @@ def _backend(
     backend._inference_adapter_ids = set()
     backend._renderer = None
     backend._render_server = None
-    backend._base_lora_signature = (LORA_CONFIG.rank, int(LORA_CONFIG.alpha)) if lora else None
+    backend._base_lora_signature = (
+        (LORA_CONFIG.rank, int(LORA_CONFIG.alpha)) if lora else None
+    )
     backend._server_groups = []
     backend._inference_router = None
     backend._inference_state_publisher = Mock()
@@ -87,7 +92,11 @@ def test_profiler_advances_once_per_policy_optimizer_step(enabled):
     backend = _backend(keep_runtime_warm=True)
     backend._cfg.trainer.policy.torch_profiler_config.enable = enabled
     backend._dispatch.optim_step.return_value = 1.0
-    request = types.OptimStepInput(adam_params=types.AdamParams(learning_rate=1e-5))
+    request = types.OptimStepInput(
+        adam_params=types.AdamParams(
+            learning_rate=1e-5, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.0
+        )
+    )
     backend.optim_step("model-a", request)
     assert backend._dispatch.profile_step.call_count == int(enabled)
     if enabled:
@@ -152,7 +161,9 @@ def test_delete_unloads_synced_adapter_from_inference_engines():
 
     backend.delete_model("model-a")
 
-    backend._inference_engine_client.unload_lora_adapter.assert_awaited_once_with("model-a")
+    backend._inference_engine_client.unload_lora_adapter.assert_awaited_once_with(
+        "model-a"
+    )
     assert backend._inference_adapter_ids == set()
 
 
@@ -167,7 +178,9 @@ def test_delete_skips_inference_unload_for_unsynced_adapter():
 def test_delete_proceeds_when_inference_unload_fails():
     backend = _backend(keep_runtime_warm=True)
     backend._inference_adapter_ids.add("model-a")
-    backend._inference_engine_client.unload_lora_adapter.side_effect = RuntimeError("vLLM unreachable")
+    backend._inference_engine_client.unload_lora_adapter.side_effect = RuntimeError(
+        "vLLM unreachable"
+    )
 
     backend.delete_model("model-a")
 
@@ -190,3 +203,32 @@ def test_create_model_signature_mismatch_rejected_against_warm_runtime():
 
     with pytest.raises(ValueError, match="LoRA signature mismatch"):
         backend.create_model("model-b", types.LoraConfig(rank=16, alpha=32, seed=0))
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_rdt_delete_requires_receiver_cleanup_before_releasing_trainer(cleanup_fails):
+    backend = _backend(keep_runtime_warm=True)
+    backend._cfg.generator.inference_engine.weight_sync_backend = "lora_rdt"
+    events = []
+
+    async def unload(name):
+        events.append("receiver_cleanup")
+        if cleanup_fails:
+            raise RuntimeError("receiver cleanup failed")
+
+    backend._inference_engine_client.unload_lora_rdt_adapter = AsyncMock(
+        side_effect=unload
+    )
+    backend._dispatch.delete_adapter.side_effect = lambda *args: events.append(
+        "trainer_cleanup"
+    )
+    if cleanup_fails:
+        with pytest.raises(RuntimeError, match="receiver cleanup failed"):
+            backend.delete_model("model-a")
+        assert backend._model_ids_to_role == {"model-a": "policy"}
+        assert events == ["receiver_cleanup"]
+    else:
+        backend.delete_model("model-a")
+        assert events == ["receiver_cleanup", "trainer_cleanup"]
+        assert backend._model_ids_to_role == {}
+    backend._inference_engine_client.unload_lora_adapter.assert_not_awaited()

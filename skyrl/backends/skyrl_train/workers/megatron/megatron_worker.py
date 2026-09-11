@@ -1828,6 +1828,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 ),
                 runtime_env={"env_vars": env_vars},
             ).remote(rank, layout)
+        producer_handles = getattr(self, "_lora_rdt_producers", {})
+        producer_handles[lora_name] = producer
+        self._lora_rdt_producers = producer_handles
         actor_names = [None] * torch.distributed.get_world_size()
         torch.distributed.all_gather_object(actor_names, actor_name)
         planner = getattr(self, "_lora_rdt_planners", {}).get(lora_name)
@@ -1990,6 +1993,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
     def delete_adapter(self, model_id: str) -> None:
         if self.adapter_store is None:
             raise RuntimeError("AdapterStore not initialised (FFT path)")
+        lora_name, _ = self._resolve_lora_sync_target(model_id)
+        producers = getattr(self, "_lora_rdt_producers", {})
+        if lora_name in producers:
+            ray.kill(producers[lora_name], no_restart=True)
+            del producers[lora_name]
+            getattr(self, "_lora_rdt_planners", {}).pop(lora_name, None)
         self.adapter_store.delete(model_id)
         # Drop the per-tenant safetensors subdir written by
         # _save_lora_adapters_and_sync. Rank 0 wrote it; rank 0 cleans it.

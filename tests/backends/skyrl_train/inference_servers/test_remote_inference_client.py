@@ -1501,3 +1501,27 @@ class TestFinishSession:
             await client.finish_session("traj-unreachable")
         finally:
             await client.teardown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_unload", [False, True])
+async def test_rdt_unload_reopens_admission_only_after_complete_fleet_cleanup(client, monkeypatch, fail_unload):
+    calls = []
+
+    async def call_servers(endpoint, payload=None):
+        calls.append((endpoint, payload))
+        if endpoint == "/skyrl/v1/unload_lora_rdt_adapter" and fail_unload:
+            raise RuntimeError("receiver cleanup failed")
+        return {"server": {"status": 200}}
+
+    monkeypatch.setattr(client, "_call_all_servers", call_servers)
+    if fail_unload:
+        with pytest.raises(RuntimeError, match="receiver cleanup failed"):
+            await client.unload_lora_rdt_adapter("adapter")
+    else:
+        await client.unload_lora_rdt_adapter("adapter")
+    assert calls[:2] == [
+        ("/skyrl/v1/pause_lora_rdt", None),
+        ("/skyrl/v1/unload_lora_rdt_adapter", {"lora_name": "adapter"}),
+    ]
+    assert calls[2:] == ([] if fail_unload else [("/skyrl/v1/resume_lora_rdt", None)])
