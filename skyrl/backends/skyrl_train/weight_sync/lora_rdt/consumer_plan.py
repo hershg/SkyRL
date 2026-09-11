@@ -1,6 +1,7 @@
 """Plan producer-owned rectangles directly into receiver-local LoRA factors."""
 
 from dataclasses import dataclass
+from heapq import heappop, heappush
 from math import prod
 from typing import Any, Mapping
 
@@ -258,13 +259,21 @@ def _get_factor_regions(module, factor, component, shape, rank):
 
 
 def _validate_factor_coverage(shape, copies):
-    for index, copy in enumerate(copies):
-        if any(a < 0 or b > size for a, b, size in zip(copy.starts, copy.stops, shape, strict=True)):
+    active: dict[int, LoRAConsumerCopy] = {}
+    endings: list[tuple[int, int]] = []
+    actual = 0
+    for index, copy in enumerate(sorted(copies, key=lambda item: item.starts[0])):
+        if any(a < 0 or b <= a or b > size for a, b, size in zip(copy.starts, copy.stops, shape, strict=True)):
             raise ValueError("Consumer source mapping exceeds the local destination")
-        for previous in copies[:index]:
+        while endings and endings[0][0] <= copy.starts[0]:
+            _, expired = heappop(endings)
+            del active[expired]
+        for previous in active.values():
             if _intersect(copy.starts, copy.stops, previous.starts, previous.stops):
                 raise ValueError("Consumer source ownership overlaps in the destination")
-    actual = sum(prod(b - a for a, b in zip(copy.starts, copy.stops)) for copy in copies)
+        active[index] = copy
+        heappush(endings, (copy.stops[0], index))
+        actual += prod(b - a for a, b in zip(copy.starts, copy.stops))
     if actual != prod(shape):
         raise ValueError("Consumer sources do not cover the complete local destination")
 

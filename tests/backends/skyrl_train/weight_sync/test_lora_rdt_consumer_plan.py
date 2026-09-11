@@ -1,4 +1,5 @@
 from dataclasses import replace
+from itertools import permutations
 from math import prod
 from types import SimpleNamespace
 
@@ -509,3 +510,35 @@ def test_empty_consumer_plan_cannot_register_an_empty_adapter(empty):
         receiver = replace(receiver, modules=(replace(module, factor_shapes=()),))
     with pytest.raises(ValueError, match="nonempty"):
         build_lora_consumer_plan(_layout(sources), receiver)
+
+
+@pytest.mark.parametrize("order", list(permutations(range(3))))
+def test_coverage_sweep_accepts_shuffled_rectangles_and_touching_boundaries(order):
+    from skyrl.backends.skyrl_train.weight_sync.lora_rdt.consumer_plan import (
+        LoRAConsumerCopy,
+        _validate_factor_coverage,
+    )
+
+    rectangles = [((0, 0), (2, 2)), ((2, 0), (4, 2)), ((0, 2), (4, 4))]
+    copies = [LoRAConsumerCopy(index, "module", 0, 0, *rectangles[index]) for index in order]
+    _validate_factor_coverage((4, 4), copies)
+
+
+@pytest.mark.parametrize(
+    "rectangles, error",
+    [
+        ([((0, 0), (3, 4)), ((2, 0), (3, 4))], "overlaps"),
+        ([((0, 0), (3, 4))], "complete"),
+        ([((0, 0), (4, 5))], "exceeds"),
+        ([((0, 0), (0, 4)), ((0, 0), (4, 4))], "exceeds"),
+    ],
+)
+def test_coverage_sweep_rejects_overlap_even_when_volume_matches_or_a_hole(rectangles, error):
+    from skyrl.backends.skyrl_train.weight_sync.lora_rdt.consumer_plan import (
+        LoRAConsumerCopy,
+        _validate_factor_coverage,
+    )
+
+    copies = [LoRAConsumerCopy(index, "module", 0, 0, start, stop) for index, (start, stop) in enumerate(rectangles)]
+    with pytest.raises(ValueError, match=error):
+        _validate_factor_coverage((4, 4), copies)
