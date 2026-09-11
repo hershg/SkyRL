@@ -65,6 +65,15 @@ class SkyRLTrainBackendOverrides(BaseModel, extra="allow"):
     is otherwise pinned by the first ``create_model`` for the warm runtime's
     lifetime."""
 
+    policy_node_resource: str | None = None
+    """Optional Ray custom resource advertised only by policy-training nodes.
+
+    When set, each policy actor requests one unit and each policy placement
+    group bundle requests ``policy_num_gpus_per_node`` units. This makes
+    disaggregated policy placement deterministic when inference and training
+    nodes belong to the same Ray cluster.
+    """
+
 
 class FSDPBackendOverrides(SkyRLTrainBackendOverrides):
     strategy: str = "fsdp"
@@ -259,6 +268,14 @@ class SkyRLTrainBackend(AbstractBackend):
         pg = self._colocate_pg
         is_lora = cfg.trainer.policy.model.lora.rank > 0
 
+        policy_resources = None
+        policy_resources_per_node = None
+        if self.config.policy_node_resource:
+            if colocate_all:
+                raise ValueError("policy_node_resource requires trainer.placement.colocate_all=False")
+            policy_resources = {self.config.policy_node_resource: 1.0}
+            policy_resources_per_node = cfg.trainer.placement.policy_num_gpus_per_node
+
         if colocate_all:
             assert pg is not None, "placement group must be created when colocate_all=True"
             num_policy_gpus = cfg.trainer.placement.policy_num_gpus_per_node * cfg.trainer.placement.policy_num_nodes
@@ -279,6 +296,8 @@ class SkyRLTrainBackend(AbstractBackend):
             PolicyWorker,
             pg=pg,
             num_gpus_per_actor=0.2 if colocate_all else 1,
+            resources=policy_resources,
+            num_resources_per_node=policy_resources_per_node,
             colocate_all=colocate_all,
             sequence_parallel_size=cfg.trainer.policy.sequence_parallel_size,
             record_memory=cfg.trainer.policy.record_memory,

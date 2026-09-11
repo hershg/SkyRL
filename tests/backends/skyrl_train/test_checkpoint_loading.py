@@ -1,10 +1,13 @@
 import tarfile
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from skyrl.backends.skyrl_train.workers.worker import Worker
-from skyrl.backends.skyrl_train_backend import SkyRLTrainBackend
+from skyrl.backends.skyrl_train_backend import (
+    MegatronBackendOverrides,
+    SkyRLTrainBackend,
+)
 
 
 @pytest.mark.parametrize("load_optimizer", [False, True])
@@ -52,3 +55,38 @@ def test_weights_only_load_does_not_reset_live_optimizer():
         load_optimizer_states=False,
         load_lr_scheduler_states=False,
     )
+
+
+def test_build_policy_requests_configured_node_resource():
+    backend = object.__new__(SkyRLTrainBackend)
+    backend.config = MegatronBackendOverrides(policy_node_resource="trainer_node")
+    backend._cfg = MagicMock()
+    backend._cfg.trainer.placement.colocate_all = False
+    backend._cfg.trainer.placement.policy_num_nodes = 1
+    backend._cfg.trainer.placement.policy_num_gpus_per_node = 8
+    backend._cfg.trainer.policy.model.lora.rank = 0
+    backend._colocate_pg = None
+    backend._tokenizer = MagicMock(pad_token_id=0)
+    backend._inference_engine_client = None
+
+    with (
+        patch("skyrl.backends.skyrl_train_backend.PPORayActorGroup") as actor_group,
+        patch("skyrl.backends.skyrl_train_backend.WorkerDispatch"),
+        patch("skyrl.backends.skyrl_train_backend.ray.get"),
+    ):
+        backend._build_policy(MagicMock(), "model_test")
+
+    assert actor_group.call_args.kwargs["resources"] == {"trainer_node": 1.0}
+    assert actor_group.call_args.kwargs["num_resources_per_node"] == 8
+
+
+def test_policy_node_resource_rejects_colocated_policy():
+    backend = object.__new__(SkyRLTrainBackend)
+    backend.config = MegatronBackendOverrides(policy_node_resource="trainer_node")
+    backend._cfg = MagicMock()
+    backend._cfg.trainer.placement.colocate_all = True
+    backend._cfg.trainer.policy.model.lora.rank = 0
+    backend._colocate_pg = MagicMock()
+
+    with pytest.raises(ValueError, match="requires trainer.placement.colocate_all=False"):
+        backend._build_policy(MagicMock(), "model_test")
