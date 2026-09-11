@@ -483,13 +483,16 @@ class VLLMServerActor(ServerActorProtocol):
         @app.post("/skyrl/v1/generate")
         async def _skyrl_generate(request: Request):
             """SkyRL generate endpoint that returns routed_experts alongside token output."""
-            if getattr(cli_args, "enable_lora", False):
-                raise HTTPException(status_code=400, detail="/skyrl/v1/generate does not support LoRA.")
-
             body = await request.json()
             token_ids = body["token_ids"]
             sampling_params_dict = body.get("sampling_params", {})
             cache_salt = body.get("cache_salt")
+
+            models = request.app.state.openai_serving_models
+            requested_model = body.get("model")
+            lora_request = models.lora_requests.get(requested_model)
+            if not models.is_base_model(requested_model) and lora_request is None:
+                raise HTTPException(status_code=404, detail=f"Unknown model {requested_model!r}.")
 
             sampling_params = VLLMSamplingParams(**sampling_params_dict)
             # `cache_salt` salts vLLM's prefix cache; vLLM rejects an empty salt, so attach only when set.
@@ -500,7 +503,12 @@ class VLLMServerActor(ServerActorProtocol):
             request_id = random_uuid()
 
             final_res = None
-            async for res in engine.generate(prompt, sampling_params, request_id=request_id):
+            async for res in engine.generate(
+                prompt,
+                sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+            ):
                 final_res = res
 
             if final_res is None:
