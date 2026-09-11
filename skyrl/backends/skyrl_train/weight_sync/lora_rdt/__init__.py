@@ -19,9 +19,12 @@ from .contracts import (
 from .producer import LoRardtProducer
 from .receiver import (
     acknowledge_lora_generation,
+    build_vllm_lora_consumer_plan,
+    pull_and_stage_local_lora_adapter,
     pull_and_stage_lora_adapter,
     pull_reconstruct_and_stage_lora_adapter,
     resolve_lora_rdt_producers,
+    validate_lora_request_layout,
 )
 from .rendezvous import LoRardtProducerRendezvous
 from .server_lifecycle import LoRardtRollbackError, LoRardtServerLifecycle
@@ -48,6 +51,8 @@ __all__ = [
     "LoRATransferInitInfo",
     "LoRAUpdateRequest",
     "acknowledge_lora_generation",
+    "build_vllm_lora_consumer_plan",
+    "pull_and_stage_local_lora_adapter",
     "activate_staged_vllm_lora_model",
     "build_lora_adapter_layout",
     "build_vllm_lora_model",
@@ -56,5 +61,6 @@ __all__ = [
     "pull_and_stage_lora_adapter",
     "pull_reconstruct_and_stage_lora_adapter",
     "resolve_lora_rdt_producers",
+    "validate_lora_request_layout",
     "stage_vllm_lora_model",
 ]

@@ -43,12 +43,7 @@ def stage_vllm_lora_model(model_runner: Any, lora_model: Any) -> None:
     """Register a new adapter id without changing the active vLLM slots."""
     manager = _get_vllm_lora_manager(model_runner)
     adapter_manager = manager._adapter_manager
-    if lora_model.id in manager.list_adapters():
-        raise ValueError(f"LoRA adapter id {lora_model.id} is already registered")
-    if len(manager.list_adapters()) >= adapter_manager.capacity:
-        raise ValueError("lora_rdt requires a free registered adapter slot to retain the previous generation")
-    if len(manager.list_adapters()) >= adapter_manager.lora_slots:
-        raise ValueError("lora_rdt requires a free GPU adapter slot to retain the previous generation")
+    _validate_staging_capacity(manager, lora_model.id)
     if not adapter_manager.add_adapter(lora_model):
         raise RuntimeError(f"vLLM declined LoRA adapter id {lora_model.id}")
 
@@ -73,3 +68,36 @@ def _get_vllm_lora_manager(model_runner: Any) -> Any:
     if manager is None:
         raise RuntimeError("lora_rdt requires a vLLM model runner with LoRA enabled")
     return manager
+
+
+def get_vllm_local_lora_plan(model_runner: Any, adapter_config: Mapping[str, Any]) -> Any:
+    """Bind adapter targets to the actual vLLM rank's local buffers."""
+    from vllm.lora.peft_helper import PEFTHelper
+
+    manager = _get_vllm_lora_manager(model_runner)._adapter_manager
+    if not hasattr(manager, "get_local_adapter_plan") or not hasattr(manager, "add_local_adapter"):
+        raise RuntimeError("lora_rdt requires the compatible vLLM fork with local-adapter plan and registration APIs")
+    return manager.get_local_adapter_plan(PEFTHelper.from_dict(dict(adapter_config)))
+
+
+def stage_vllm_local_lora_factors(
+    model_runner: Any,
+    adapter_id: int,
+    receiver_plan: Any,
+    factors: Mapping[str, tuple[list[torch.Tensor], list[torch.Tensor]]],
+) -> None:
+    """Register independent local factors without activating a GPU slot."""
+    manager = _get_vllm_lora_manager(model_runner)
+    _validate_staging_capacity(manager, adapter_id)
+    if not manager._adapter_manager.add_local_adapter(adapter_id, receiver_plan, dict(factors)):
+        raise RuntimeError(f"vLLM declined local LoRA adapter id {adapter_id}")
+
+
+def _validate_staging_capacity(manager: Any, adapter_id: int) -> None:
+    registered = manager.list_adapters()
+    if adapter_id in registered:
+        raise ValueError(f"LoRA adapter id {adapter_id} is already registered")
+    if len(registered) >= manager._adapter_manager.capacity:
+        raise ValueError("lora_rdt requires a free registered adapter slot to retain the previous generation")
+    if len(registered) >= manager._adapter_manager.lora_slots:
+        raise ValueError("lora_rdt requires a free GPU adapter slot to retain the previous generation")

@@ -233,8 +233,10 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
         from skyrl.backends.skyrl_train.weight_sync.lora_rdt import (
             LoRardtProducerRendezvous,
             LoRAUpdateRequest,
-            pull_reconstruct_and_stage_lora_adapter,
+            build_vllm_lora_consumer_plan,
+            pull_and_stage_local_lora_adapter,
             resolve_lora_rdt_producers,
+            validate_lora_request_layout,
         )
         from skyrl.backends.skyrl_train.weight_sync.lora_rdt.contracts import (
             LoRAReceiverGeneration,
@@ -242,6 +244,7 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
 
         rendezvous_info = LoRardtProducerRendezvous.from_json_dict(rendezvous)
         update_request = LoRAUpdateRequest.from_json_dict(request)
+        validate_lora_request_layout(rendezvous_info.layout, update_request)
         adapter_name = update_request.adapter_name
         staged = getattr(self, "_skyrl_lora_rdt_staged", {})
         active = getattr(self, "_skyrl_lora_rdt_active", {})
@@ -261,17 +264,30 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
                 raise ValueError(f"LoRA adapter {adapter_name!r} changed its fixed receiver layout")
             if next_record.adapter_config_json != active_record.adapter_config_json:
                 raise ValueError(f"LoRA adapter {adapter_name!r} changed its fixed receiver configuration")
+        plans = getattr(self, "_skyrl_lora_rdt_consumer_plans", {})
+        cached = plans.get(adapter_name)
+        if cached is None:
+            consumer_plan = build_vllm_lora_consumer_plan(rendezvous_info.layout, adapter_config, self.model_runner)
+        else:
+            config_json, consumer_plan = cached
+            if (
+                config_json != next_record.adapter_config_json
+                or consumer_plan.source_layout_digest != rendezvous_info.layout.layout_digest
+            ):
+                raise ValueError(f"LoRA adapter {adapter_name!r} changed its fixed consumer plan")
         producers = resolve_lora_rdt_producers(rendezvous_info.actor_name_by_rank(), rendezvous_info.namespace)
-        pull_reconstruct_and_stage_lora_adapter(
+        pull_and_stage_local_lora_adapter(
             producers=producers,
             layout=rendezvous_info.layout,
             request=update_request,
             adapter_id=adapter_id,
-            adapter_config=adapter_config,
+            consumer_plan=consumer_plan,
             model_runner=self.model_runner,
             device=str(self.device),
         )
         torch.cuda.synchronize(self.device)
+        plans[adapter_name] = (next_record.adapter_config_json, consumer_plan)
+        self._skyrl_lora_rdt_consumer_plans = plans
         staged[adapter_name] = next_record
         self._skyrl_lora_rdt_staged = staged
         return {"adapter_id": adapter_id, "generation": update_request.generation}
@@ -329,15 +345,21 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
         )
 
         discard_staged_vllm_lora_model(self.model_runner, adapter_id)
+        removed_names = set()
         staged = getattr(self, "_skyrl_lora_rdt_staged", {})
         for adapter_name, record in tuple(staged.items()):
             if record.adapter_id == adapter_id:
                 del staged[adapter_name]
+                removed_names.add(adapter_name)
         active = getattr(self, "_skyrl_lora_rdt_active", {})
         for adapter_name, record in tuple(active.items()):
             if record.adapter_id == adapter_id:
                 del active[adapter_name]
+                removed_names.add(adapter_name)
         getattr(self, "_skyrl_lora_rdt_retained", {}).pop(adapter_id, None)
+        for name in removed_names:
+            if name not in staged and name not in active:
+                getattr(self, "_skyrl_lora_rdt_consumer_plans", {}).pop(name, None)
 
     def remove_lora_rdt_adapter(self, adapter_id: int) -> None:
         """Release a drained retired adapter after its replacement is active."""

@@ -1,5 +1,6 @@
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,10 @@ from skyrl.backends.skyrl_train.weight_sync.lora_rdt.contracts import (
 @pytest.fixture(autouse=True)
 def _mock_cuda_fence(monkeypatch):
     monkeypatch.setattr(worker_wrap.torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.build_vllm_lora_consumer_plan",
+        lambda layout, config, runner: SimpleNamespace(source_layout_digest=layout.layout_digest),
+    )
 
 
 def _record(generation, adapter_id, config=None):
@@ -74,7 +79,7 @@ def test_worker_stages_then_activates_only_the_requested_generation(monkeypatch)
         lambda names, namespace: {0: "producer"},
     )
     monkeypatch.setattr(
-        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.pull_reconstruct_and_stage_lora_adapter",
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.pull_and_stage_local_lora_adapter",
         lambda **kwargs: staged.append(kwargs),
     )
     monkeypatch.setattr(
@@ -104,7 +109,7 @@ def test_worker_rejects_stale_or_unstaged_generation(monkeypatch):
         lambda names, namespace: {0: "producer"},
     )
     monkeypatch.setattr(
-        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.pull_reconstruct_and_stage_lora_adapter",
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.pull_and_stage_local_lora_adapter",
         lambda **kwargs: None,
     )
 
@@ -117,12 +122,23 @@ def test_worker_rejects_stale_or_unstaged_generation(monkeypatch):
 def test_worker_rollback_restores_generation_and_allows_a_replacement(monkeypatch):
     worker = _worker()
     registered = set()
+    plan_builds = []
+
+    def build_plan(layout, config, runner):
+        plan = SimpleNamespace(source_layout_digest=layout.layout_digest)
+        plan_builds.append(plan)
+        return plan
+
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.build_vllm_lora_consumer_plan",
+        build_plan,
+    )
     monkeypatch.setattr(
         "skyrl.backends.skyrl_train.weight_sync.lora_rdt.resolve_lora_rdt_producers",
         lambda names, namespace: {0: "producer"},
     )
     monkeypatch.setattr(
-        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.pull_reconstruct_and_stage_lora_adapter",
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.pull_and_stage_local_lora_adapter",
         lambda **kwargs: registered.add(kwargs["adapter_id"]),
     )
     monkeypatch.setattr(
@@ -158,6 +174,8 @@ def test_worker_rollback_restores_generation_and_allows_a_replacement(monkeypatc
 
     assert worker._skyrl_lora_rdt_active == {}
     assert registered == set()
+    assert worker._skyrl_lora_rdt_consumer_plans == {}
+    assert len(plan_builds) == 1
 
 
 def test_worker_restoring_unknown_generation_does_not_touch_vllm(monkeypatch):
@@ -244,7 +262,7 @@ def test_failed_cuda_completion_does_not_acknowledge_generation(monkeypatch, pha
         lambda names, namespace: {0: "producer"},
     )
     monkeypatch.setattr(
-        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.pull_reconstruct_and_stage_lora_adapter",
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.pull_and_stage_local_lora_adapter",
         lambda **kwargs: queued.append(kwargs["adapter_id"]),
     )
     monkeypatch.setattr(
@@ -279,3 +297,56 @@ def test_failed_cuda_completion_does_not_acknowledge_generation(monkeypatch, pha
     assert worker._skyrl_lora_rdt_active == active_before
     assert worker._skyrl_lora_rdt_staged == staged_before
     assert worker._skyrl_lora_rdt_retained == retained_before
+
+
+@pytest.mark.parametrize("field", ["adapter_name", "layout_digest"])
+def test_worker_rejects_request_mismatch_before_plan_or_actor_lookup(monkeypatch, field):
+    worker = _worker()
+    request = replace(_request(1), **{field: "wrong-name" if field == "adapter_name" else "0" * 64})
+
+    def unexpected_plan(*args):
+        raise AssertionError("invalid requests must not build a plan")
+
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.build_vllm_lora_consumer_plan",
+        unexpected_plan,
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        worker.stage_lora_rdt_adapter(_rendezvous().to_json_dict(), request.to_json_dict(), 9, {"r": 2})
+    assert not getattr(worker, "_skyrl_lora_rdt_consumer_plans", {})
+
+
+@pytest.mark.parametrize("failure_phase", ["pull", "completion"])
+def test_failed_first_stage_does_not_retain_a_plan(monkeypatch, failure_phase):
+    worker = _worker()
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.resolve_lora_rdt_producers",
+        lambda names, namespace: {0: "producer"},
+    )
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected stage failure")
+
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.pull_and_stage_local_lora_adapter",
+        fail if failure_phase == "pull" else lambda **kwargs: None,
+    )
+    if failure_phase == "completion":
+        monkeypatch.setattr(worker_wrap.torch.cuda, "synchronize", fail)
+    with pytest.raises(RuntimeError, match="injected stage failure"):
+        worker.stage_lora_rdt_adapter(_rendezvous().to_json_dict(), _request(1).to_json_dict(), 9, {"r": 2})
+    assert not getattr(worker, "_skyrl_lora_rdt_consumer_plans", {})
+    assert not getattr(worker, "_skyrl_lora_rdt_staged", {})
+
+
+def test_discarding_the_only_staged_generation_releases_its_plan(monkeypatch):
+    worker = _worker()
+    worker._skyrl_lora_rdt_staged = {"adapter": _record(1, 9)}
+    worker._skyrl_lora_rdt_consumer_plans = {"adapter": object()}
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.weight_sync.lora_rdt.discard_staged_vllm_lora_model",
+        lambda runner, adapter_id: None,
+    )
+    worker.discard_lora_rdt_adapter(9)
+    assert worker._skyrl_lora_rdt_consumer_plans == {}
+    assert worker._skyrl_lora_rdt_staged == {}
