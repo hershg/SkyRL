@@ -233,8 +233,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 pre_mlp_layernorm_output, padding_mask, packed_seq_params
             )
         )
-        mlp_output_with_bias = self.mlp(
-            pre_mlp_layernorm_output, padding_mask=moe_padding_mask
+        mlp_output_with_bias = self._run_mlp(
+            pre_mlp_layernorm_output,
+            residual,
+            moe_padding_mask,
+            inference_context,
         )
         if moe_unflatten_mbs is not None:
             mlp_output, mlp_bias = mlp_output_with_bias
