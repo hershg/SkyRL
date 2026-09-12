@@ -1,6 +1,9 @@
 import os
 import shutil
 import tempfile
+from contextlib import contextmanager
+from functools import wraps
+from time import perf_counter
 
 import torch
 import torch.distributed
@@ -15,12 +18,54 @@ _ACTIVITY_MAP = {
 }
 
 
+@contextmanager
+def measure_phase_seconds(metrics, name):
+    start = perf_counter()
+    yield
+    metrics[name] = perf_counter() - start
+
+
+@contextmanager
+def measure_megatron_schedule(model_config, timers):
+    """Measure synchronized schedule phases without replacing existing timers."""
+    if model_config.timers is not None:
+        raise ValueError("Cannot replace existing Megatron timers")
+    phases = {"forward-compute": 2, "backward-compute": 2, "forward-backward": 1}
+    for name, level in phases.items():
+        timers(name, log_level=level).reset()
+    report = {}
+    model_config.timers = timers
+    try:
+        yield report
+        for name in phases:
+            report[name] = timers(name).elapsed(reset=False, barrier=False)
+    finally:
+        model_config.timers = None
+
+
 def build_profiler_from_policy_cfg(trainer_cfg):
     """Build the policy profiler, or return None when disabled."""
     cfg = trainer_cfg.policy.torch_profiler_config
     if not cfg.enable:
         return None
     return Profiler(cfg)
+
+
+def flush_profile_on_oom(method):
+    """Export this worker's active trace before propagating a training OOM."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except torch.OutOfMemoryError:
+            logger.exception(f"OOM in {method.__name__}; flushing the local worker's profiler")
+            if self.profiler is not None:
+                self.profiler.stop()
+                self.profiler.start()
+            raise
+
+    return wrapped
 
 
 class Profiler:
@@ -87,7 +132,7 @@ class Profiler:
             self.prof = None
 
     def _on_trace_ready(self, prof) -> None:
-        """Write a trace and cache the last-window kernel self-time summary."""
+        """Write a trace and optionally cache the last-window kernel self-time summary."""
         os.makedirs(self.save_path, exist_ok=True)
         # Deterministic per-window names: unique without a timestamp, predictable
         # for users, and they keep `stacks` windows from overwriting each other.
@@ -101,6 +146,8 @@ class Profiler:
             prof.export_chrome_trace(os.path.join(self.save_path, name))
             logger.info(f"[Profiler] rank {self.rank}: exported chrome trace -> {name}")
 
+        if not self.config.collect_kernel_summary:
+            return
         try:
             # Microseconds, self time.
             self._last_pairs = [(str(e.key), float(e.self_device_time_total)) for e in prof.key_averages()]
@@ -148,7 +195,7 @@ class Profiler:
 
     def get_kernel_summary(self):
         """Return ``{"window_count": int, "pairs": [(name, self_us), ...]}`` or None."""
-        if not self.enable or self.prof is None:
+        if not self.enable or self.prof is None or not self.config.collect_kernel_summary:
             return None
         return {"window_count": self._window_count, "pairs": list(self._last_pairs)}
 
