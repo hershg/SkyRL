@@ -209,6 +209,8 @@ def _kda_parity():
         use_cpu_initialization=False,
         gradient_accumulation_fusion=False,
         sequence_parallel=False,
+        recompute_granularity="selective",
+        recompute_modules=["gdn"],
     )
     cfg.kda_gate_lower_bound = -5.0
     mod = build_module(
@@ -244,22 +246,25 @@ def _kda_parity():
     xs = [torch.randn(1, length, hidden, device="cuda", dtype=dtype) for length in lengths]
     with torch.no_grad():
         hf_out = torch.cat([hf(x) for x in xs], dim=1)[0].float()  # [t, C]
-        packed = torch.cat(xs, dim=1).transpose(0, 1).contiguous()  # [t, 1, C]
-        cu_seqlens = torch.tensor([0, lengths[0], sum(lengths)], device="cuda", dtype=torch.int32)
-        params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=max(lengths),
-            max_seqlen_kv=max(lengths),
-        )
-        meg_out, bias = mod(packed, packed_seq_params=params)
+    packed = torch.cat(xs, dim=1).transpose(0, 1).contiguous().requires_grad_(True)
+    cu_seqlens = torch.tensor([0, lengths[0], sum(lengths)], device="cuda", dtype=torch.int32)
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=max(lengths),
+        max_seqlen_kv=max(lengths),
+    )
+    meg_out, bias = mod(packed, packed_seq_params=params)
     assert bias is None
-    meg_out = meg_out[:, 0].float()
-    diff = (meg_out - hf_out).abs()
+    meg_out_float = meg_out[:, 0].float()
+    diff = (meg_out_float - hf_out).abs()
+    meg_out_float.square().mean().backward()
     return {
+        "finite_input_grad": bool(torch.isfinite(packed.grad).all()),
         "max_abs_diff": diff.max().item(),
         "mean_abs_diff": diff.mean().item(),
+        "recompute_gdn": mod.recompute_gdn,
         "ref_mean_abs": hf_out.abs().mean().item(),
     }
 
@@ -276,5 +281,7 @@ def test_kda_matches_hf(ray_init_fixture):
     """KDA on packed sequences reproduces per-sequence HF Glm5NextTextLinearAttention (bf16)."""
     stats = ray.get(_kda_parity.remote())
     print(f"KDA vs HF: {stats}")
+    assert stats["recompute_gdn"] is True
+    assert stats["finite_input_grad"] is True
     assert stats["mean_abs_diff"] < 0.02 * max(stats["ref_mean_abs"], 1e-3), stats
     assert stats["max_abs_diff"] < 0.2 * max(stats["ref_mean_abs"], 1e-3) + 1e-2, stats

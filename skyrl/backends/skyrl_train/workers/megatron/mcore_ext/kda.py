@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
+from megatron.core import tensor_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
@@ -94,6 +95,11 @@ class KimiDeltaAttention(MegatronModule):
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
         self.tp_size = self.tp_group.size()
+        self.recompute_gdn = (
+            config.recompute_granularity == "selective"
+            and config.recompute_modules is not None
+            and "gdn" in config.recompute_modules
+        )
         if pg_collection.cp is not None and pg_collection.cp.size() > 1:
             raise NotImplementedError("KimiDeltaAttention does not support context parallelism.")
 
@@ -252,7 +258,18 @@ class KimiDeltaAttention(MegatronModule):
         if inference_context is not None:
             raise NotImplementedError("KimiDeltaAttention does not support inference caches.")
         cu_seqlens = self._resolve_cu_seqlens(packed_seq_params)
+        if self.recompute_gdn and self.training:
 
+            def _checkpointed_compute(hidden_states):
+                return self._forward_compute(hidden_states, cu_seqlens)
+
+            return tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
+        return self._forward_compute(hidden_states, cu_seqlens)
+
+    def _forward_compute(
+        self, hidden_states: torch.Tensor, cu_seqlens: Optional[torch.Tensor]
+    ):
+        """Run the complete KDA computation for eager or checkpointed execution."""
         # Column-parallel projections gather the sequence-parallel shard internally, so every
         # per-token/per-sequence op below sees the full sequence ([s, b, local]).
         q, _ = self.q_proj(hidden_states)
