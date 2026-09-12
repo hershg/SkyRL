@@ -483,7 +483,7 @@ torchvision = [
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
 # Megatron-Bridge PRs #6041 and #5971 plus their dispatch follow-up. Grouped
 # experts reuse their base output while other expert linears use the fused merge.
-megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "90d3a8bba90537bce7394b84c8bfebcd247820ca", marker = "sys_platform == 'linux'"}
+megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "90d3a8bba2961b115738ff848fb1d18390566d48", marker = "sys_platform == 'linux'"}
 # GLM-5.3-Flash needs K-pool DSA selection absent from Bridge's validated submodule pin.
 # This candidate begins at that pin, adds GLM architecture support, and retains
 # only bounded streaming K-pool score tiles, never a [sequence, sequence / kpool]
