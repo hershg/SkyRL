@@ -143,9 +143,9 @@ class Glm5NextBridge(MegatronModelBridge):
         provider.hidden_dropout = 0.0
         provider.attention_dropout = 0.0
         provider.attention_softmax_in_fp32 = False
-        # The gate/up clamp of GLM's SwiGLU lives on the unfused GLU path only.
+        # Megatron-LM #5940 preserves GLM's gate/up clamp in the fused SwiGLU path.
         provider.activation_func_clamp_value = text_config.swiglu_limit
-        provider.bias_activation_fusion = False
+        provider.bias_activation_fusion = True
         provider.use_te_activation_func = False
         provider.mtp_num_layers = None
 
