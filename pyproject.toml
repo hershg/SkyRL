@@ -481,8 +481,9 @@ torchvision = [
     { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
 ]
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
-# megatron-bridge main branch: latest as of 9/8/26
-megatron-bridge = {git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge", rev = "8e5f0e13b7dff8a951c6676e2f7b4a1853a34845", marker = "sys_platform == 'linux'"}
+# Megatron-Bridge PR #6041 plus its expert-TP selection follow-up. The fused
+# expert LoRA output merge avoids an additional full-width long-context buffer.
+megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "9cf1b16ce9f6b20440ac01ea5ff53b093a852463", marker = "sys_platform == 'linux'"}
 # GLM-5.3-Flash needs K-pool DSA selection absent from Bridge's validated submodule pin.
 # This candidate begins at that pin, adds GLM architecture support, and retains
 # only bounded streaming K-pool score tiles, never a [sequence, sequence / kpool]

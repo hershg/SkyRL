@@ -4731,8 +4731,8 @@ wheels = [
 
 [[package]]
 name = "megatron-bridge"
-version = "0.7.0+8e5f0e13"
-source = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge?rev=8e5f0e13b7dff8a951c6676e2f7b4a1853a34845#8e5f0e13b7dff8a951c6676e2f7b4a1853a34845" }
+version = "0.7.0+9cf1b16ce"
+source = { git = "https://github.com/hershg/Megatron-Bridge?rev=9cf1b16ce9f6b20440ac01ea5ff53b093a852463#9cf1b16ce9f6b20440ac01ea5ff53b093a852463" }
 dependencies = [
     { name = "accelerate", marker = "sys_platform == 'linux' or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },
     { name = "comet-ml", marker = "sys_platform == 'linux' or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },
@@ -9358,7 +9358,7 @@ requires-dist = [
     { name = "mamba-ssm", marker = "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", url = "https://github.com/NovaSky-AI/skyrl-wheels/releases/download/cu13torch2.13/mamba_ssm-2.3.2.post1-cp312-cp312-linux_x86_64.whl" },
     { name = "mamba-ssm", marker = "python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", url = "https://github.com/NovaSky-AI/skyrl-wheels/releases/download/cu13torch2.13/mamba_ssm-2.3.2.post1-cp313-cp313-linux_x86_64.whl" },
     { name = "mamba-ssm", marker = "python_full_version == '3.14.*' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", url = "https://github.com/NovaSky-AI/skyrl-wheels/releases/download/cu13torch2.13/mamba_ssm-2.3.2.post1-cp314-cp314-linux_x86_64.whl" },
-    { name = "megatron-bridge", marker = "sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge?rev=8e5f0e13b7dff8a951c6676e2f7b4a1853a34845" },
+    { name = "megatron-bridge", marker = "sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/hershg/Megatron-Bridge?rev=9cf1b16ce9f6b20440ac01ea5ff53b093a852463" },
     { name = "megatron-core", marker = "sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/hershg/Megatron-LM?rev=0844f60c9eb222f83ff763364e12b215431b1763" },
     { name = "mini-swe-agent", marker = "extra == 'miniswe'", specifier = ">=1.12.0" },
     { name = "mkdocs", marker = "extra == 'dev'" },
