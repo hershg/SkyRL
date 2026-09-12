@@ -95,8 +95,9 @@ class KimiDeltaAttention(MegatronModule):
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
         self.tp_size = self.tp_group.size()
+        # Full-layer replay can still exceed peak memory unless KDA internal tensors are checkpointed.
         self.recompute_gdn = (
-            config.recompute_granularity == "selective"
+            config.recompute_granularity in {"full", "selective"}
             and config.recompute_modules is not None
             and "gdn" in config.recompute_modules
         )

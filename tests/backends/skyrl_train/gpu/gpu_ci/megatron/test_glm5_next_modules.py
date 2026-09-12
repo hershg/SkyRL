@@ -209,8 +209,10 @@ def _kda_parity():
         use_cpu_initialization=False,
         gradient_accumulation_fusion=False,
         sequence_parallel=False,
-        recompute_granularity="selective",
+        recompute_granularity="full",
+        recompute_method="uniform",
         recompute_modules=["gdn"],
+        recompute_num_layers=1,
     )
     cfg.kda_gate_lower_bound = -5.0
     mod = build_module(
