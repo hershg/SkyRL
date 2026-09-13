@@ -277,11 +277,10 @@ class KimiDeltaAttention(MegatronModule):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
         f, _ = self.f_b_proj(self.f_a_proj(hidden_states)[0])
-        gate, _ = self.g_b_proj(self.g_a_proj(hidden_states)[0])
         beta, _ = self.b_proj(hidden_states)
 
         # [s, b, ·] -> [b, s, ·] (fla layout; b == 1 for packed sequences).
-        q, k, v, f, gate, beta = (t.transpose(0, 1).contiguous() for t in (q, k, v, f, gate, beta))
+        q, k, v, f, beta = (t.transpose(0, 1).contiguous() for t in (q, k, v, f, beta))
         batch, seq_len, _ = q.shape
         if cu_seqlens is not None and batch != 1:
             raise ValueError("Packed KDA input expects batch dimension 1.")
@@ -309,6 +308,10 @@ class KimiDeltaAttention(MegatronModule):
             cu_seqlens=cu_seqlens,
         )
 
+        # The output gate is not consumed by the recurrent KDA kernel. Compute it afterward so
+        # its sequence-sized activation is not live at the kernel peak allocation.
+        gate, _ = self.g_b_proj(self.g_a_proj(hidden_states)[0])
+        gate = gate.transpose(0, 1).contiguous()
         out = self.o_norm(core_attn_out.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim))
         out = out.view(batch, seq_len, self.local_projection_size).transpose(0, 1)
         return self.o_proj(out.to(hidden_states.dtype))
