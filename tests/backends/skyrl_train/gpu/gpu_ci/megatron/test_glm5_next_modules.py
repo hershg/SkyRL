@@ -11,6 +11,7 @@ uv run --isolated --extra dev --extra megatron -- pytest -s tests/backends/skyrl
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import ray
@@ -287,3 +288,96 @@ def test_kda_matches_hf(ray_init_fixture):
     assert stats["finite_input_grad"] is True
     assert stats["mean_abs_diff"] < 0.02 * max(stats["ref_mean_abs"], 1e-3), stats
     assert stats["max_abs_diff"] < 0.2 * max(stats["ref_mean_abs"], 1e-3) + 1e-2, stats
+
+
+def _run_mock_chunked_kda(monkeypatch, sequence_length, cu_seqlens=None):
+    from skyrl.backends.skyrl_train.workers.megatron.mcore_ext import kda as kda_module
+
+    calls = []
+
+    def run_chunk(**kwargs):
+        chunk_q = kwargs["q"]
+        state = kwargs["initial_state"]
+        if state is None:
+            state = torch.zeros_like(chunk_q[:, 0])
+        output = chunk_q + state.unsqueeze(1)
+        final_state = state + chunk_q.sum(dim=1)
+        calls.append(
+            {
+                "initial_state": kwargs["initial_state"],
+                "length": chunk_q.shape[1],
+                "output_final_state": kwargs["output_final_state"],
+                "cu_seqlens": kwargs["cu_seqlens"],
+            }
+        )
+        return output, final_state
+
+    monkeypatch.setattr(kda_module, "chunk_kda", run_chunk)
+    module = SimpleNamespace(
+        A_log=torch.zeros(1),
+        dt_bias=torch.zeros(1),
+        gate_lower_bound=-5.0,
+    )
+    q = torch.arange(sequence_length, dtype=torch.float32).view(1, sequence_length, 1, 1)
+    q.requires_grad_(True)
+    zeros = torch.zeros_like(q)
+    beta = torch.zeros(1, sequence_length, 1)
+    output = kda_module.KimiDeltaAttention._run_kda_in_sequence_chunks(
+        module,
+        q,
+        zeros,
+        zeros,
+        zeros,
+        beta,
+        cu_seqlens,
+    )
+    return calls, output, q
+
+
+def test_kda_long_sequence_carries_state_across_bounded_chunks(monkeypatch):
+    from skyrl.backends.skyrl_train.workers.megatron.mcore_ext.kda import (
+        _KDA_SEQUENCE_CHUNK_SIZE,
+    )
+
+    sequence_length = 2 * _KDA_SEQUENCE_CHUNK_SIZE + 1
+    calls, output, q = _run_mock_chunked_kda(monkeypatch, sequence_length)
+
+    assert [call["length"] for call in calls] == [
+        _KDA_SEQUENCE_CHUNK_SIZE,
+        _KDA_SEQUENCE_CHUNK_SIZE,
+        1,
+    ]
+    assert calls[0]["initial_state"] is None
+    assert calls[1]["initial_state"] is not None
+    assert calls[2]["initial_state"] is not None
+    assert all(call["output_final_state"] for call in calls)
+    output[:, -1].sum().backward()
+    assert torch.count_nonzero(q.grad[:, :_KDA_SEQUENCE_CHUNK_SIZE]) > 0
+
+
+def test_kda_packed_sequences_reset_state_at_boundaries(monkeypatch):
+    from skyrl.backends.skyrl_train.workers.megatron.mcore_ext.kda import (
+        _KDA_SEQUENCE_CHUNK_SIZE,
+    )
+
+    first_length = _KDA_SEQUENCE_CHUNK_SIZE - 1
+    second_length = 2
+    cu_seqlens = torch.tensor([0, first_length, first_length + second_length])
+    calls, output, q = _run_mock_chunked_kda(monkeypatch, first_length + second_length, cu_seqlens)
+
+    assert [call["length"] for call in calls] == [first_length, second_length]
+    assert all(call["initial_state"] is None for call in calls)
+    assert [call["cu_seqlens"].tolist() for call in calls] == [[0, first_length], [0, second_length]]
+    assert torch.equal(output[:, :first_length], q[:, :first_length])
+    assert torch.equal(output[:, first_length:], q[:, first_length:])
+
+
+def test_kda_short_input_keeps_single_packed_call(monkeypatch):
+    cu_seqlens = torch.tensor([0, 11, 32])
+    calls, output, q = _run_mock_chunked_kda(monkeypatch, 32, cu_seqlens)
+
+    assert len(calls) == 1
+    assert calls[0]["initial_state"] is None
+    assert calls[0]["output_final_state"] is False
+    assert calls[0]["cu_seqlens"] is cu_seqlens
+    assert torch.equal(output, q)

@@ -50,6 +50,9 @@ except ImportError:
     HAVE_FLA = False
 
 
+_KDA_SEQUENCE_CHUNK_SIZE = 8192
+
+
 @dataclass
 class KimiDeltaAttentionSubmodules:
     """Submodule specs for :class:`KimiDeltaAttention`.
@@ -243,6 +246,69 @@ class KimiDeltaAttention(MegatronModule):
         )
         return out
 
+    def _run_kda_in_sequence_chunks(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        f: torch.Tensor,
+        beta: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        seq_len = q.shape[1]
+        if seq_len <= _KDA_SEQUENCE_CHUNK_SIZE:
+            return chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=f,
+                beta=beta,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                safe_gate=self.gate_lower_bound is not None,
+                lower_bound=self.gate_lower_bound,
+                cu_seqlens=cu_seqlens,
+            )[0]
+
+        if cu_seqlens is None or cu_seqlens.numel() == 2:
+            sequence_ranges = [(0, seq_len)]
+        else:
+            sequence_boundaries = cu_seqlens.detach().cpu().tolist()
+            sequence_ranges = list(zip(sequence_boundaries[:-1], sequence_boundaries[1:]))
+
+        outputs = []
+        for sequence_start, sequence_end in sequence_ranges:
+            state = None
+            for chunk_start in range(sequence_start, sequence_end, _KDA_SEQUENCE_CHUNK_SIZE):
+                chunk_end = min(chunk_start + _KDA_SEQUENCE_CHUNK_SIZE, sequence_end)
+                chunk_cu_seqlens = (
+                    None
+                    if cu_seqlens is None
+                    else cu_seqlens.new_tensor([0, chunk_end - chunk_start])
+                )
+                output, state = chunk_kda(
+                    q=q[:, chunk_start:chunk_end],
+                    k=k[:, chunk_start:chunk_end],
+                    v=v[:, chunk_start:chunk_end],
+                    g=f[:, chunk_start:chunk_end],
+                    beta=beta[:, chunk_start:chunk_end],
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    initial_state=state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    use_gate_in_kernel=True,
+                    safe_gate=self.gate_lower_bound is not None,
+                    lower_bound=self.gate_lower_bound,
+                    cu_seqlens=chunk_cu_seqlens,
+                )
+                outputs.append(output)
+        return torch.cat(outputs, dim=1)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -291,21 +357,8 @@ class KimiDeltaAttention(MegatronModule):
         head_shape = (batch, seq_len, self.local_num_heads, self.head_dim)
         q, k, v, f = (t.view(head_shape) for t in (q, k, v, f))
 
-        core_attn_out, _ = chunk_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=f,
-            beta=beta.float().sigmoid(),
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            safe_gate=self.gate_lower_bound is not None,
-            lower_bound=self.gate_lower_bound,
-            cu_seqlens=cu_seqlens,
+        core_attn_out = self._run_kda_in_sequence_chunks(
+            q, k, v, f, beta.float().sigmoid(), cu_seqlens
         )
 
         # The output gate is not consumed by the recurrent KDA kernel. Compute it afterward so
