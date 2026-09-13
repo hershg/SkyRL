@@ -34,19 +34,20 @@ def compact_adapter_state(
 def save_adapter_state(
     adapter_state: Mapping[str, torch.Tensor],
     output_directory: str,
+    temporary_suffix: str = "",
 ) -> None:
     compact_state = compact_adapter_state(adapter_state)
     safetensors_path = os.path.join(output_directory, "adapter_model.safetensors")
     compact_path = os.path.join(output_directory, "adapter_model.bin")
     if compact_state is None:
-        temporary_path = safetensors_path + ".tmp"
+        temporary_path = f"{safetensors_path}.tmp{temporary_suffix}"
         save_file(adapter_state, temporary_path)
         if os.path.exists(compact_path):
             os.remove(compact_path)
         os.replace(temporary_path, safetensors_path)
         return
 
-    temporary_path = compact_path + ".tmp"
+    temporary_path = f"{compact_path}.tmp{temporary_suffix}"
     torch.save(compact_state, temporary_path)
     if os.path.exists(safetensors_path):
         os.remove(safetensors_path)
