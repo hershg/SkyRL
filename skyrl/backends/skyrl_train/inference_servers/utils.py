@@ -268,6 +268,9 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     for key, value in engine_kwargs.items():
         setattr(args, key, value)
 
+    if isinstance(args.profiler_config, dict):
+        args.profiler_config = ProfilerConfig(**args.profiler_config)
+
     return args
 
 

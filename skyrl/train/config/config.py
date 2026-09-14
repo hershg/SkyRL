@@ -62,7 +62,9 @@ class DataLoaderConfig(BaseConfig):
 
     def __post_init__(self) -> None:
         if self.num_workers is not None and self.num_workers < 0:
-            raise ValueError(f"data.dataloader.num_workers must be None or >= 0, got {self.num_workers}.")
+            raise ValueError(
+                f"data.dataloader.num_workers must be None or >= 0, got {self.num_workers}."
+            )
 
 
 @dataclass
@@ -73,10 +75,14 @@ class DataConfig(BaseConfig):
     size is bounded by the CPU memory available on a worker node.
     """
 
-    train_data: List[str] = field(default_factory=lambda: [os.path.expanduser("~/data/gsm8k/train.parquet")])
+    train_data: List[str] = field(
+        default_factory=lambda: [os.path.expanduser("~/data/gsm8k/train.parquet")]
+    )
     """Files for the training dataset.
     Each entry is a path to a parquet or json file, or the name of a HuggingFace dataset."""
-    val_data: List[str] = field(default_factory=lambda: [os.path.expanduser("~/data/gsm8k/validation.parquet")])
+    val_data: List[str] = field(
+        default_factory=lambda: [os.path.expanduser("~/data/gsm8k/validation.parquet")]
+    )
     """Files for the evaluation dataset, in the same formats accepted by ``train_data``.
     When more than one is given, evaluation runs over all of them: both per-dataset metrics
     (keyed by each sample's ``data_source``) and aggregated ``eval/all/*`` metrics are logged,
@@ -325,6 +331,8 @@ class TorchProfilerConfig(BaseConfig):
     """Gzip chrome traces (``*.pt.trace.json.gz``). Traces are repetitive JSON and
     compress several-fold, which matters most when they are uploaded to cloud storage.
     The gzip runs inside ``on_trace_ready``, i.e. on the training thread."""
+    collect_kernel_summary: bool = True
+    """Cache kernel times after export; disable for raw traces without eager event aggregation."""
     export_type: str = "chrome_trace"
     """Either ``chrome_trace`` or ``stacks``.
     ``chrome_trace`` writes ``*.pt.trace.json``; ``stacks`` writes self-CUDA-time stacks and
@@ -341,7 +349,9 @@ class TorchProfilerConfig(BaseConfig):
         if not self.enable:
             return
         if not self.ranks:
-            raise ValueError("`torch_profiler_config.ranks` must be non-empty when profiling is enabled.")
+            raise ValueError(
+                "`torch_profiler_config.ranks` must be non-empty when profiling is enabled."
+            )
         # Avoid implicit relative paths in Ray runtime working dirs.
         if not self.save_path:
             raise ValueError(
@@ -358,8 +368,12 @@ class TorchProfilerConfig(BaseConfig):
             )
         # Empty activities record nothing.
         if not self.activities:
-            raise ValueError("`torch_profiler_config.activities` must be non-empty when profiling is enabled.")
-        bad_activities = [a for a in self.activities if a.lower() not in TORCH_PROFILER_ACTIVITIES]
+            raise ValueError(
+                "`torch_profiler_config.activities` must be non-empty when profiling is enabled."
+            )
+        bad_activities = [
+            a for a in self.activities if a.lower() not in TORCH_PROFILER_ACTIVITIES
+        ]
         if bad_activities:
             raise ValueError(
                 f"invalid `torch_profiler_config.activities` entries {bad_activities}. "
@@ -378,13 +392,21 @@ class TorchProfilerConfig(BaseConfig):
         for name in ("skip_first", "wait", "warmup", "repeat"):
             value = getattr(self, name)
             if value < 0:
-                raise ValueError(f"`torch_profiler_config.{name}` must be >= 0, got {value}.")
+                raise ValueError(
+                    f"`torch_profiler_config.{name}` must be >= 0, got {value}."
+                )
         if self.active < 1:
-            raise ValueError(f"`torch_profiler_config.active` must be >= 1, got {self.active}.")
+            raise ValueError(
+                f"`torch_profiler_config.active` must be >= 1, got {self.active}."
+            )
 
         # FSDP manual CPU offload uses swap_tensors, which conflicts with profiler-held
         # parameter refs during colocated runs.
-        if strategy == "fsdp" and fsdp_cpu_offload is False and (colocate_all or colocate_policy_ref):
+        if (
+            strategy == "fsdp"
+            and fsdp_cpu_offload is False
+            and (colocate_all or colocate_policy_ref)
+        ):
             raise ValueError(
                 "`torch_profiler_config.enable=true` is incompatible with this FSDP configuration: "
                 "with the manual CPU-offload path (`policy.fsdp_config.cpu_offload=false`, the default) "
@@ -416,7 +438,9 @@ class MegatronHFExportConfig(BaseConfig):
         # save_every_n_ranks indexes ranks via modulo/floor-div in the bridge's
         # distributed save; < 1 raises ZeroDivisionError there. Fail fast instead.
         if self.save_every_n_ranks < 1:
-            raise ValueError(f"save_every_n_ranks must be >= 1, got {self.save_every_n_ranks}")
+            raise ValueError(
+                f"save_every_n_ranks must be >= 1, got {self.save_every_n_ranks}"
+            )
 
 
 @dataclass
@@ -509,7 +533,9 @@ class MegatronConfig(BaseConfig):
     ddp_config: MegatronDDPConfig = field(default_factory=MegatronDDPConfig)
     """Pass-through config for Megatron's ``DistributedDataParallelConfig``:
     https://github.com/NVIDIA/Megatron-LM/blob/core_r0.13.0/megatron/core/distributed/distributed_data_parallel_config.py"""
-    hf_export_config: MegatronHFExportConfig = field(default_factory=MegatronHFExportConfig)
+    hf_export_config: MegatronHFExportConfig = field(
+        default_factory=MegatronHFExportConfig
+    )
     lora_config: MegatronLoraConfig = field(default_factory=MegatronLoraConfig)
     optimizer_config_kwargs: Dict[str, Any] = field(
         default_factory=lambda: copy.deepcopy(DEFAULT_MEGATRON_OPTIMIZER_KWARGS)
@@ -669,7 +695,11 @@ class PlacementConfig(BaseConfig):
 
 @dataclass
 class PolicyConfig(BaseConfig):
-    model: ModelConfig = field(default_factory=lambda: copy.deepcopy(ModelConfig(path="Qwen/Qwen2.5-1.5B-Instruct")))
+    model: ModelConfig = field(
+        default_factory=lambda: copy.deepcopy(
+            ModelConfig(path="Qwen/Qwen2.5-1.5B-Instruct")
+        )
+    )
     optimizer_config: OptimizerConfig = field(default_factory=OptimizerConfig)
     """Optimizer configuration for the policy model."""
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
@@ -682,7 +712,9 @@ class PolicyConfig(BaseConfig):
     record_memory: bool = False
     """Save memory snapshots to ``{ckpt_path}/memory_snapshots/``.
     Visualize by dragging pickle files to https://docs.pytorch.org/memory_viz."""
-    torch_profiler_config: TorchProfilerConfig = field(default_factory=TorchProfilerConfig)
+    torch_profiler_config: TorchProfilerConfig = field(
+        default_factory=TorchProfilerConfig
+    )
     """``torch.profiler`` config for policy training steps."""
     megatron_config: MegatronConfig = field(default_factory=MegatronConfig)
     model_config_kwargs: dict = field(default_factory=dict)
@@ -712,7 +744,9 @@ class CriticConfig(BaseConfig):
     """
 
     model: ModelConfig = field(default_factory=ModelConfig)
-    optimizer_config: OptimizerConfig = field(default_factory=lambda: OptimizerConfig(lr=5e-6))
+    optimizer_config: OptimizerConfig = field(
+        default_factory=lambda: OptimizerConfig(lr=5e-6)
+    )
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     """FSDP configuration, applicable when ``trainer.strategy="fsdp"``."""
     sequence_parallel_size: int = 1
@@ -754,7 +788,6 @@ class RefConfig(BaseConfig):
 
 @dataclass
 class KLCtrlConfig(BaseConfig):
-
     type: str = "fixed"
     """``"fixed"`` or ``"adaptive"``."""
     kl_target: float = 0.1
@@ -812,7 +845,6 @@ class KLCovConfig(BaseConfig):
 
 @dataclass
 class CISPOConfig(BaseConfig):
-
     cispo_eps_clip_low: float = 1.0
     """Offset for lower bound of importance sampling ratio clipping (as opposed to PPO token update clipping).
     
@@ -834,7 +866,9 @@ class CISPOConfig(BaseConfig):
 
     def __post_init__(self):
         if self.cispo_anchor not in ("old", "rollout"):
-            raise ValueError(f"cispo_anchor must be 'old' or 'rollout', got {self.cispo_anchor!r}")
+            raise ValueError(
+                f"cispo_anchor must be 'old' or 'rollout', got {self.cispo_anchor!r}"
+            )
 
 
 # DPPO parameters (only used when policy_loss_type="dppo")
@@ -979,13 +1013,17 @@ class AlgorithmConfig(BaseConfig):
     use_tis: bool = False
     """Deprecated: use ``off_policy_correction`` instead.
     Enabled Truncated Importance Sampling (TIS) as proposed in https://fengyao.notion.site/off-policy-rl."""
-    off_policy_correction: OffPolicyCorrectionConfig = field(default_factory=OffPolicyCorrectionConfig)
+    off_policy_correction: OffPolicyCorrectionConfig = field(
+        default_factory=OffPolicyCorrectionConfig
+    )
     """See https://docs.skyrl.ai/docs/algorithms/off_policy_correction for a full guide."""
     sapo: SAPOConfig = field(default_factory=SAPOConfig)
     """Only used when ``policy_loss_type="sapo"``."""
     value_clip: float = 0.2
     """Clip value for the value loss."""
-    dynamic_sampling: DynamicSamplingConfig = field(default_factory=DynamicSamplingConfig)
+    dynamic_sampling: DynamicSamplingConfig = field(
+        default_factory=DynamicSamplingConfig
+    )
     """Dynamic sampling configuration."""
     clip_cov: ClipCovConfig = field(default_factory=ClipCovConfig)
     """Only used when ``policy_loss_type="clip_cov"``."""
@@ -1130,9 +1168,9 @@ class DeltaWeightSyncConfig(BaseConfig):
     """Number of trainer-side worker threads used to compute and compress delta payloads.
     If unset, the publisher uses ``min(8, os.cpu_count())``."""
 
-    checkpoint_load_format: Literal["vllm_multi_thread_safetensors", "vllm_fastsafetensors"] = (
-        "vllm_multi_thread_safetensors"
-    )
+    checkpoint_load_format: Literal[
+        "vllm_multi_thread_safetensors", "vllm_fastsafetensors"
+    ] = "vllm_multi_thread_safetensors"
     """Receiver reload iterator for the prepared local checkpoint.
     
     `vllm_multi_thread_safetensors` loads safetensor files from disk to CPU storage with N parallel workers using vLLM's native safetensors iterator. Tensors are then loaded onto GPU memory iterately.
@@ -1152,7 +1190,9 @@ class DeltaWeightSyncConfig(BaseConfig):
         )
 
         if self.local_checkpoint_dir is None:
-            self.local_checkpoint_dir = str(_default_local_checkpoint_dir(self.sync_dir))
+            self.local_checkpoint_dir = str(
+                _default_local_checkpoint_dir(self.sync_dir)
+            )
         if self.publish_staging_dir is None:
             self.publish_staging_dir = str(_default_publish_staging_dir(self.sync_dir))
 
@@ -1309,7 +1349,9 @@ class InferenceEngineConfig(BaseConfig):
 class GeneratorConfig(BaseConfig):
     """Configuration for generation behavior."""
 
-    inference_engine: InferenceEngineConfig = field(default_factory=InferenceEngineConfig)
+    inference_engine: InferenceEngineConfig = field(
+        default_factory=InferenceEngineConfig
+    )
     n_samples_per_prompt: int = 5
     """Number of samples to generate per prompt.
     The total size of the training batch is ``trainer.train_batch_size * n_samples_per_prompt``."""
@@ -1364,10 +1406,10 @@ class GeneratorConfig(BaseConfig):
     to collapse multi-turn step-wise sequences into single sequences before training."""
 
     def __post_init__(self):
-
         if self.eval_sampling_params is None:
             self.eval_sampling_params = SamplingParams(
-                temperature=0.0, max_generate_length=self.sampling_params.max_generate_length
+                temperature=0.0,
+                max_generate_length=self.sampling_params.max_generate_length,
             )
 
 
@@ -1387,7 +1429,9 @@ class GSM8kLLMJudgeEnvConfig(BaseConfig):
 class SkyRLGymConfig(BaseConfig):
     max_env_workers: int = 32
     text2sql: Text2SQLEnvConfig = field(default_factory=Text2SQLEnvConfig)
-    llm_as_a_judge: GSM8kLLMJudgeEnvConfig = field(default_factory=GSM8kLLMJudgeEnvConfig)
+    llm_as_a_judge: GSM8kLLMJudgeEnvConfig = field(
+        default_factory=GSM8kLLMJudgeEnvConfig
+    )
     search: SearchEnvConfig = field(default_factory=SearchEnvConfig)
 
 
@@ -1599,9 +1643,9 @@ class TrainerConfig(BaseConfig):
             self.print_example_interval = self.log_example_interval
 
         if self.policy.model.fake_int4_qat.enabled:
-            assert (
-                self.strategy == "megatron"
-            ), "`trainer.policy.model.fake_int4_qat.enabled=True` is only supported with `trainer.strategy=megatron`."
+            assert self.strategy == "megatron", (
+                "`trainer.policy.model.fake_int4_qat.enabled=True` is only supported with `trainer.strategy=megatron`."
+            )
             assert not self.policy.megatron_config.lora_config.merge_lora, (
                 "`trainer.policy.model.fake_int4_qat.enabled=True` currently requires "
                 "`trainer.policy.megatron_config.lora_config.merge_lora=False` so weight "
@@ -1609,7 +1653,8 @@ class TrainerConfig(BaseConfig):
             )
 
         if self.logprobs_chunk_size is not None and (
-            not isinstance(self.logprobs_chunk_size, int) or self.logprobs_chunk_size <= 0
+            not isinstance(self.logprobs_chunk_size, int)
+            or self.logprobs_chunk_size <= 0
         ):
             raise ValueError(
                 f"logprobs_chunk_size must be a positive integer or None, got {self.logprobs_chunk_size!r}."
@@ -1658,7 +1703,9 @@ def validate_dict_keys_against_dataclass(datacls: Type[Any], d: dict):
     """
     valid_fields = {f.name for f in dataclasses.fields(datacls)}
     if invalid_keys := set(d.keys() - valid_fields):
-        raise ValueError(f"Invalid fields {invalid_keys} for {datacls.__name__}. Valid fields are {valid_fields}.")
+        raise ValueError(
+            f"Invalid fields {invalid_keys} for {datacls.__name__}. Valid fields are {valid_fields}."
+        )
 
 
 def overrides_dict_to_dotlist(args: Dict[str, Any]) -> List[str]:
@@ -1815,7 +1862,6 @@ class SkyRLTrainConfig(BaseConfig):
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
 
     def __post_init__(self):
-
         # generator.max_input_length defaults to trainer.max_prompt_length
         if self.generator.max_input_length is None:
             self.generator.max_input_length = self.trainer.max_prompt_length
@@ -1823,11 +1869,16 @@ class SkyRLTrainConfig(BaseConfig):
         # Copy temperature from generator sampling params to algorithm config
         # so workers can access it without needing the generator config
         if self.trainer.algorithm.temperature is None:
-            self.trainer.algorithm.temperature = self.generator.sampling_params.temperature
+            self.trainer.algorithm.temperature = (
+                self.generator.sampling_params.temperature
+            )
 
         if self.data.dataloader.num_workers is None:
             self.data.dataloader.num_workers = 8
-        if self.data.dataloader.persistent_workers and self.data.dataloader.num_workers == 0:
+        if (
+            self.data.dataloader.persistent_workers
+            and self.data.dataloader.num_workers == 0
+        ):
             raise ValueError(
                 "data.dataloader.persistent_workers requires num_workers > 0, but it was set explicitly to 0."
             )
@@ -1839,7 +1890,11 @@ class SkyRLTrainConfig(BaseConfig):
         )
 
         ie_cfg = self.generator.inference_engine
-        if _uses_lora_weight_sync(self) and ie_cfg.enforce_eager and ie_cfg.backend == "vllm":
+        if (
+            _uses_lora_weight_sync(self)
+            and ie_cfg.enforce_eager
+            and ie_cfg.backend == "vllm"
+        ):
             import warnings
 
             warnings.warn(
@@ -1905,17 +1960,22 @@ class SkyRLTrainConfig(BaseConfig):
                 "`trainer.policy.megatron_config.transformer_config_kwargs.rope_parameters` instead"
             )
         inference_rope_parameters = _get_nested_value(
-            overrides, "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters"
+            overrides,
+            "generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters",
         )
         if inference_rope_parameters is not _MISSING:
             trainer_strategy = _get_nested_value(overrides, "trainer.strategy")
-            trainer_strategy = "fsdp" if trainer_strategy is _MISSING else trainer_strategy
+            trainer_strategy = (
+                "fsdp" if trainer_strategy is _MISSING else trainer_strategy
+            )
             trainer_rope_parameters_path = (
                 "trainer.policy.megatron_config.transformer_config_kwargs.rope_parameters"
                 if trainer_strategy == "megatron"
                 else "trainer.policy.model_config_kwargs.rope_parameters"
             )
-            trainer_rope_parameters = _get_nested_value(overrides, trainer_rope_parameters_path)
+            trainer_rope_parameters = _get_nested_value(
+                overrides, trainer_rope_parameters_path
+            )
             if inference_rope_parameters != trainer_rope_parameters:
                 raise ValueError(
                     "`generator.inference_engine.engine_init_kwargs.hf_overrides.rope_parameters` must match "
@@ -1924,15 +1984,21 @@ class SkyRLTrainConfig(BaseConfig):
         async_engine_path = "generator.inference_engine.async_engine"
         async_engine = _get_nested_value(overrides, async_engine_path)
         if async_engine is not _MISSING:
-            if async_engine is True or (isinstance(async_engine, str) and async_engine.lower() == "true"):
+            if async_engine is True or (
+                isinstance(async_engine, str) and async_engine.lower() == "true"
+            ):
                 _delete_nested_key(overrides, async_engine_path)
-            elif async_engine is False or (isinstance(async_engine, str) and async_engine.lower() == "false"):
+            elif async_engine is False or (
+                isinstance(async_engine, str) and async_engine.lower() == "false"
+            ):
                 raise ValueError(
                     "`async_engine=False` is no longer supported; SkyRL always uses the async "
                     "HTTP/vLLM inference path. Remove the override."
                 )
             else:
-                raise ValueError("`async_engine` is no longer supported as a config field. Remove the override.")
+                raise ValueError(
+                    "`async_engine` is no longer supported as a config field. Remove the override."
+                )
         removed_inference_engine_overrides = {
             "generator.inference_engine.enable_http_endpoint": (
                 "`enable_http_endpoint` is no longer supported; SkyRL always uses the HTTP/vLLM inference path. "
@@ -1974,7 +2040,9 @@ class SkyRLTrainConfig(BaseConfig):
                 DeprecationWarning,
                 stacklevel=2,
             )
-            overrides.trainer["remove_microbatch_padding"] = overrides.trainer["use_sample_packing"]
+            overrides.trainer["remove_microbatch_padding"] = overrides.trainer[
+                "use_sample_packing"
+            ]
             del overrides.trainer["use_sample_packing"]
         return cls.from_dict_config(overrides)
 

@@ -37,14 +37,18 @@ def _backend(
 ) -> SkyRLTrainBackend:
     """Build a backend in the post-create_model state without running __init__."""
     backend = object.__new__(SkyRLTrainBackend)
-    backend.config = MegatronBackendOverrides(keep_runtime_warm_on_last_unload=keep_runtime_warm)
+    backend.config = MegatronBackendOverrides(
+        keep_runtime_warm_on_last_unload=keep_runtime_warm
+    )
     backend._model_ids_to_role = {model_id: "policy" for model_id in model_ids}
     backend._model_metadata = {
-        model_id: types.ModelMetadata(adapter_index=0, lora_config=LORA_CONFIG) for model_id in model_ids
+        model_id: types.ModelMetadata(adapter_index=0, lora_config=LORA_CONFIG)
+        for model_id in model_ids
     }
     backend._cfg = Mock()
     backend._cfg.trainer.strategy = strategy
     backend._cfg.generator.inference_engine.weight_sync_backend = "filesystem"
+    backend._cfg.trainer.policy.torch_profiler_config.enable = False
     backend._dispatch = Mock()
     backend._colocate_pg = None
     backend._inference_engine_client = Mock()
@@ -53,7 +57,9 @@ def _backend(
     backend._inference_adapter_ids = set()
     backend._renderer = None
     backend._render_server = None
-    backend._base_lora_signature = (LORA_CONFIG.rank, int(LORA_CONFIG.alpha)) if lora else None
+    backend._base_lora_signature = (
+        (LORA_CONFIG.rank, int(LORA_CONFIG.alpha)) if lora else None
+    )
     backend._server_groups = []
     backend._inference_router = None
     backend._inference_state_publisher = Mock()
@@ -80,6 +86,31 @@ def test_last_lora_unload_keeps_runtime_warm_when_enabled():
 
 def test_keep_runtime_warm_defaults_to_true():
     assert MegatronBackendOverrides().keep_runtime_warm_on_last_unload is True
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_profiler_advances_once_per_policy_optimizer_step(enabled):
+    backend = _backend(keep_runtime_warm=True)
+    backend._cfg.trainer.policy.torch_profiler_config.enable = enabled
+    backend._dispatch.optim_step.return_value = 1.0
+    request = types.OptimStepInput(adam_params=types.AdamParams(learning_rate=1e-5))
+    backend.optim_step("model-a", request)
+    assert backend._dispatch.profile_step.call_count == int(enabled)
+    if enabled:
+        assert backend._dispatch.method_calls[-2:] == [
+            ("optim_step", ("policy",), {"model_id": "model-a"}),
+            ("profile_step", ("policy",), {}),
+        ]
+
+
+@pytest.mark.parametrize("keep_warm", [False, True])
+def test_profiler_stops_only_when_shared_runtime_is_torn_down(keep_warm):
+    backend = _backend(keep_runtime_warm=keep_warm)
+    backend._cfg.trainer.policy.torch_profiler_config.enable = True
+    dispatch = backend._dispatch
+    with patch("skyrl.backends.skyrl_train_backend.ray.shutdown"):
+        backend.delete_model("model-a")
+    assert dispatch.stop_profile.call_count == int(not keep_warm)
 
 
 def test_last_lora_unload_tears_down_when_disabled():
@@ -127,7 +158,9 @@ def test_delete_unloads_synced_adapter_from_inference_engines():
 
     backend.delete_model("model-a")
 
-    backend._inference_engine_client.unload_lora_adapter.assert_awaited_once_with("model-a")
+    backend._inference_engine_client.unload_lora_adapter.assert_awaited_once_with(
+        "model-a"
+    )
     assert backend._inference_adapter_ids == set()
 
 
@@ -152,7 +185,9 @@ def test_delete_skips_native_unload_before_first_publication():
 def test_delete_proceeds_when_inference_unload_fails():
     backend = _backend(keep_runtime_warm=True)
     backend._inference_adapter_ids.add("model-a")
-    backend._inference_engine_client.unload_lora_adapter.side_effect = RuntimeError("vLLM unreachable")
+    backend._inference_engine_client.unload_lora_adapter.side_effect = RuntimeError(
+        "vLLM unreachable"
+    )
 
     backend.delete_model("model-a")
 
@@ -197,7 +232,9 @@ def test_native_lora_delete_requires_receiver_cleanup_before_releasing_trainer(
         method_name,
         AsyncMock(side_effect=unload),
     )
-    backend._dispatch.delete_adapter.side_effect = lambda *args: events.append("trainer_cleanup")
+    backend._dispatch.delete_adapter.side_effect = lambda *args: events.append(
+        "trainer_cleanup"
+    )
     if cleanup_fails:
         with pytest.raises(RuntimeError, match="receiver cleanup failed"):
             backend.delete_model("model-a")

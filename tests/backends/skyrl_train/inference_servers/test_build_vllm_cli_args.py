@@ -18,13 +18,17 @@ from skyrl.train.config import SkyRLTrainConfig
 def test_serialized_fp8_weight_sync_defaults_configure_vllm_checkpoint_fp8(monkeypatch):
     import skyrl.backends.skyrl_train.inference_servers.utils as inference_utils
 
-    monkeypatch.setattr(inference_utils, "_serialized_fp8_ignored_layers", lambda _model_path: [])
+    monkeypatch.setattr(
+        inference_utils, "_serialized_fp8_ignored_layers", lambda _model_path: []
+    )
     cfg = SkyRLTrainConfig()
     ie_cfg = cfg.generator.inference_engine
     ie_cfg.fp8_weight_sync_mode = "blockwise"
     engine_kwargs = {"hf_overrides": {"rope_theta": 10000.0}}
 
-    _apply_serialized_fp8_weight_sync_defaults(ie_cfg, engine_kwargs, model_path="qwen35-test")
+    _apply_serialized_fp8_weight_sync_defaults(
+        ie_cfg, engine_kwargs, model_path="qwen35-test"
+    )
 
     assert engine_kwargs["quantization"] == "fp8"
     assert engine_kwargs["load_format"] == "dummy"
@@ -44,10 +48,14 @@ def test_serialized_fp8_weight_sync_defaults_configure_vllm_checkpoint_fp8(monke
         {"hf_overrides": {"quantization_config": {"weight_block_size": [64, 128]}}},
     ],
 )
-def test_serialized_fp8_weight_sync_rejects_conflicting_vllm_settings(engine_kwargs, monkeypatch):
+def test_serialized_fp8_weight_sync_rejects_conflicting_vllm_settings(
+    engine_kwargs, monkeypatch
+):
     import skyrl.backends.skyrl_train.inference_servers.utils as inference_utils
 
-    monkeypatch.setattr(inference_utils, "_serialized_fp8_ignored_layers", lambda _model_path: [])
+    monkeypatch.setattr(
+        inference_utils, "_serialized_fp8_ignored_layers", lambda _model_path: []
+    )
     cfg = SkyRLTrainConfig()
     cfg.generator.inference_engine.fp8_weight_sync_mode = "blockwise"
 
@@ -139,15 +147,27 @@ def test_build_vllm_cli_args_succeeds_on_gpu_less_host(monkeypatch):
     cfg = SkyRLTrainConfig()
     cfg.generator.inference_engine.served_model_name = "served-alias"
     cfg.generator.inference_engine.engine_init_kwargs = {
-        "hf_overrides": {"rope_parameters": {"rope_type": "linear", "factor": 2.0, "rope_theta": 10000.0}}
+        "hf_overrides": {
+            "rope_parameters": {
+                "rope_type": "linear",
+                "factor": 2.0,
+                "rope_theta": 10000.0,
+            }
+        }
     }
     args = build_vllm_cli_args(cfg)
 
     assert args is not None
     assert args.model == cfg.trainer.policy.model.path
     assert args.served_model_name == ["served-alias"]
-    assert args.tensor_parallel_size == cfg.generator.inference_engine.tensor_parallel_size
-    assert args.hf_overrides["rope_parameters"] == {"rope_type": "linear", "factor": 2.0, "rope_theta": 10000.0}
+    assert (
+        args.tensor_parallel_size == cfg.generator.inference_engine.tensor_parallel_size
+    )
+    assert args.hf_overrides["rope_parameters"] == {
+        "rope_type": "linear",
+        "factor": 2.0,
+        "rope_theta": 10000.0,
+    }
     assert vllm.platforms.current_platform.device_type == "cuda"
 
     # NOTE: the MTP speculative_config wiring test lives in
@@ -175,6 +195,31 @@ def test_build_vllm_cli_args_materializes_profiler_config():
     assert not args.profiler_config.torch_profiler_with_stack
 
 
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "profiler",
+    [None, {}, {"profiler": "torch", "torch_profiler_dump_cuda_time_total": False}],
+)
+def test_build_app_accepts_profiler_overrides_without_loading_model(profiler, tmp_path):
+    from vllm.entrypoints.openai.api_server import build_app
+
+    cfg = SkyRLTrainConfig()
+    if profiler is not None:
+        profiler = dict(profiler)
+        if profiler.get("profiler") == "torch":
+            profiler["torch_profiler_dir"] = str(tmp_path)
+        cfg.generator.inference_engine.engine_init_kwargs = {
+            "profiler_config": profiler
+        }
+
+    args = build_vllm_cli_args(cfg)
+    app = build_app(args, supported_tasks=("generate",))
+    paths = app.openapi()["paths"]
+    enabled = profiler is not None and profiler.get("profiler") == "torch"
+    assert ("/start_profile" in paths) == enabled
+    assert ("/stop_profile" in paths) == enabled
+
+
 def test_resolve_policy_model_name_uses_served_model_name():
     cfg = SkyRLTrainConfig()
     cfg.trainer.policy.model.path = "base-model"
@@ -187,10 +232,16 @@ class TestGetPDP2PConnectorName:
     """Tests for get_pd_p2p_connector_name."""
 
     def test_bare_nixl(self):
-        assert get_pd_p2p_connector_name({"kv_connector": "NixlConnector"}) == "NixlConnector"
+        assert (
+            get_pd_p2p_connector_name({"kv_connector": "NixlConnector"})
+            == "NixlConnector"
+        )
 
     def test_bare_mooncake(self):
-        assert get_pd_p2p_connector_name({"kv_connector": "MooncakeConnector"}) == "MooncakeConnector"
+        assert (
+            get_pd_p2p_connector_name({"kv_connector": "MooncakeConnector"})
+            == "MooncakeConnector"
+        )
 
     def test_multiconnector_resolves_single_p2p(self):
         kv_config = {
@@ -207,7 +258,9 @@ class TestGetPDP2PConnectorName:
     def test_multiconnector_zero_p2p_raises(self):
         kv_config = {
             "kv_connector": "MultiConnector",
-            "kv_connector_extra_config": {"connectors": [{"kv_connector": "MooncakeStoreConnector"}]},
+            "kv_connector_extra_config": {
+                "connectors": [{"kv_connector": "MooncakeStoreConnector"}]
+            },
         }
         with pytest.raises(ValueError, match="exactly one P2P transfer connector"):
             get_pd_p2p_connector_name(kv_config)
@@ -251,15 +304,27 @@ class TestGetPDCLIArgs:
 
     def test_kv_role_preserved_when_set(self):
         args = Namespace()
-        role_kwargs = {"kv_transfer_config": {"kv_connector": "MooncakeConnector", "kv_role": "kv_producer"}}
+        role_kwargs = {
+            "kv_transfer_config": {
+                "kv_connector": "MooncakeConnector",
+                "kv_role": "kv_producer",
+            }
+        }
         out = get_pd_cli_args(args, role="prefill", role_init_kwargs=role_kwargs)
         assert out.kv_transfer_config["kv_role"] == "kv_producer"
 
-        role_kwargs = {"kv_transfer_config": {"kv_connector": "MooncakeConnector", "kv_role": "kv_consumer"}}
+        role_kwargs = {
+            "kv_transfer_config": {
+                "kv_connector": "MooncakeConnector",
+                "kv_role": "kv_consumer",
+            }
+        }
         out = get_pd_cli_args(args, role="decode", role_init_kwargs=role_kwargs)
         assert out.kv_transfer_config["kv_role"] == "kv_consumer"
 
     def test_missing_kv_transfer_config_raises(self):
         args = Namespace()
-        with pytest.raises(ValueError, match="kv_transfer_config must be set when enable_pd=True"):
+        with pytest.raises(
+            ValueError, match="kv_transfer_config must be set when enable_pd=True"
+        ):
             get_pd_cli_args(args, role="decode")
