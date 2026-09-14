@@ -482,7 +482,7 @@ torchvision = [
 ]
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
 # LoRA-native adapter export with explicit grouped-expert ownership.
-megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "3949f8c1ac0037ba9c2ce4a2edd98c99ca43a2af", marker = "sys_platform == 'linux'"}
+megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "28aea7d9eae8a9434d149347dce55952b406af69", marker = "sys_platform == 'linux'"}
 # megatron-core must match the `3rdparty/Megatron-LM` submodule pin of the
 # megatron-bridge rev above -- that is the only megatron-core commit Bridge's
 # own CI validates against. Bump the two together, reading the submodule rev with
