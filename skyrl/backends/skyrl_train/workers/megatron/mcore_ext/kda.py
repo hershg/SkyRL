@@ -50,7 +50,7 @@ except ImportError:
     HAVE_FLA = False
 
 
-_KDA_SEQUENCE_CHUNK_SIZE = 8192
+_KDA_SEQUENCE_CHUNK_SIZE = 4096
 
 
 @dataclass
