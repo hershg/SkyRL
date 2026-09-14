@@ -247,6 +247,29 @@ class KimiDeltaAttention(MegatronModule):
         )
         return out
 
+    def _project_and_conv(
+        self,
+        projection: nn.Module,
+        convolution: nn.Conv1d,
+        hidden_states: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Project and convolve without retaining a sequence-sized projection input."""
+
+        def compute(hidden_states):
+            projected, _ = projection(hidden_states)
+            projected = projected.transpose(0, 1).contiguous()
+            return self._conv(convolution, projected, cu_seqlens)
+
+        if self.recompute_gdn and torch.is_grad_enabled():
+            return torch_checkpoint(
+                compute,
+                hidden_states,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        return compute(hidden_states)
+
     def _run_kda_in_sequence_chunks(
         self,
         q: torch.Tensor,
@@ -368,21 +391,20 @@ class KimiDeltaAttention(MegatronModule):
         """Run the complete KDA computation for eager or checkpointed execution."""
         # Column-parallel projections gather the sequence-parallel shard internally, so every
         # per-token/per-sequence op below sees the full sequence ([s, b, local]).
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
+        # During backward replay, checkpoint each projection-convolution branch independently so
+        # autograd does not retain three additional full-sequence projection tensors. Delay the
+        # remaining projections until the convolutions have released their temporary workspaces.
+        q = self._project_and_conv(self.q_proj, self.q_conv1d, hidden_states, cu_seqlens)
+        k = self._project_and_conv(self.k_proj, self.k_conv1d, hidden_states, cu_seqlens)
+        v = self._project_and_conv(self.v_proj, self.v_conv1d, hidden_states, cu_seqlens)
         f, _ = self.f_b_proj(self.f_a_proj(hidden_states)[0])
         beta, _ = self.b_proj(hidden_states)
 
-        # [s, b, ·] -> [b, s, ·] (fla layout; b == 1 for packed sequences).
-        q, k, v, f, beta = (t.transpose(0, 1).contiguous() for t in (q, k, v, f, beta))
+        # Convert the remaining projections to the FLA layout [b, s, ·].
+        f, beta = (t.transpose(0, 1).contiguous() for t in (f, beta))
         batch, seq_len, _ = q.shape
         if cu_seqlens is not None and batch != 1:
             raise ValueError("Packed KDA input expects batch dimension 1.")
-
-        q = self._conv(self.q_conv1d, q, cu_seqlens)
-        k = self._conv(self.k_conv1d, k, cu_seqlens)
-        v = self._conv(self.v_conv1d, v, cu_seqlens)
         head_shape = (batch, seq_len, self.local_num_heads, self.head_dim)
         q, k, v, f = (t.view(head_shape) for t in (q, k, v, f))
 

@@ -263,10 +263,16 @@ def _kda_parity():
     meg_out_float = meg_out[:, 0].float()
     diff = (meg_out_float - hf_out).abs()
     meg_out_float.square().mean().backward()
+    missing_parameter_grads = [name for name, param in mod.named_parameters() if param.grad is None]
+    finite_parameter_grads = all(
+        torch.isfinite(param.grad).all() for param in mod.parameters() if param.grad is not None
+    )
     return {
         "finite_input_grad": bool(torch.isfinite(packed.grad).all()),
+        "finite_parameter_grads": bool(finite_parameter_grads),
         "max_abs_diff": diff.max().item(),
         "mean_abs_diff": diff.mean().item(),
+        "missing_parameter_grads": missing_parameter_grads,
         "recompute_gdn": mod.recompute_gdn,
         "ref_mean_abs": hf_out.abs().mean().item(),
     }
@@ -286,6 +292,8 @@ def test_kda_matches_hf(ray_init_fixture):
     print(f"KDA vs HF: {stats}")
     assert stats["recompute_gdn"] is True
     assert stats["finite_input_grad"] is True
+    assert stats["finite_parameter_grads"] is True
+    assert stats["missing_parameter_grads"] == []
     assert stats["mean_abs_diff"] < 0.02 * max(stats["ref_mean_abs"], 1e-3), stats
     assert stats["max_abs_diff"] < 0.2 * max(stats["ref_mean_abs"], 1e-3) + 1e-2, stats
 
