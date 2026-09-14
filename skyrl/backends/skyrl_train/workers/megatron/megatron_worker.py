@@ -4,6 +4,7 @@ import os
 import shutil
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -20,6 +21,8 @@ from megatron.bridge.peft.canonical_lora import CanonicalLoRA
 from megatron.bridge.peft.lora import LoRA
 from megatron.core.optimizer import ChainedOptimizer, DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.core.timers import Timers
+from megatron.core.utils import get_model_config as get_mcore_model_config
 from omegaconf import OmegaConf
 from transformers import AutoConfig
 
@@ -69,7 +72,11 @@ from skyrl.backends.skyrl_train.training_batch import (
     TrainingInputBatch,
     TrainingOutputBatch,
 )
-from skyrl.backends.skyrl_train.utils.profiler import build_profiler_from_policy_cfg
+from skyrl.backends.skyrl_train.utils.profiler import (
+    build_profiler_from_policy_cfg,
+    flush_profile_on_oom,
+    measure_megatron_schedule,
+)
 from skyrl.backends.skyrl_train.utils.replay_utils import make_replay_padding_indices
 from skyrl.backends.skyrl_train.weight_sync import (
     LoraLoadRequest,
@@ -1229,6 +1236,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # standard CUDA memory; only subsequent activations use expandable segments.
         self._set_expandable_segments(True)
 
+    @flush_profile_on_oom
     def forward(
         self,
         data: TrainingInputBatch,
@@ -1339,6 +1347,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=status)
 
+    @flush_profile_on_oom
     def forward_backward(
         self,
         data: TrainingInputBatch,
@@ -1471,15 +1480,23 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 f"seq_len={seq_len} tokens={real_tokens}"
             )
 
-        metrics_list = self.model.forward_backward_mini_batch(
-            micro_batches=micro_buffer,
-            seq_len=seq_len,
-            micro_batch_size=micro_bsz,
-            temperature=self.cfg.algorithm.temperature,
-            loss_fn=loss_fn,
-            loss_fn_config=loss_fn_config,
-            return_per_token_outputs=return_per_token_outputs,
-        )
+        phase_context = nullcontext(None)
+        if self.cfg.policy.torch_profiler_config.enable:
+            model_config = get_model_config(self.actor_module[0])
+            assert model_config is get_mcore_model_config(self.model.actor_module[0])
+            phase_context = measure_megatron_schedule(model_config, Timers(log_level=2, log_option="all"))
+        with phase_context as schedule_phases:
+            metrics_list = self.model.forward_backward_mini_batch(
+                micro_batches=micro_buffer,
+                seq_len=seq_len,
+                micro_batch_size=micro_bsz,
+                temperature=self.cfg.algorithm.temperature,
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+                return_per_token_outputs=return_per_token_outputs,
+            )
+        if schedule_phases is not None:
+            logger.info(f"megatron schedule phases | rank={torch.distributed.get_rank()} seconds={schedule_phases}")
 
         if self.empty_cuda_cache:
             torch.cuda.empty_cache()
@@ -1545,6 +1562,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=status)
 
+    @flush_profile_on_oom
     def optim_step(self) -> Optional[float]:
         """
         Perform optimizer step.
