@@ -325,6 +325,8 @@ class TorchProfilerConfig(BaseConfig):
     """Gzip chrome traces (``*.pt.trace.json.gz``). Traces are repetitive JSON and
     compress several-fold, which matters most when they are uploaded to cloud storage.
     The gzip runs inside ``on_trace_ready``, i.e. on the training thread."""
+    collect_kernel_summary: bool = True
+    """Cache kernel times after export; disable for raw traces without eager event aggregation."""
     export_type: str = "chrome_trace"
     """Either ``chrome_trace`` or ``stacks``.
     ``chrome_trace`` writes ``*.pt.trace.json``; ``stacks`` writes self-CUDA-time stacks and
