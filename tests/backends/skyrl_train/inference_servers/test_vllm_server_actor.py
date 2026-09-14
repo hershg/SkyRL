@@ -18,6 +18,18 @@ from skyrl.backends.skyrl_train.inference_servers.vllm_server_actor import (
     _LORA_UPLOAD_MAX_BYTES,
     VLLMServerActor,
 )
+from skyrl.backends.skyrl_train.weight_sync.lora_transport.request_gate import (
+    LoRATransportAdmissionGate,
+)
+
+
+def _add_custom_endpoints(app, engine, args):
+    VLLMServerActor._add_custom_endpoints(
+        app,
+        engine,
+        args,
+        lora_transport_admission_gate=LoRATransportAdmissionGate(),
+    )
 
 
 class _FakeEngine:
@@ -54,7 +66,7 @@ async def test_route_endpoint_resolves_lora_by_model(model, status, uses_lora):
     lora_request = object()
     app.state.openai_serving_models = SimpleNamespace(lora_requests={"adapter_test": lora_request})
     engine = _FakeEngine()
-    VLLMServerActor._add_custom_endpoints(app, engine, Namespace(model="base_test", served_model_name=["served_alias"]))
+    _add_custom_endpoints(app, engine, Namespace(model="base_test", served_model_name=["served_alias"]))
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(
@@ -76,7 +88,7 @@ async def test_route_endpoint_resolves_lora_by_model(model, status, uses_lora):
 async def test_lora_upload_rejects_bad_checksum(tmp_path, monkeypatch):
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     app = FastAPI()
-    VLLMServerActor._add_custom_endpoints(app, _FakeEngine(), Namespace())
+    _add_custom_endpoints(app, _FakeEngine(), Namespace())
     upload_id = str(uuid.uuid4())
     content = b"adapter-bytes"
 
@@ -102,7 +114,7 @@ async def test_lora_upload_rejects_bad_checksum(tmp_path, monkeypatch):
 async def test_lora_upload_rejects_oversized_file(tmp_path, monkeypatch):
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     app = FastAPI()
-    VLLMServerActor._add_custom_endpoints(app, _FakeEngine(), Namespace())
+    _add_custom_endpoints(app, _FakeEngine(), Namespace())
     upload_id = str(uuid.uuid4())
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
@@ -124,7 +136,9 @@ class _FakeLoraEngineClient:
         self.adapter_bytes = None
 
     async def add_lora(self, request) -> None:
-        self.adapter_bytes = Path(request.lora_path, "adapter_model.safetensors").read_bytes()
+        weight_paths = [path for path in Path(request.lora_path).iterdir() if path.name.startswith("adapter_model.")]
+        assert len(weight_paths) == 1
+        self.adapter_bytes = weight_paths[0].read_bytes()
 
 
 @pytest.mark.asyncio
@@ -138,7 +152,7 @@ async def test_lora_upload_loads_verified_adapter(tmp_path, monkeypatch):
         lora_id_counter=SimpleNamespace(inc=lambda _: 1),
         engine_client=engine_client,
     )
-    VLLMServerActor._add_custom_endpoints(app, _FakeEngine(), Namespace())
+    _add_custom_endpoints(app, _FakeEngine(), Namespace())
     upload_id = str(uuid.uuid4())
     files = {
         "adapter_model.safetensors": b"adapter-bytes",
@@ -162,3 +176,35 @@ async def test_lora_upload_loads_verified_adapter(tmp_path, monkeypatch):
     assert engine_client.adapter_bytes == files["adapter_model.safetensors"]
     assert app.state.openai_serving_models.lora_requests["adapter_test"].load_inplace is False
     assert not (tmp_path / "skyrl_lora_uploads" / upload_id).exists()
+
+
+@pytest.mark.asyncio
+async def test_lora_upload_loads_compact_bin_adapter(tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    engine_client = _FakeLoraEngineClient()
+    app = FastAPI()
+    app.state.openai_serving_models = SimpleNamespace(
+        lora_requests={},
+        lora_resolver_lock=defaultdict(asyncio.Lock),
+        lora_id_counter=SimpleNamespace(inc=lambda _: 1),
+        engine_client=engine_client,
+    )
+    _add_custom_endpoints(app, _FakeEngine(), Namespace())
+    upload_id = str(uuid.uuid4())
+    files = {"adapter_model.bin": b"compact-adapter", "adapter_config.json": b'{"r": 32}'}
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        for filename, content in files.items():
+            response = await client.put(
+                f"/skyrl/v1/lora-adapters/{upload_id}/{filename}",
+                content=content,
+                headers={"X-SkyRL-SHA256": hashlib.sha256(content).hexdigest(), "X-SkyRL-File-Size": str(len(content))},
+            )
+            assert response.status_code == 200
+        response = await client.post(
+            "/skyrl/v1/load_lora_adapter",
+            json={"lora_name": "adapter_test", "upload_id": upload_id},
+        )
+
+    assert response.status_code == 200
+    assert engine_client.adapter_bytes == files["adapter_model.bin"]
