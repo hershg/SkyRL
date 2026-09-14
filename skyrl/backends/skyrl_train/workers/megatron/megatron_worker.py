@@ -1718,11 +1718,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         adapter_state = {}
         for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=keep_state, show_progress=False):
             if keep_state:
-                # Keep the training dtype (bf16): upcasting to float32 doubles
-                # the already-large per-expert adapter state (and the file the
-                # engines re-read every step) for no fidelity gain -- vLLM casts
-                # adapters to its lora dtype on load.
-                adapter_state[f"base_model.model.{name}"] = tensor.clone()
+                # Benchmark control: match the native transport's FP32 source
+                # contract before comparing file and device-direct publication.
+                adapter_state[f"base_model.model.{name}"] = tensor.float().clone()
 
         rank = torch.distributed.get_rank()
         if keep_state:
