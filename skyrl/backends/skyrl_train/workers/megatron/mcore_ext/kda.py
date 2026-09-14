@@ -39,6 +39,7 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from torch import nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 try:
     from fla.modules import FusedRMSNormGated
@@ -50,7 +51,7 @@ except ImportError:
     HAVE_FLA = False
 
 
-_KDA_SEQUENCE_CHUNK_SIZE = 4096
+_KDA_SEQUENCE_CHUNK_SIZE = 8192
 
 
 @dataclass
@@ -290,22 +291,50 @@ class KimiDeltaAttention(MegatronModule):
                     if cu_seqlens is None
                     else cu_seqlens.new_tensor([0, chunk_end - chunk_start])
                 )
-                output, state = chunk_kda(
-                    q=q[:, chunk_start:chunk_end],
-                    k=k[:, chunk_start:chunk_end],
-                    v=v[:, chunk_start:chunk_end],
-                    g=f[:, chunk_start:chunk_end],
-                    beta=beta[:, chunk_start:chunk_end],
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    initial_state=state,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                    use_gate_in_kernel=True,
-                    safe_gate=self.gate_lower_bound is not None,
-                    lower_bound=self.gate_lower_bound,
-                    cu_seqlens=chunk_cu_seqlens,
+                def _run_chunk(
+                    chunk_q,
+                    chunk_k,
+                    chunk_v,
+                    chunk_f,
+                    chunk_beta,
+                    initial_state,
+                    *,
+                    chunk_cu_seqlens=chunk_cu_seqlens,
+                ):
+                    return chunk_kda(
+                        q=chunk_q,
+                        k=chunk_k,
+                        v=chunk_v,
+                        g=chunk_f,
+                        beta=chunk_beta,
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=True,
+                        use_gate_in_kernel=True,
+                        safe_gate=self.gate_lower_bound is not None,
+                        lower_bound=self.gate_lower_bound,
+                        cu_seqlens=chunk_cu_seqlens,
+                    )
+
+                chunk_inputs = (
+                    q[:, chunk_start:chunk_end],
+                    k[:, chunk_start:chunk_end],
+                    v[:, chunk_start:chunk_end],
+                    f[:, chunk_start:chunk_end],
+                    beta[:, chunk_start:chunk_end],
+                    state,
                 )
+                if self.recompute_gdn and torch.is_grad_enabled():
+                    output, state = torch_checkpoint(
+                        _run_chunk,
+                        *chunk_inputs,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                else:
+                    output, state = _run_chunk(*chunk_inputs)
                 outputs.append(output)
         return torch.cat(outputs, dim=1)
 

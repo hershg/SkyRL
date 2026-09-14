@@ -290,7 +290,7 @@ def test_kda_matches_hf(ray_init_fixture):
     assert stats["max_abs_diff"] < 0.2 * max(stats["ref_mean_abs"], 1e-3) + 1e-2, stats
 
 
-def _run_mock_chunked_kda(monkeypatch, sequence_length, cu_seqlens=None):
+def _run_mock_chunked_kda(monkeypatch, sequence_length, cu_seqlens=None, recompute_gdn=True):
     from skyrl.backends.skyrl_train.workers.megatron.mcore_ext import kda as kda_module
 
     calls = []
@@ -317,6 +317,7 @@ def _run_mock_chunked_kda(monkeypatch, sequence_length, cu_seqlens=None):
         A_log=torch.zeros(1),
         dt_bias=torch.zeros(1),
         gate_lower_bound=-5.0,
+        recompute_gdn=recompute_gdn,
     )
     q = torch.arange(sequence_length, dtype=torch.float32).view(1, sequence_length, 1, 1)
     q.requires_grad_(True)
@@ -332,6 +333,24 @@ def _run_mock_chunked_kda(monkeypatch, sequence_length, cu_seqlens=None):
         cu_seqlens,
     )
     return calls, output, q
+
+
+def test_kda_chunk_checkpoint_matches_uncheckpointed(monkeypatch):
+    from skyrl.backends.skyrl_train.workers.megatron.mcore_ext.kda import (
+        _KDA_SEQUENCE_CHUNK_SIZE,
+    )
+
+    sequence_length = 2 * _KDA_SEQUENCE_CHUNK_SIZE + 1
+    _, direct_output, direct_q = _run_mock_chunked_kda(
+        monkeypatch, sequence_length, recompute_gdn=False
+    )
+    _, checkpointed_output, checkpointed_q = _run_mock_chunked_kda(
+        monkeypatch, sequence_length, recompute_gdn=True
+    )
+    direct_output.sum().backward()
+    checkpointed_output.sum().backward()
+    torch.testing.assert_close(checkpointed_output, direct_output)
+    torch.testing.assert_close(checkpointed_q.grad, direct_q.grad)
 
 
 def test_kda_long_sequence_carries_state_across_bounded_chunks(monkeypatch):
