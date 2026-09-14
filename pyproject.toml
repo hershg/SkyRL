@@ -484,8 +484,8 @@ harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f
 # Megatron-Bridge PRs #6041 and #5971 plus their dispatch follow-up. Grouped
 # experts reuse their base output while other expert linears use the fused merge.
 megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "90d3a8bba2961b115738ff848fb1d18390566d48", marker = "sys_platform == 'linux'"}
-# FLA 0.5.2 peak-memory fix validated at native 262144-token KDA.
-flash-linear-attention = {git = "https://github.com/hershg/flash-linear-attention", rev = "60911d54ca0f3f1daf0556e3b1788c343fafc138", marker = "sys_platform == 'linux'"}
+# FLA peak-memory fix rebased onto upstream 0.6.0, including Blackwell GDN determinism fixes.
+flash-linear-attention = {git = "https://github.com/hershg/flash-linear-attention", rev = "22978043f5d99dba57e03587f2e754e2948d1fe0", marker = "sys_platform == 'linux'"}
 # GLM-5.3-Flash needs K-pool DSA selection absent from Bridge's validated submodule pin.
 # This candidate begins at that pin, adds GLM architecture support, and retains
 # only bounded streaming K-pool score tiles, never a [sequence, sequence / kpool]
