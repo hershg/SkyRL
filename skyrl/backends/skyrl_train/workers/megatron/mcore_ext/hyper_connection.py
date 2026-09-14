@@ -6,8 +6,9 @@ with ``eps`` hard-coded to 1e-6. GLM-5.3-Flash instead uses a standard RMSNorm,
 residual streams -- this model's embeddings have a per-token rms below ``sqrt(1e-5)``, where the
 placement of the epsilon changes the mixing weights materially.
 
-DELETE THIS MODULE once ``TransformerConfig`` carries the input-norm knobs upstream
-(``mhc_norm_eps`` / ``mhc_norm_eps_inside_sqrt``, read by ``HyperConnectionModule`` itself).
+The subclass remains for compatibility with Megatron-Core revisions that do not read
+``mhc_norm_eps`` directly. The fused path is implemented by Megatron-Core and uses the same
+epsilon-inside-sqrt semantics.
 """
 
 from typing import Tuple
@@ -26,11 +27,6 @@ class RMSNormInputHyperConnectionModule(HyperConnectionModule):
 
     def __init__(self, config: TransformerConfig, layer_number: int):
         super().__init__(config, layer_number)
-        if config.use_fused_mhc:
-            raise NotImplementedError(
-                "The fused mHC kernels implement the 1/(rms+eps) input normalization only; "
-                "use_fused_mhc is not compatible with mhc_norm_eps_inside_sqrt=True."
-            )
         self.norm_eps = getattr(config, "mhc_norm_eps", None) or config.layernorm_epsilon
 
     def _projection_and_get_norm(self, x: Tensor) -> Tuple[Tensor, Tensor]:
