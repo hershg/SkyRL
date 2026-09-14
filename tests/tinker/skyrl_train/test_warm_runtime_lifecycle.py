@@ -93,7 +93,15 @@ def test_profiler_advances_once_per_policy_optimizer_step(enabled):
     backend = _backend(keep_runtime_warm=True)
     backend._cfg.trainer.policy.torch_profiler_config.enable = enabled
     backend._dispatch.optim_step.return_value = 1.0
-    request = types.OptimStepInput(adam_params=types.AdamParams(learning_rate=1e-5))
+    request = types.OptimStepInput(
+        adam_params=types.AdamParams(
+            learning_rate=1e-5,
+            beta1=0.9,
+            beta2=0.95,
+            eps=1e-12,
+            weight_decay=0.0,
+        )
+    )
     backend.optim_step("model-a", request)
     assert backend._dispatch.profile_step.call_count == int(enabled)
     if enabled:
