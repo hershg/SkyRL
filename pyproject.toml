@@ -482,16 +482,14 @@ torchvision = [
 ]
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
 # LoRA-native adapter export with explicit grouped-expert ownership.
-megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "28aea7d9eae8a9434d149347dce55952b406af69", marker = "sys_platform == 'linux'"}
+megatron-bridge = {git = "https://github.com/hershg/Megatron-Bridge", rev = "6ed246ec19e4b209a87d14cd5a756e506ae57c07", marker = "sys_platform == 'linux'"}
 # megatron-core must match the `3rdparty/Megatron-LM` submodule pin of the
 # megatron-bridge rev above -- that is the only megatron-core commit Bridge's
 # own CI validates against. Bump the two together, reading the submodule rev with
-# `git ls-tree <bridge-rev> 3rdparty/Megatron-LM`. This one is on the Megatron-LM
-# main branch (https://github.com/NVIDIA/Megatron-LM/tree/main), dated 9/7/26. Megatron-LM main
-# is 3 commits ahead of it at the time of this bump; the extra commits rework
-# `experimental_attention_variant/dsa.py` (NVIDIA/Megatron-LM#6402), which the GLM 5 sparse
-# attention path builds on, so this stays on the rev Bridge validates rather than main's tip.
-megatron-core = {git = "https://github.com/NVIDIA/Megatron-LM", rev = "14346b65a2d0790e451919858f7771078105c5f0", marker = "sys_platform == 'linux'"}
+# `git ls-tree <bridge-rev> 3rdparty/Megatron-LM`.
+# MCore #6114 is cherry-picked onto the previous pin so router-replay padding
+# broadcasts correctly without pulling unrelated MCore main changes.
+megatron-core = {git = "https://github.com/hershg/Megatron-LM", rev = "0f604e24426da44c2bda190d32a98070341fb73b", marker = "sys_platform == 'linux'"}
 # NOTE (sumanthrh): This custom wheel of vllm-router includes a fix for /chat/completions endpoint: https://github.com/vllm-project/router/pull/162  on top of 0.1.14 as well as a new `sticky_least_loaded` policy: https://github.com/SumanthRH/router/tree/session-aware-lb
 vllm-router = [
     { url = "https://github.com/SumanthRH/router/releases/download/0.1.14.post1/vllm_router-0.1.14.post1-cp38-abi3-manylinux_2_35_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
