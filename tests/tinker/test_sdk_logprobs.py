@@ -28,6 +28,28 @@ def test_sampler_scores_match_shifted_training_targets_for_unequal_lengths():
         assert call.args[0].to_ints()[1:] == datum.loss_fn_inputs["target_tokens"].data
 
 
+def test_trainer_scores_each_probe_with_the_same_batching_as_sampler():
+    probes = make_probes()
+    trainer = SimpleNamespace(
+        forward=Mock(
+            side_effect=[
+                SimpleNamespace(
+                    result=lambda: SimpleNamespace(
+                        loss_fn_outputs=[{"logprobs": SimpleNamespace(data=[-0.1] * 64)}]
+                    )
+                ),
+                SimpleNamespace(
+                    result=lambda: SimpleNamespace(
+                        loss_fn_outputs=[{"logprobs": SimpleNamespace(data=[-0.2] * 128)}]
+                    )
+                ),
+            ]
+        )
+    )
+    assert checks.score_trainer(trainer, probes) == [-0.1] * 64 + [-0.2] * 128
+    assert [call.args[0] for call in trainer.forward.call_args_list] == [[probes[0]], [probes[1]]]
+
+
 def test_missing_sampler_scores_are_not_padded():
     sampler = SimpleNamespace(compute_logprobs=lambda prompt: SimpleNamespace(result=lambda: [None, -0.1]))
     with pytest.raises(ValueError, match="one score per token"):

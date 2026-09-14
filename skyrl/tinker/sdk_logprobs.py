@@ -27,11 +27,12 @@ def prepare_probes(trainer, tokenizer=None):
 
 
 def score_trainer(trainer, probes):
-    result = trainer.forward(probes, "cross_entropy").result()
-    if len(result.loss_fn_outputs) != len(probes):
-        raise ValueError("wrong training datum count")
     scores = []
-    for datum, output in zip(probes, result.loss_fn_outputs, strict=True):
+    for datum in probes:
+        result = trainer.forward([datum], "cross_entropy").result()
+        if len(result.loss_fn_outputs) != 1:
+            raise ValueError("wrong training datum count")
+        output = result.loss_fn_outputs[0]
         values = output["logprobs"].data
         if len(values) != len(datum.model_input.to_ints()) or not all(map(math.isfinite, values)):
             raise ValueError("wrong training token count or nonfinite logprobs")
