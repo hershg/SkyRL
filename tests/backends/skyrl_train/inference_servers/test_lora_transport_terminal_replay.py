@@ -226,3 +226,58 @@ async def test_fleet_recovers_unacknowledged_stage_without_losing_previous_route
             "request": LoRAUpdateRequest.from_layout(layout, 2).to_json_dict(),
         }
         await call_http(url, "/skyrl/v1/stage_lora_nccl_adapter", following)
+
+
+@pytest.mark.asyncio
+async def test_next_generation_finishes_retirement_after_lost_commit_response(monkeypatch):
+    layout = _create_layout()
+    server_urls = ["http://server-0.example.com", "http://server-1.example.com"]
+    events = []
+    lost_response = True
+
+    async def call_server(server_url, endpoint, payload=None):
+        nonlocal lost_response
+        payload = payload or {}
+        generation = payload.get("request", {}).get("generation")
+        events.append((endpoint, server_url, generation))
+        if endpoint.endswith("/stage_lora_nccl_adapter"):
+            return server_url, {
+                "status": 200,
+                "body": {"lora_int_id": 10 + generation},
+            }
+        if (
+            endpoint.endswith("/commit_lora_transport_adapter")
+            and server_url == server_urls[1]
+            and generation == 1
+            and lost_response
+        ):
+            lost_response = False
+            raise TimeoutError("commit response lost after retirement")
+        return server_url, {"status": 200, "body": {}}
+
+    client = RemoteInferenceClient(
+        proxy_url="http://router.example.com",
+        server_urls=server_urls,
+        data_parallel_size=2,
+    )
+    monkeypatch.setattr(client, "_call_server", call_server)
+    request_one = LoRAUpdateRequest.from_layout(layout, 1).to_json_dict()
+    with pytest.raises(RuntimeError, match="failed to retire"):
+        await client.load_lora_nccl_adapter("adapter", request_one)
+    assert "adapter" in client._lora_nccl_pending_retirements
+
+    request_two = LoRAUpdateRequest.from_layout(layout, 2).to_json_dict()
+    await client.load_lora_nccl_adapter("adapter", request_two)
+    assert "adapter" not in client._lora_nccl_pending_retirements
+    first_new_stage = next(
+        index
+        for index, (endpoint, _, generation) in enumerate(events)
+        if endpoint.endswith("/stage_lora_nccl_adapter") and generation == 2
+    )
+    replayed_commits = [
+        index
+        for index, (endpoint, _, generation) in enumerate(events)
+        if endpoint.endswith("/commit_lora_transport_adapter") and generation == 1
+    ]
+    assert len(replayed_commits) == 4
+    assert max(replayed_commits) < first_new_stage

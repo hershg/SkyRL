@@ -233,6 +233,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
     _sem_loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
     # Monotonic counter of weight syncs (see `increment_weight_version`); source of the prefix-cache salt.
     _weight_version: int = field(default=0, repr=False)
+    _lora_nccl_pending_retirements: Dict[str, Tuple[Dict[str, Any], Dict[str, int]]] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
     @property
     def weight_version(self) -> int:
@@ -1322,8 +1326,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """Stage and atomically activate one packed-NCCL LoRA generation."""
         from skyrl.backends.skyrl_train.weight_sync.lora_transport.fleet_control import (
             LoRATransportFleetTransaction,
+            LoRATransportRetirementError,
         )
 
+        await self._finish_pending_lora_nccl_retirement(lora_name)
         transaction_started = time.perf_counter()
         generation = int(request["generation"])
         adapter_ids: Dict[str, int] = {}
@@ -1394,23 +1400,65 @@ class RemoteInferenceClient(InferenceEngineInterface):
             if producer_error is not None:
                 raise RuntimeError(f"LoRA NCCL producer failed: {producer_error}")
 
-        result = dict(
-            await LoRATransportFleetTransaction(self.server_urls).replace(
-                stage=stage,
-                pause=pause,
-                activate=lambda url: call_phase("/skyrl/v1/activate_lora_transport_adapter", url),
-                rollback=lambda url: call_phase("/skyrl/v1/rollback_lora_transport_adapter", url),
-                commit=lambda url: call_phase("/skyrl/v1/commit_lora_transport_adapter", url),
-                resume=resume,
-                prepare_activation=(wait_for_producer if producer_ready is not None else None),
+        try:
+            result = dict(
+                await LoRATransportFleetTransaction(self.server_urls).replace(
+                    stage=stage,
+                    pause=pause,
+                    activate=lambda url: call_phase("/skyrl/v1/activate_lora_transport_adapter", url),
+                    rollback=lambda url: call_phase("/skyrl/v1/rollback_lora_transport_adapter", url),
+                    commit=lambda url: call_phase("/skyrl/v1/commit_lora_transport_adapter", url),
+                    resume=resume,
+                    prepare_activation=(wait_for_producer if producer_ready is not None else None),
+                )
             )
-        )
+        except LoRATransportRetirementError:
+            self._lora_nccl_pending_retirements[lora_name] = (
+                dict(request),
+                dict(adapter_ids),
+            )
+            raise
         logger.info(
             "lora_nccl_fleet_stage generation=%s phase=transaction_envelope seconds=%.6f",
             generation,
             time.perf_counter() - transaction_started,
         )
         return result
+
+    async def _finish_pending_lora_nccl_retirement(self, lora_name: str) -> None:
+        """Replay an interrupted idempotent commit before staging a newer generation."""
+        pending = self._lora_nccl_pending_retirements.get(lora_name)
+        if pending is None:
+            return
+        request, adapter_ids = pending
+        payload = {
+            "lora_name": lora_name,
+            "request": request,
+            "transport": "nccl",
+        }
+
+        async def commit(server_url: str):
+            server_payload = {**payload, "adapter_id": adapter_ids[server_url]}
+            return await self._call_server(
+                server_url,
+                "/skyrl/v1/commit_lora_transport_adapter",
+                server_payload,
+            )
+
+        results = await asyncio.gather(
+            *(commit(server_url) for server_url in self.server_urls),
+            return_exceptions=True,
+        )
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            from skyrl.backends.skyrl_train.weight_sync.lora_transport.fleet_control import (
+                LoRATransportRetirementError,
+            )
+
+            raise LoRATransportRetirementError(
+                f"LoRA adapter {lora_name!r} still has an incomplete retirement"
+            ) from errors[0]
+        del self._lora_nccl_pending_retirements[lora_name]
 
     async def load_lora_nccl_adapter(
         self,
@@ -1475,6 +1523,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
     async def unload_lora_nccl_adapter(self, lora_name: str) -> Dict[str, Any]:
         """Unload the adapter before destroying its persistent NCCL groups."""
+        await self._finish_pending_lora_nccl_retirement(lora_name)
         await self._call_all_servers("/skyrl/v1/pause_lora_transport")
         try:
             result = await self._call_all_servers(
