@@ -1,3 +1,4 @@
+from fractions import Fraction
 from types import SimpleNamespace
 
 import pytest
@@ -74,10 +75,16 @@ def test_bridge_export_to_vllm_activation_preserves_exact_normalized_deltas(monk
             self.dense_proj = ReplicatedLinear(8, 6, bias=False, disable_tp=True)
             self.shared_expert_proj = ReplicatedLinear(8, 6, bias=False, disable_tp=True)
             self.routed_expert_proj = ReplicatedLinear(8, 6, bias=False, disable_tp=True)
+            self.nonintegral_proj = ReplicatedLinear(8, 6, bias=False, disable_tp=True)
 
     alpha = 16
     configured_rank = 32
-    effective_ranks = {"dense_proj": 32, "shared_expert_proj": 32, "routed_expert_proj": 4}
+    effective_ranks = {
+        "dense_proj": 32,
+        "shared_expert_proj": 32,
+        "routed_expert_proj": 4,
+        "nonintegral_proj": 7,
+    }
     source_factors = {}
     tasks = []
     for index, (name, effective_rank) in enumerate(effective_ranks.items()):
@@ -188,7 +195,10 @@ def test_bridge_export_to_vllm_activation_preserves_exact_normalized_deltas(monk
                 }
                 assert component_scales == {
                     "linear_in": (1, 1),
-                    "linear_out": (configured_rank // effective_rank, 1),
+                    "linear_out": (
+                        Fraction(configured_rank, effective_rank).numerator,
+                        Fraction(configured_rank, effective_rank).denominator,
+                    ),
                 }
                 staged_a, staged_b = (component[0] for component in factors[name])
                 source_a, source_b = source_factors[name]
