@@ -152,9 +152,14 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     """Build CLI args for vLLM server from config."""
     from vllm import AsyncEngineArgs
     from vllm.config import ProfilerConfig, WeightTransferConfig
-    from vllm.entrypoints.openai.cli_args import FrontendArgs
     from vllm.platforms import current_platform
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    try:
+        from vllm.entrypoints.openai.cli_args import FrontendArgs
+    except ImportError:
+        # vLLM main moved this public CLI surface after SkyRL's supported 0.28 pin.
+        from vllm.entrypoints.launchers.cli_args import FrontendArgs
 
     # This function may run a GPU-less Ray head
     # node, where ``current_platform`` resolves to ``UnspecifiedPlatform`` with
