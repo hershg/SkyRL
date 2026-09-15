@@ -36,9 +36,7 @@ from tests.backends.skyrl_train.weight_sync.lora_reference_utils import (  # noq
     reconstruct_lora_bridge_tensors,
 )
 
-local_adapter = pytest.importorskip(
-    "vllm.lora.local_adapter", reason="Requires the explicit local-factor vLLM fork API"
-)
+local_adapter = pytest.importorskip("vllm.lora.local_adapter", reason="Requires the public local-factor vLLM API")
 LocalLoRAModulePlan = local_adapter.LocalLoRAModulePlan
 LocalLoRAPlan = local_adapter.LocalLoRAPlan
 
