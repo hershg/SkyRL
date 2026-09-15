@@ -9,6 +9,10 @@ from typing import Any
 ServerCall = Callable[[str], Awaitable[Any]]
 
 
+class LoRATransportRetirementError(RuntimeError):
+    """The new generation is active, but its predecessor is not retired everywhere."""
+
+
 class LoRATransportFleetTransaction:
     """Stage every deployment before one paused activation transaction.
 
@@ -62,7 +66,9 @@ class LoRATransportFleetTransaction:
                 # Old adapters are retained through activation. A commit failure
                 # cannot expose a mixed generation, but it must stop a later
                 # replacement until the retained old buffer is reconciled.
-                raise RuntimeError("LoRA activated everywhere but failed to retire an old adapter") from committed
+                raise LoRATransportRetirementError(
+                    "LoRA activated everywhere but failed to retire an old adapter"
+                ) from committed
             return activated
         except BaseException as error:
             primary_error = error

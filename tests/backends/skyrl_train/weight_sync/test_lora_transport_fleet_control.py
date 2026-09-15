@@ -4,6 +4,7 @@ import pytest
 
 from skyrl.backends.skyrl_train.weight_sync.lora_transport.fleet_control import (
     LoRATransportFleetTransaction,
+    LoRATransportRetirementError,
 )
 
 
@@ -137,7 +138,7 @@ async def test_failed_retirement_resumes_only_the_uniform_new_generation():
     async def resume(url):
         resumed.append(dict(active))
 
-    with pytest.raises(RuntimeError, match="failed to retire"):
+    with pytest.raises(LoRATransportRetirementError, match="failed to retire"):
         await LoRATransportFleetTransaction(["a", "b"]).replace(stage, pause, activate, rollback, commit, resume)
 
     assert resumed == [{"a": 2, "b": 2}, {"a": 2, "b": 2}]
