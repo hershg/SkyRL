@@ -233,8 +233,6 @@ def validate_megatron_cfg(cfg: SkyRLTrainConfig):
             raise ValueError(f"{backend} does not support MTP or fully_sharded_loras")
         if megatron.transformer_config_kwargs.get("fp8"):
             raise ValueError(f"{backend} requires FP32 LoRA publication; FP8 is unsupported")
-        if megatron.lora_config.normalize_moe_lora:
-            raise ValueError("lora_nccl does not support normalize_moe_lora")
         if cfg.trainer.placement.policy_num_nodes != 1:
             raise ValueError("lora_nccl initially requires all trainer ranks on one node")
         if ie_cfg.num_engines != 1:

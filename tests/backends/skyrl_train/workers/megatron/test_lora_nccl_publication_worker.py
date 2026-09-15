@@ -37,6 +37,8 @@ def _record():
         hf_param_names=("down_proj.lora_B.weight",),
         component="linear_out",
         transform="identity",
+        alpha=32,
+        effective_rank=32,
         tensor_parallel_axis=0,
         tensor_parallel_rank=0,
         tensor_parallel_size=1,
@@ -118,6 +120,7 @@ def _route(layout):
                     starts=(0, 0),
                     stops=source.shape,
                 ),
+                value_scale=(1, 1),
             ),
         ),
     )
@@ -134,7 +137,7 @@ def publication_environment(monkeypatch):
     worker = object.__new__(MegatronPolicyWorkerBase)
     worker.actor_module = object()
     worker.bridge = SimpleNamespace(export_local_adapter_weights=lambda actor_module: [_record()])
-    worker.lora_cls = object()
+    worker.lora_cls = SimpleNamespace(dim=32)
     worker._logical_model_path = "model"
 
     class RemoteClient:

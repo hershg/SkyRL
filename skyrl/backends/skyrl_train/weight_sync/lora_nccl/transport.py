@@ -240,8 +240,8 @@ class _LoRAConsumerAssembler:
             self._copies[plan.pulls[copy.pull_index]].append(copy)
         self._factors = {
             module.module_name: (
-                [torch.empty(pair[0], dtype=torch.bfloat16, device=device) for pair in module.factor_shapes],
-                [torch.empty(pair[1], dtype=torch.bfloat16, device=device) for pair in module.factor_shapes],
+                [torch.zeros(pair[0], dtype=torch.bfloat16, device=device) for pair in module.factor_shapes],
+                [torch.zeros(pair[1], dtype=torch.bfloat16, device=device) for pair in module.factor_shapes],
             )
             for module in plan.receiver_plan.modules
         }
@@ -265,8 +265,12 @@ class _LoRAConsumerAssembler:
         for copy in self._copies[pull]:
             shape = tuple(stop - start for start, stop in zip(copy.starts, copy.stops, strict=True))
             destination = self._factors[copy.module_name][copy.component][copy.factor_index]
+            source = tensor.reshape(shape)
+            if pull.value_scale != (1, 1):
+                numerator, denominator = pull.value_scale
+                source = source * (numerator / denominator)
             destination[tuple(slice(start, stop) for start, stop in zip(copy.starts, copy.stops, strict=True))].copy_(
-                tensor.reshape(shape)
+                source
             )
         self._received.add(pull)
 

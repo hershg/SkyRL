@@ -3,6 +3,7 @@
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
+from math import gcd
 from typing import Any, Iterable, Literal, Mapping
 
 import torch
@@ -25,6 +26,17 @@ class LoRABridgeSource:
     expert_parallel_rank: int
     expert_parallel_size: int
     transform_config: tuple[tuple[str, int | bool | None], ...]
+    alpha: int
+    configured_rank: int
+    effective_rank: int
+
+    @property
+    def value_scale(self) -> tuple[int, int]:
+        """Return the canonical correction applied while staging the receiver."""
+        if self.component == "linear_in":
+            return (1, 1)
+        divisor = gcd(self.configured_rank, self.effective_rank)
+        return (self.configured_rank // divisor, self.effective_rank // divisor)
 
 
 @dataclass(frozen=True)
@@ -66,6 +78,9 @@ class LoRABridgeSourceLayout:
                     expert_parallel_rank=source["expert_parallel_rank"],
                     expert_parallel_size=source["expert_parallel_size"],
                     transform_config=tuple((name, value) for name, value in source["transform_config"]),
+                    alpha=source["alpha"],
+                    configured_rank=source["configured_rank"],
+                    effective_rank=source["effective_rank"],
                 )
                 for source in data["sources"]
             ),
@@ -96,6 +111,8 @@ class LoRABridgeSourceLayout:
 def extract_lora_bridge_sources(
     records: Iterable[Any],
     source_rank: int = 0,
+    *,
+    configured_rank: int,
 ) -> tuple[dict[str, torch.Tensor], tuple[LoRABridgeSource, ...]]:
     """Detach tensors from Bridge records and return stable transport metadata.
 
@@ -106,6 +123,8 @@ def extract_lora_bridge_sources(
     """
     if source_rank < 0:
         raise ValueError(f"lora_transport Bridge source rank must be non-negative, got {source_rank}")
+    if configured_rank <= 0:
+        raise ValueError(f"lora_transport configured rank must be positive, got {configured_rank}")
     tensors: dict[str, torch.Tensor] = {}
     sources: list[LoRABridgeSource] = []
     for record in records:
@@ -135,6 +154,9 @@ def extract_lora_bridge_sources(
                 expert_parallel_rank=record.expert_parallel_rank,
                 expert_parallel_size=record.expert_parallel_size,
                 transform_config=tuple(record.transform_config),
+                alpha=record.alpha,
+                configured_rank=configured_rank,
+                effective_rank=record.effective_rank,
             )
         )
     if not sources:
@@ -166,6 +188,11 @@ def _validate_lora_bridge_source(source: LoRABridgeSource) -> None:
         raise ValueError(f"Bridge source {source.key!r} has invalid shape {source.shape!r}")
     if source.tensor_parallel_size <= 0 or source.expert_parallel_size <= 0:
         raise ValueError(f"Bridge source {source.key!r} has invalid parallel sizes")
+    scaling_values = (source.alpha, source.configured_rank, source.effective_rank)
+    if any(type(value) is not int or value <= 0 for value in scaling_values):
+        raise ValueError(f"Bridge source {source.key!r} has invalid LoRA scaling metadata")
+    if source.effective_rank > source.configured_rank:
+        raise ValueError(f"Bridge source {source.key!r} effective rank exceeds configured rank")
     if not 0 <= source.tensor_parallel_rank < source.tensor_parallel_size:
         raise ValueError(f"Bridge source {source.key!r} has invalid tensor-parallel rank")
     if not 0 <= source.expert_parallel_rank < source.expert_parallel_size:
@@ -190,6 +217,9 @@ def _validate_complete_lora_bridge_source_layout(
             or source.expert_parallel_axis != first.expert_parallel_axis
             or source.expert_parallel_size != first.expert_parallel_size
             or source.transform_config != first.transform_config
+            or source.alpha != first.alpha
+            or source.configured_rank != first.configured_rank
+            or source.effective_rank != first.effective_rank
             for source in group
         ):
             raise ValueError(f"Bridge source {key!r} has inconsistent shard metadata")

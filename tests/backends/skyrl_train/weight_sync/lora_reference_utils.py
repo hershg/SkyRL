@@ -204,7 +204,7 @@ def assemble_lora_consumer_factors(
     pulled: Mapping[LoRAConsumerPull, torch.Tensor],
     device: torch.device | str,
 ) -> dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]]:
-    """Materialize independent unscaled BF16 factors; the vLLM manager scales once."""
+    """Materialize independently scaled BF16 factors from exact FP32 pulls."""
     if set(pulled) != set(plan.pulls):
         raise ValueError("Pulled slices must match the complete consumer plan")
     for pull, tensor in pulled.items():
@@ -213,8 +213,8 @@ def assemble_lora_consumer_factors(
             raise ValueError("Pulled slices must preserve exact FP32 shape and dtype")
     factors = {
         module.module_name: (
-            [torch.empty(pair[0], dtype=torch.bfloat16, device=device) for pair in module.factor_shapes],
-            [torch.empty(pair[1], dtype=torch.bfloat16, device=device) for pair in module.factor_shapes],
+            [torch.zeros(pair[0], dtype=torch.bfloat16, device=device) for pair in module.factor_shapes],
+            [torch.zeros(pair[1], dtype=torch.bfloat16, device=device) for pair in module.factor_shapes],
         )
         for module in plan.receiver_plan.modules
     }
@@ -222,7 +222,11 @@ def assemble_lora_consumer_factors(
         tensor = pulled[plan.pulls[copy.pull_index]]
         shape = tuple(b - a for a, b in zip(copy.starts, copy.stops))
         destination = factors[copy.module_name][copy.component][copy.factor_index]
-        destination[tuple(slice(a, b) for a, b in zip(copy.starts, copy.stops))].copy_(tensor.reshape(shape))
+        source = tensor.reshape(shape)
+        if plan.pulls[copy.pull_index].value_scale != (1, 1):
+            numerator, denominator = plan.pulls[copy.pull_index].value_scale
+            source = source * (numerator / denominator)
+        destination[tuple(slice(a, b) for a, b in zip(copy.starts, copy.stops))].copy_(source)
     return factors
 
 

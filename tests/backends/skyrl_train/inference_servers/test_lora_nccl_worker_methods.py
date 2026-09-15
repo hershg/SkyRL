@@ -68,6 +68,9 @@ def _layout():
                 expert_parallel_rank=0,
                 expert_parallel_size=1,
                 transform_config=(),
+                alpha=1,
+                configured_rank=1,
+                effective_rank=1,
             ),
         ),
     )
@@ -77,6 +80,7 @@ def _consumer_plan(layout):
     pull = LoRAConsumerPull(
         0,
         LoRASourceSlice("adapter.weight", (0, 0), (1, 2)),
+        (1, 1),
     )
     module = SimpleNamespace(
         module_name="model.proj",

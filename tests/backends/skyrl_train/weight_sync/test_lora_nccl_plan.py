@@ -32,10 +32,11 @@ def _consumer_plan(*pulls):
     )
 
 
-def _pull(source_rank, key, starts, stops):
+def _pull(source_rank, key, starts, stops, value_scale=(1, 1)):
     return LoRAConsumerPull(
         source_rank,
         LoRASourceSlice(key, tuple(starts), tuple(stops)),
+        value_scale,
     )
 
 
@@ -90,6 +91,26 @@ def test_plan_digest_and_buckets_do_not_depend_on_pull_order():
     assert plan.buckets == reordered.buckets
     assert [pull.source_slice.key for pull in plan.buckets[0].pulls] == ["a", "b"]
     assert [pull.source_slice.key for pull in plan.buckets[1].pulls] == ["c"]
+
+
+def test_plan_digest_tracks_receiver_value_scale():
+    unscaled = build_lora_nccl_plan({0: _consumer_plan(_pull(0, "a", (0,), (2,)))}, 32)
+    scaled = build_lora_nccl_plan({0: _consumer_plan(_pull(0, "a", (0,), (2,), (8, 1)))}, 32)
+
+    assert unscaled.plan_digest != scaled.plan_digest
+
+
+def test_route_rejects_omitted_or_noncanonical_value_scale():
+    route = LoRANcclConsumerRoute.from_consumer_plan(0, _consumer_plan(_pull(0, "a", (0,), (2,))))
+    payload = route.to_json_dict()
+    del payload["pulls"][0]["value_scale"]
+
+    with pytest.raises(KeyError, match="value_scale"):
+        LoRANcclConsumerRoute.from_json_dict(payload)
+    with pytest.raises(ValueError, match="numerator/denominator"):
+        LoRANcclConsumerRoute(0, LAYOUT_DIGEST, (_pull(0, "a", (0,), (2,), (8,)),))
+    with pytest.raises(ValueError, match="canonical"):
+        LoRANcclConsumerRoute(0, LAYOUT_DIGEST, (_pull(0, "a", (0,), (2,), (8, 2)),))
 
 
 def test_pack_and_unpack_preserve_exact_fp32_slices():

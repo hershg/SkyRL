@@ -57,6 +57,7 @@ def _append_source(
     ep_axis=None,
     ep_size=1,
     transform="identity",
+    effective_rank=4,
 ):
     ep_shards = tensor.chunk(ep_size, dim=ep_axis) if ep_axis is not None else [tensor] * ep_size
     for ep_rank, ep_shard in enumerate(ep_shards):
@@ -77,6 +78,9 @@ def _append_source(
                 ep_rank,
                 ep_size,
                 (),
+                4,
+                4,
+                effective_rank,
             )
             sources.append(source)
             tensors[(key, tp_rank, ep_rank)] = shard.contiguous().clone()
@@ -126,7 +130,12 @@ def _module(
 
 
 def _execute(source_layout, tensors, module):
-    receiver = LocalLoRAPlan(4, 12, ("proj",), (module,))
+    receiver = LocalLoRAPlan(
+        source_layout.sources[0].configured_rank,
+        source_layout.sources[0].alpha,
+        ("proj",),
+        (module,),
+    )
     plan = build_lora_consumer_plan(source_layout, receiver)
     by_owner = {
         (source.source_rank, source.key): tensors[

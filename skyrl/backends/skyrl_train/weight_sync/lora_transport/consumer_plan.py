@@ -22,6 +22,7 @@ from skyrl.backends.skyrl_train.weight_sync.lora_transport.contracts import (
 class LoRAConsumerPull:
     source_rank: int
     source_slice: LoRASourceSlice
+    value_scale: tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -200,6 +201,11 @@ def build_lora_consumer_plan(source_layout: LoRABridgeSourceLayout, receiver_pla
     """Intersect canonical source ownership with only the consumed local regions."""
     if receiver_plan.rank <= 0 or not receiver_plan.modules or not receiver_plan.target_modules:
         raise ValueError("Consumer plans require a positive rank and nonempty targets and modules")
+    for source in source_layout.sources:
+        if source.configured_rank != receiver_plan.rank:
+            raise ValueError("Bridge source configured rank does not match the vLLM adapter rank")
+        if source.alpha != receiver_plan.lora_alpha:
+            raise ValueError("Bridge source alpha does not match the vLLM adapter alpha")
     module_names = [module.module_name for module in receiver_plan.modules]
     if len(module_names) != len(set(module_names)):
         raise ValueError("Consumer plans require unique module names")
@@ -216,12 +222,28 @@ def build_lora_consumer_plan(source_layout: LoRABridgeSourceLayout, receiver_pla
             raise ValueError("Consumer source names must match runtime factor order")
         for factor_index, shapes in enumerate(module.factor_shapes):
             for component, destination_shape in enumerate(shapes):
+                suffix = ".lora_A.weight" if component == 0 else ".lora_B.weight"
+                canonical_names = tuple(
+                    convert_moe_expert_lora_key(
+                        name.removeprefix("base_model.model.") + suffix,
+                        len(destination_shape),
+                    )
+                    for name in module.source_names[factor_index]
+                )
+                missing_names = set(canonical_names).difference(sources)
+                if missing_names:
+                    raise ValueError(f"Missing canonical sources for {sorted(missing_names)!r}")
+                effective_ranks = {tile.source.effective_rank for name in canonical_names for tile in sources[name][1]}
+                if len(effective_ranks) != 1:
+                    raise ValueError("One vLLM factor requires one effective LoRA rank")
+                effective_rank = effective_ranks.pop()
                 regions = _get_factor_regions(
                     module,
                     factor_index,
                     component,
                     destination_shape,
                     receiver_plan.rank,
+                    effective_rank,
                 )
                 factor_copies = []
                 for (
@@ -246,7 +268,7 @@ def build_lora_consumer_plan(source_layout: LoRABridgeSourceLayout, receiver_pla
                         stops = tuple(a + b - c for a, b, c in zip(tile.source_starts, upper, tile.starts))
                         selection = LoRASourceSlice(tile.source.key, starts, stops)
                         selection.validate_shape(tile.source.shape)
-                        pull = LoRAConsumerPull(tile.source.source_rank, selection)
+                        pull = LoRAConsumerPull(tile.source.source_rank, selection, tile.source.value_scale)
                         if pull not in pull_indices:
                             pull_indices[pull] = len(pulls)
                             pulls.append(pull)
@@ -267,20 +289,24 @@ def build_lora_consumer_plan(source_layout: LoRABridgeSourceLayout, receiver_pla
                             tuple(value + 1 for value in destination_start[:prefix]) + local_stop,
                         )
                         factor_copies.append(copy)
-                _validate_factor_coverage(destination_shape, factor_copies)
+                active_shape = list(destination_shape)
+                active_shape[-2 if component == 0 else -1] = effective_rank
+                _validate_factor_coverage(tuple(active_shape), factor_copies)
                 copies.extend(factor_copies)
     return LoRAConsumerPlan(source_layout.layout_digest, receiver_plan, tuple(pulls), tuple(copies))
 
 
-def _get_factor_regions(module, factor, component, shape, rank):
+def _get_factor_regions(module, factor, component, shape, configured_rank, effective_rank):
     layout = module.source_layout
     names = module.source_names[factor]
     global_input = module.global_input_size
     global_output = module.global_output_sizes[factor]
+    if shape[-2 if component == 0 else -1] != configured_rank:
+        raise ValueError("vLLM factor shape does not match its configured LoRA rank")
     if layout in ("row", "column", "replicated", "merged"):
         if len(names) != 1 or len(shape) != 2:
             raise ValueError("Dense local factors require one 2D source")
-        expected = (rank, global_input) if component == 0 else (global_output, rank)
+        expected = (effective_rank, global_input) if component == 0 else (global_output, effective_rank)
         start = [0, 0]
         if layout == "row" and component == 0:
             start[1] = module.tp_rank * shape[1]
@@ -306,7 +332,7 @@ def _get_factor_regions(module, factor, component, shape, rank):
     input_size = global_input
     if factor == 1:
         input_size = module.global_output_sizes[0] // (2 if layout == "moe_3d" else 1)
-    per_expert_shape = (rank, input_size) if component == 0 else (global_output, rank)
+    per_expert_shape = (effective_rank, input_size) if component == 0 else (global_output, effective_rank)
     start = [0, 0]
     if factor == 1 and component == 0:
         start[1] = module.tp_rank * shape[-1]
@@ -340,7 +366,7 @@ def _get_factor_regions(module, factor, component, shape, rank):
                 (
                     shape[0],
                     side * (global_output // 2) + (module.tp_rank + 1) * half,
-                    rank,
+                    effective_rank,
                 ),
                 (0, side * half, 0),
             )

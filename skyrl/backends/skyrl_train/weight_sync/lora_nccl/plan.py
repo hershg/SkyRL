@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
-from math import prod
+from math import gcd, prod
 from typing import Any, Mapping
 
 import torch
@@ -22,6 +22,7 @@ def _pull_sort_key(pull: LoRAConsumerPull) -> tuple:
         pull.source_slice.key,
         pull.source_slice.starts,
         pull.source_slice.stops,
+        pull.value_scale,
     )
 
 
@@ -51,6 +52,14 @@ class LoRANcclConsumerRoute:
             raise ValueError("LoRA NCCL routes require a SHA-256 layout digest")
         if not self.pulls:
             raise ValueError("LoRA NCCL routes require at least one source pull")
+        for pull in self.pulls:
+            if len(pull.value_scale) != 2 or any(type(value) is not int for value in pull.value_scale):
+                raise ValueError("LoRA NCCL routes require integer numerator/denominator value scales")
+            numerator, denominator = pull.value_scale
+            if numerator <= 0 or denominator <= 0:
+                raise ValueError("LoRA NCCL routes require positive value scales")
+            if gcd(numerator, denominator) != 1:
+                raise ValueError("LoRA NCCL routes require canonical value scales")
         canonical = tuple(sorted(self.pulls, key=_pull_sort_key))
         if self.pulls != canonical or len(self.pulls) != len(set(self.pulls)):
             raise ValueError("LoRA NCCL route pulls must be canonical and unique")
@@ -77,6 +86,7 @@ class LoRANcclConsumerRoute:
                     "key": pull.source_slice.key,
                     "starts": pull.source_slice.starts,
                     "stops": pull.source_slice.stops,
+                    "value_scale": pull.value_scale,
                 }
                 for pull in self.pulls
             ],
@@ -99,6 +109,7 @@ class LoRANcclConsumerRoute:
                         starts=tuple(pull["starts"]),
                         stops=tuple(pull["stops"]),
                     ),
+                    value_scale=tuple(pull["value_scale"]),
                 )
                 for pull in data["pulls"]
             ),

@@ -371,7 +371,7 @@ def test_megatron_validation_rejects_unsupported_lora_nccl_topology(
         train_utils.validate_megatron_cfg(cfg)
 
 
-def test_megatron_validation_rejects_normalized_moe_lora():
+def test_megatron_validation_accepts_normalized_moe_lora_with_native_scaling():
     cfg = _make_validated_test_config()
     cfg.trainer.strategy = "megatron"
     cfg.trainer.placement.colocate_all = False
@@ -381,8 +381,7 @@ def test_megatron_validation_rejects_normalized_moe_lora():
     cfg.trainer.policy.megatron_config.lora_config.normalize_moe_lora = True
     cfg.generator.inference_engine.weight_sync_backend = "lora_nccl"
 
-    with pytest.raises(ValueError, match="normalize_moe_lora"):
-        train_utils.validate_megatron_cfg(cfg)
+    train_utils.validate_megatron_cfg(cfg)
 
 
 def test_megatron_validation_requires_fp8_param_gather_for_training():

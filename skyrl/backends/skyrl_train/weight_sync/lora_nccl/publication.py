@@ -30,13 +30,16 @@ class LoRANcclPublication:
 class LoRANcclPublicationPlanner:
     """Validate each update against one global rank-local Bridge layout."""
 
-    def __init__(self, adapter_name: str, source_rank: int) -> None:
+    def __init__(self, adapter_name: str, source_rank: int, configured_rank: int) -> None:
         if not adapter_name:
             raise ValueError("LoRA NCCL publications require an adapter name")
         if source_rank < 0:
             raise ValueError("LoRA NCCL source ranks must be non-negative")
+        if configured_rank <= 0:
+            raise ValueError("LoRA NCCL configured rank must be positive")
         self._adapter_name = adapter_name
         self._source_rank = source_rank
+        self._configured_rank = configured_rank
         self._layout: LoRABridgeSourceLayout | None = None
         self._generation = -1
 
@@ -49,6 +52,7 @@ class LoRANcclPublicationPlanner:
         local_tensors, local_sources = extract_lora_bridge_sources(
             records,
             self._source_rank,
+            configured_rank=self._configured_rank,
         )
         if self._layout is None:
             if gathered_sources is None:

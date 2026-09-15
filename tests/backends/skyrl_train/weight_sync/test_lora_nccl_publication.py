@@ -21,6 +21,8 @@ def _record(tp_rank, values=None):
         hf_param_names=("model.proj.lora_B.weight",),
         component="linear_out",
         transform="identity",
+        alpha=32,
+        effective_rank=32,
         tensor_parallel_axis=0,
         tensor_parallel_rank=tp_rank,
         tensor_parallel_size=2,
@@ -33,13 +35,13 @@ def _record(tp_rank, values=None):
 
 def _global_sources():
     return [
-        extract_lora_bridge_sources([_record(0)], 0)[1],
-        extract_lora_bridge_sources([_record(1)], 1)[1],
+        extract_lora_bridge_sources([_record(0)], 0, configured_rank=32)[1],
+        extract_lora_bridge_sources([_record(1)], 1, configured_rank=32)[1],
     ]
 
 
 def test_publication_planner_freezes_layout_and_advances_each_attempt():
-    planner = LoRANcclPublicationPlanner("adapter", 0)
+    planner = LoRANcclPublicationPlanner("adapter", 0, 32)
 
     first = planner.plan([_record(0)], _global_sources())
     second = planner.plan([_record(0, [[3.0, 4.0]])])
@@ -52,7 +54,7 @@ def test_publication_planner_freezes_layout_and_advances_each_attempt():
 
 
 def test_publication_planner_rejects_changed_or_reinitialized_layout():
-    planner = LoRANcclPublicationPlanner("adapter", 0)
+    planner = LoRANcclPublicationPlanner("adapter", 0, 32)
     planner.plan([_record(0)], _global_sources())
 
     with pytest.raises(ValueError, match="changed its fixed local source layout"):

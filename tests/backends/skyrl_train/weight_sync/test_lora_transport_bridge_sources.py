@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,8 @@ def _record(**overrides):
         "hf_param_names": ("base_model.model.layers.0.mlp.gate_proj.lora_A.weight",),
         "component": "linear_in",
         "transform": "identity",
+        "alpha": 32,
+        "effective_rank": 32,
         "weight": torch.ones((2, 4), dtype=torch.float32),
         "tensor_parallel_axis": 1,
         "tensor_parallel_rank": 0,
@@ -32,8 +35,12 @@ def _record(**overrides):
     return SimpleNamespace(**fields)
 
 
+def _extract(records, source_rank=0):
+    return extract_lora_bridge_sources(records, source_rank, configured_rank=32)
+
+
 def test_extract_lora_bridge_sources_separates_fp32_storage_from_stable_metadata():
-    tensors, sources = extract_lora_bridge_sources([_record()])
+    tensors, sources = _extract([_record()])
 
     assert tensors.keys() == {sources[0].key}
     assert tensors[sources[0].key].dtype is torch.float32
@@ -45,9 +52,9 @@ def test_extract_lora_bridge_sources_separates_fp32_storage_from_stable_metadata
 def test_extract_lora_bridge_sources_rejects_duplicate_or_non_fp32_sources():
     record = _record()
     with pytest.raises(ValueError, match="duplicate"):
-        extract_lora_bridge_sources([record, record])
+        _extract([record, record])
     with pytest.raises(ValueError, match="float32"):
-        extract_lora_bridge_sources([_record(weight=torch.ones((2, 4), dtype=torch.bfloat16))])
+        _extract([_record(weight=torch.ones((2, 4), dtype=torch.bfloat16))])
 
 
 def test_reconstruct_lora_bridge_tensors_assembles_tp_and_ep_shards():
@@ -72,7 +79,7 @@ def test_reconstruct_lora_bridge_tensors_assembles_tp_and_ep_shards():
                     "expert_parallel_rank": ep_rank,
                 }
             )
-            _, sources = extract_lora_bridge_sources([record])
+            _, sources = _extract([record])
             records.extend(sources)
             tensors[(sources[0].key, tp_rank, ep_rank)] = torch.full(
                 (1, 2), ep_rank * 10 + tp_rank, dtype=torch.float32
@@ -100,8 +107,8 @@ def test_reconstruct_lora_bridge_tensors_replicates_and_splits_gated_sources():
         weight=torch.arange(8, dtype=torch.float32).reshape(4, 2),
         tensor_parallel_size=1,
     )
-    tensors_a, sources_a = extract_lora_bridge_sources([replicated])
-    tensors_b, sources_b = extract_lora_bridge_sources([gated])
+    tensors_a, sources_a = _extract([replicated])
+    tensors_b, sources_b = _extract([gated])
     tensors = {
         (sources_a[0].key, 0, 0): tensors_a[sources_a[0].key],
         (sources_b[0].key, 0, 0): tensors_b[sources_b[0].key],
@@ -131,7 +138,7 @@ def test_reconstruct_lora_bridge_tensors_splits_qkv_with_bridge_layout_config():
             ("attention_output_gate", False),
         ),
     )
-    tensors, sources = extract_lora_bridge_sources([qkv])
+    tensors, sources = _extract([qkv])
 
     result = reconstruct_lora_bridge_tensors(
         sources,
@@ -177,7 +184,7 @@ def test_reconstruct_lora_bridge_tensors_splits_gdn_with_bridge_layout_config():
     tensors = {}
     for tp_rank in range(2):
         record = _record(**{**source.__dict__, "tensor_parallel_rank": tp_rank})
-        _, sources = extract_lora_bridge_sources([record])
+        _, sources = _extract([record])
         records.extend(sources)
         tensors[(sources[0].key, tp_rank, 0)] = torch.arange(
             tp_rank * 12, (tp_rank + 1) * 12, dtype=torch.float32
@@ -204,12 +211,14 @@ def test_reconstruct_lora_bridge_tensors_splits_gdn_with_bridge_layout_config():
 
 
 def test_bridge_source_layout_digest_tracks_rank_ownership_and_rejects_duplicates():
-    _, first_sources = extract_lora_bridge_sources([_record()], source_rank=0)
-    _, second_sources = extract_lora_bridge_sources([_record(tensor_parallel_rank=1)], source_rank=1)
+    _, first_sources = _extract([_record()], source_rank=0)
+    _, second_sources = _extract([_record(tensor_parallel_rank=1)], source_rank=1)
     layout = LoRABridgeSourceLayout("adapter", (*first_sources, *second_sources))
 
-    _, remapped_sources = extract_lora_bridge_sources([_record(tensor_parallel_rank=1)], source_rank=2)
+    _, remapped_sources = _extract([_record(tensor_parallel_rank=1)], source_rank=2)
     assert layout.layout_digest != LoRABridgeSourceLayout("adapter", (*first_sources, *remapped_sources)).layout_digest
+    changed_scale = tuple(replace(source, effective_rank=16) for source in layout.sources)
+    assert layout.layout_digest != LoRABridgeSourceLayout("adapter", changed_scale).layout_digest
     with pytest.raises(ValueError, match="ownership"):
         LoRABridgeSourceLayout(
             "adapter",
@@ -220,8 +229,8 @@ def test_bridge_source_layout_digest_tracks_rank_ownership_and_rejects_duplicate
 
 
 def test_bridge_source_layout_round_trips_over_the_control_plane_and_verifies_digest():
-    _, first_sources = extract_lora_bridge_sources([_record()], source_rank=0)
-    _, second_sources = extract_lora_bridge_sources([_record(tensor_parallel_rank=1)], source_rank=1)
+    _, first_sources = _extract([_record()], source_rank=0)
+    _, second_sources = _extract([_record(tensor_parallel_rank=1)], source_rank=1)
     layout = LoRABridgeSourceLayout("adapter", (*first_sources, *second_sources))
     payload = layout.to_json_dict()
 
@@ -230,3 +239,19 @@ def test_bridge_source_layout_round_trips_over_the_control_plane_and_verifies_di
     payload["sources"][0]["source_rank"] = 7
     with pytest.raises(ValueError, match="digest"):
         LoRABridgeSourceLayout.from_json_dict(payload)
+
+    payload = layout.to_json_dict()
+    del payload["sources"][0]["effective_rank"]
+    with pytest.raises(KeyError, match="effective_rank"):
+        LoRABridgeSourceLayout.from_json_dict(payload)
+
+
+def test_bridge_source_scaling_supports_rational_rank_ratios_and_rejects_rank_expansion():
+    _, sources = _extract([_record(tensor_parallel_size=1, effective_rank=7)])
+    layout = LoRABridgeSourceLayout("adapter", sources)
+
+    assert layout.sources[0].value_scale == (1, 1)
+    linear_out = replace(layout.sources[0], component="linear_out")
+    assert linear_out.value_scale == (32, 7)
+    with pytest.raises(ValueError, match="exceeds configured rank"):
+        LoRABridgeSourceLayout("adapter", (replace(layout.sources[0], effective_rank=33),))

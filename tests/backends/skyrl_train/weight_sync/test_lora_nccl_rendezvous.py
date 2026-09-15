@@ -42,14 +42,14 @@ def _plan():
         0,
         LAYOUT_DIGEST,
         (
-            LoRAConsumerPull(0, LoRASourceSlice("a", (0,), (2,))),
-            LoRAConsumerPull(2, LoRASourceSlice("c", (0,), (1,))),
+            LoRAConsumerPull(0, LoRASourceSlice("a", (0,), (2,)), (1, 1)),
+            LoRAConsumerPull(2, LoRASourceSlice("c", (0,), (1,)), (1, 1)),
         ),
     )
     rank2 = LoRANcclConsumerRoute(
         2,
         LAYOUT_DIGEST,
-        (LoRAConsumerPull(0, LoRASourceSlice("b", (0,), (3,))),),
+        (LoRAConsumerPull(0, LoRASourceSlice("b", (0,), (3,)), (1, 1)),),
     )
     return build_lora_nccl_plan({0: rank0, 2: rank2}, 32)
 
@@ -96,8 +96,8 @@ def test_source_and_receiver_join_one_shared_static_group():
         0,
         LAYOUT_DIGEST,
         (
-            LoRAConsumerPull(0, LoRASourceSlice("a", (0,), (2,))),
-            LoRAConsumerPull(2, LoRASourceSlice("c", (0,), (1,))),
+            LoRAConsumerPull(0, LoRASourceSlice("a", (0,), (2,)), (1, 1)),
+            LoRAConsumerPull(2, LoRASourceSlice("c", (0,), (1,)), (1, 1)),
         ),
     )
     consumer_plan = LoRAConsumerPlan(
@@ -134,7 +134,7 @@ def test_receiver_constructor_failure_destroys_shared_group(monkeypatch):
     consumer_plan = LoRAConsumerPlan(
         LAYOUT_DIGEST,
         type("ReceiverPlan", (), {"modules": ()})(),
-        (LoRAConsumerPull(0, LoRASourceSlice("a", (0,), (2,))),),
+        (LoRAConsumerPull(0, LoRASourceSlice("a", (0,), (2,)), (1, 1)),),
         (),
     )
     with pytest.raises(RuntimeError, match="injected session failure"):

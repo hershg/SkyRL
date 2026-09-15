@@ -1890,10 +1890,18 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         if state is None:
             static_started = time.perf_counter()
-            _, local_sources = extract_lora_bridge_sources(records, source_rank=rank)
+            _, local_sources = extract_lora_bridge_sources(
+                records,
+                source_rank=rank,
+                configured_rank=self.lora_cls.dim,
+            )
             gathered_sources = [None] * world_size
             torch.distributed.all_gather_object(gathered_sources, local_sources)
-            planner = LoRANcclPublicationPlanner(lora_name, rank)
+            planner = LoRANcclPublicationPlanner(
+                lora_name,
+                rank,
+                self.lora_cls.dim,
+            )
             publication = planner.plan(records, gathered_sources)
             control = [None]
             if rank == 0:

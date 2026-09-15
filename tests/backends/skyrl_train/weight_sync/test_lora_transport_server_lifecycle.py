@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from skyrl.backends.skyrl_train.weight_sync.lora_transport.bridge_sources import (
@@ -43,6 +45,9 @@ def _layout():
                 expert_parallel_rank=0,
                 expert_parallel_size=1,
                 transform_config=(),
+                alpha=1,
+                configured_rank=1,
+                effective_rank=1,
             ),
         ),
     )
@@ -178,11 +183,12 @@ async def test_transport_rejects_changed_layout_before_worker_collective():
     await lifecycle.activate(engine, _request(), 4)
     await lifecycle.commit(engine, _request(), 4)
     before = list(engine.calls)
+    changed_layout = LoRABridgeSourceLayout(
+        "adapter",
+        (replace(_layout().sources[0], configured_rank=2),),
+    )
     changed = LoRAUpdateRequest.from_json_dict(
-        {
-            **_request(2).to_json_dict(),
-            "layout_digest": "0" * 64,
-        }
+        {**_request(2).to_json_dict(), "layout_digest": changed_layout.layout_digest}
     )
 
     with pytest.raises(ValueError, match="changed the fixed source layout"):

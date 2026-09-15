@@ -51,6 +51,9 @@ def _create_layout():
         expert_parallel_rank=0,
         expert_parallel_size=1,
         transform_config=(),
+        alpha=1,
+        configured_rank=1,
+        effective_rank=1,
     )
     layout = LoRABridgeSourceLayout("adapter", (source,))
     return layout

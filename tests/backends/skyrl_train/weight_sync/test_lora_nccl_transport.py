@@ -53,8 +53,8 @@ def _request(digest=LAYOUT_DIGEST):
 
 
 def _consumer_plan():
-    pull_a = LoRAConsumerPull(0, LoRASourceSlice("a", (1, 1), (3, 4)))
-    pull_b = LoRAConsumerPull(0, LoRASourceSlice("b", (0, 0), (4, 2)))
+    pull_a = LoRAConsumerPull(0, LoRASourceSlice("a", (1, 1), (3, 4)), (1, 1))
+    pull_b = LoRAConsumerPull(0, LoRASourceSlice("b", (0, 0), (4, 2)), (1, 1))
     module = SimpleNamespace(
         module_name="model.proj",
         factor_shapes=(((2, 3), (4, 2)),),
