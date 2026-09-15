@@ -382,6 +382,12 @@ def test_kda_long_sequence_carries_state_across_bounded_chunks(monkeypatch):
     assert torch.count_nonzero(q.grad[:, :_KDA_SEQUENCE_CHUNK_SIZE]) > 0
 
 
+def test_kda_8192_input_uses_two_memory_bounded_chunks(monkeypatch):
+    calls, _, _ = _run_mock_chunked_kda(monkeypatch, 8192)
+
+    assert [call["length"] for call in calls] == [4096, 4096]
+
+
 def test_kda_packed_sequences_reset_state_at_boundaries(monkeypatch):
     from skyrl.backends.skyrl_train.workers.megatron.mcore_ext.kda import (
         _KDA_SEQUENCE_CHUNK_SIZE,
