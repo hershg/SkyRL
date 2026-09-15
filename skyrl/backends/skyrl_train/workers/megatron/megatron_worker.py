@@ -756,6 +756,7 @@ class MegatronWorker:
                 normalize_moe_lora=self.cfg.policy.megatron_config.lora_config.normalize_moe_lora,
                 share_expert_adapters=lora_config.share_expert_adapters,
                 use_transformer_engine_op_fuser=lora_config.use_transformer_engine_op_fuser,
+                a2a_experimental=lora_config.a2a_experimental,
             )
         elif lora_type == "canonical_lora":
             # TODO (sumanthrh): Why is share_expert_adapters not passed here?

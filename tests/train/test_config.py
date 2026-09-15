@@ -128,6 +128,7 @@ def test_cli_overrides():
         "trainer.policy.model.path=path/to/model",
         "trainer.seed=123",
         "trainer.policy.model.lora.use_transformer_engine_op_fuser=true",
+        "trainer.policy.model.lora.a2a_experimental=true",
         "generator.inference_engine.engine_init_kwargs.field=value",
         "generator.sampling_params.temperature=0.7",
     ]
@@ -135,6 +136,7 @@ def test_cli_overrides():
     assert cfg.trainer.policy.model.path == "path/to/model"
     assert cfg.trainer.seed == 123
     assert cfg.trainer.policy.model.lora.use_transformer_engine_op_fuser is True
+    assert cfg.trainer.policy.model.lora.a2a_experimental is True
     assert cfg.generator.inference_engine.engine_init_kwargs["field"] == "value"
     assert cfg.generator.sampling_params.temperature == 0.7
 

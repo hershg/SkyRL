@@ -129,6 +129,13 @@ class SkyRLLoraConfig(BaseConfig):
     group has size one.
     """
 
+    a2a_experimental: bool = False
+    """Use Megatron Bridge's hidden-to-sequence all-to-all for LoRA output projections.
+
+    This avoids a full-sequence, full-hidden activation for row-parallel targets
+    when tensor and sequence parallelism are enabled.
+    """
+
     max_loras: int = 1
     """Maximum number of LoRA adapters that can be active concurrently in a
     single GPU batch. Maps to vLLM's ``max_loras``. Increase past 1 to enable
