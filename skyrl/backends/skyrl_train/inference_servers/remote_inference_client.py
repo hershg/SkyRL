@@ -1282,6 +1282,28 @@ class RemoteInferenceClient(InferenceEngineInterface):
             {"method": "skyrl_finish_weight_update"},
         )
 
+    async def describe_active_lora(self) -> list[dict[str, Any]]:
+        """Collect receiver-owned adapter evidence without losing engine identity."""
+        return await self._collect_lora_diagnostic("describe_active_lora")
+
+    async def evict_active_lora(self) -> list[dict[str, Any]]:
+        """Remove the audited adapter from every receiver's slots and cache."""
+        return await self._collect_lora_diagnostic("evict_active_lora")
+
+    async def _collect_lora_diagnostic(self, method: str) -> list[dict[str, Any]]:
+        responses = await self._call_all_servers("/collective_rpc", {"method": method, "kwargs": {}})
+        if set(responses) != set(self.server_urls):
+            raise RuntimeError("Receiver audit did not cover every inference engine")
+        receipts = []
+        for engine_id, response in responses.items():
+            if response["status"] != 200:
+                raise RuntimeError("Receiver audit request failed")
+            results = response["body"]["results"]
+            if not isinstance(results, list) or not results:
+                raise RuntimeError("Receiver audit did not return per-rank receipts")
+            receipts.extend({**result, "engine_id": engine_id} for result in results)
+        return receipts
+
     async def load_lora_adapter(
         self,
         lora_name: str,
