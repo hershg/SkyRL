@@ -5,8 +5,13 @@ from contextlib import asynccontextmanager
 
 import ray
 import torch
+from ray.util.placement_group import remove_placement_group
 
 from examples.model_checks.lora_logprobs import perturb_adapters
+from examples.model_checks.placement import (
+    create_role_placement_groups,
+    validate_role_nodes,
+)
 from skyrl.backends.skyrl_train.distributed.dispatch import WorkerOutput
 from skyrl.backends.skyrl_train.inference_servers.setup import (
     build_new_inference_client,
@@ -21,21 +26,37 @@ from skyrl.train.utils.utils import initialize_ray
 
 
 @asynccontextmanager
-async def open_runtime(cfg, tokenizer):
+async def open_runtime(cfg, tokenizer, worker_type=None, role_addresses=None):
     if ray.is_initialized():
         raise RuntimeError("Run in a fresh driver on an owned Ray cluster")
+    groups = {}
     try:
         initialize_ray(cfg)
-        client, setup = build_new_inference_client(cfg, tokenizer)
+        if role_addresses is not None:
+            groups = create_role_placement_groups(role_addresses, cfg.trainer.placement.policy_num_gpus_per_node)
+        client, setup = build_new_inference_client(cfg, tokenizer, placement_group=groups.get("inference"))
         try:
             policy = PPORayActorGroup(
                 cfg.trainer,
                 num_nodes=cfg.trainer.placement.policy_num_nodes,
                 num_gpus_per_node=cfg.trainer.placement.policy_num_gpus_per_node,
-                ray_actor_type=ray.remote(LoRALogprobWorker),
+                ray_actor_type=ray.remote(LoRALogprobWorker if worker_type is None else worker_type),
+                pg=groups.get("trainer"),
                 sequence_parallel_size=cfg.trainer.policy.sequence_parallel_size,
                 record_memory=cfg.trainer.policy.record_memory,
             )
+            if role_addresses is not None:
+                expected = validate_role_nodes(
+                    ray.nodes(), role_addresses, cfg.trainer.placement.policy_num_gpus_per_node
+                )
+                actual = ray.get(policy.async_run_ray_method("pass_through", "get_ray_node_id"))
+                expected_trainers = [
+                    node
+                    for node in sorted(expected["trainer"])
+                    for _ in range(cfg.trainer.placement.policy_num_gpus_per_node)
+                ]
+                if actual != expected_trainers:
+                    raise ValueError("Trainer actors differ from the admitted three-node placement")
             ray.get(policy.async_init_model(cfg.trainer.policy.model.path))
             ray.get(
                 policy.async_run_ray_method(
@@ -52,6 +73,8 @@ async def open_runtime(cfg, tokenizer):
                 for group in setup.server_groups:
                     group.shutdown()
     finally:
+        for group in groups.values():
+            remove_placement_group(group.pg)
         # Disconnect this driver and its non-detached actors, not the cluster.
         ray.shutdown()
 
