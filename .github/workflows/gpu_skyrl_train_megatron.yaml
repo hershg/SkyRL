@@ -15,6 +15,7 @@ on:
       - '!docs/**'
       - '!examples/**'
       - 'examples/model_checks/**'
+      - 'tests/backends/skyrl_train/distributed/test_scheduler_restore.py'
       - '.github/workflows/**'
   pull_request_target:
     types: [labeled]
