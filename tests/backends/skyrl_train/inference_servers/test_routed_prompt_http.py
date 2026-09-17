@@ -8,6 +8,9 @@ import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+pytest.importorskip("vllm")
+
 from vllm.lora.request import LoRARequest
 
 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
@@ -16,6 +19,8 @@ from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import
 from skyrl.backends.skyrl_train.inference_servers.vllm_server_actor import (
     VLLMServerActor,
 )
+
+pytestmark = pytest.mark.vllm
 
 
 def make_app(score=-0.25):

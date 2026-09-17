@@ -4,6 +4,7 @@ import json
 import sys
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import numpy as np
 import pytest
@@ -215,9 +216,9 @@ async def test_run_checks_the_actual_published_update_and_cleans_up(
         calls.append("score_trainer")
         return [-2.0 + update_size, -3.0 + update_size] if changed else [-2.0, -3.0]
 
-    async def capture_routes(client, sequences, model):
+    async def score_routed_sampler(client, sequences, model):
         calls.append("capture_routes")
-        return [torch.full((3, 2, 1), publications)]
+        return await score_sampler(client, sequences, model), [torch.full((3, 2, 1), publications)]
 
     async def score_sampler(client, sequences, model):
         calls.append(f"score_{model}")
@@ -231,7 +232,7 @@ async def test_run_checks_the_actual_published_update_and_cleans_up(
         ("perturb_trainer", perturb),
         ("score_trainer", score_trainer),
         ("score_sampler", score_sampler),
-        ("capture_routes", capture_routes),
+        ("score_routed_sampler", score_routed_sampler),
     ]:
         monkeypatch.setattr(run_lora_logprobs, name, function)
     args = SimpleNamespace(
@@ -263,16 +264,23 @@ async def test_run_checks_the_actual_published_update_and_cleans_up(
         "score_trainer",
         "score_adapter",
     ]
-    if replay:
-        expected.insert(2, "capture_routes")
     if update_size >= 0.05:
         expected += ["publish"]
         if replay:
-            expected += ["capture_routes", "score_trainer"]
+            expected += ["score_adapter", "score_trainer"]
             assert report["zero_routes"] != report["updated_routes"]
             assert report["trainer_prepublication"] == report["trainer_updated"]
             assert report["prepublication_stale_parity"]["mean_abs"] >= 0.05
-        expected += ["score_adapter"]
+        if not replay:
+            expected += ["score_adapter"]
+    if replay:
+        expected = [
+            item
+            for call in expected
+            for item in (
+                ["capture_routes", call] if call.startswith("score_adapter") or call == "score_base" else [call]
+            )
+        ]
     assert calls == expected + ["cleanup"]
 
 
@@ -337,15 +345,19 @@ async def test_route_capture_requires_full_fixed_sequence(length):
         assert request["prompt_token_ids"] == [[1, 2, 3]]
         assert request["sampling_params"]["routed_experts_prompt_start"] == 0
         assert model == "adapter"
-        return {"rollout_expert_indices": [torch.zeros((length, 2, 1), dtype=torch.int64)]}
+        return {
+            "rollout_expert_indices": [torch.zeros((length, 2, 1), dtype=torch.int64)],
+            "prompt_logprobs": [[None, -1.0, -2.0]],
+        }
 
     client = SimpleNamespace(reset_prefix_cache=reset_prefix_cache, generate=generate)
     if length == 3:
-        routes = await megatron_lora.capture_routes(client, [[1, 2, 3]], "adapter")
+        scores, routes = await megatron_lora.score_routed_sampler(client, [[1, 2, 3]], "adapter")
         assert routes[0].shape == (3, 2, 1)
+        assert scores == [-1.0, -2.0]
     else:
         with pytest.raises(ValueError, match="every fixed probe token"):
-            await megatron_lora.capture_routes(client, [[1, 2, 3]], "adapter")
+            await megatron_lora.score_routed_sampler(client, [[1, 2, 3]], "adapter")
 
 
 def test_routed_batch_preserves_unequal_sequence_alignment():
@@ -368,3 +380,18 @@ def test_replay_requires_matching_capture_before_runtime(replay, capture):
                 "generator.inference_engine.enable_return_routed_experts": capture,
             }
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("values", [None, [None], [0.0, -1.0, -2.0], [None, None, -2.0], [None, float("nan"), -2.0]])
+async def test_routed_scores_reject_missing_misaligned_or_nonfinite_tokens(values):
+    async def generate(request, model):
+        assert request["sampling_params"]["prompt_logprobs"] == 0
+        return {
+            "rollout_expert_indices": [np.zeros((3, 2, 1), dtype=np.int32)],
+            "prompt_logprobs": None if values is None else [values],
+        }
+
+    client = SimpleNamespace(reset_prefix_cache=AsyncMock(), generate=generate)
+    with pytest.raises(ValueError):
+        await megatron_lora.score_routed_sampler(client, [[1, 2, 3]], "adapter")

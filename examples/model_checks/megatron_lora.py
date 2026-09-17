@@ -117,7 +117,7 @@ def score_trainer(policy, batch):
     return scores
 
 
-async def capture_routes(client, sequences, model):
+async def score_routed_sampler(client, sequences, model):
     await client.reset_prefix_cache()
     result = await client.generate(
         {
@@ -126,6 +126,7 @@ async def capture_routes(client, sequences, model):
                 "max_tokens": 1,
                 "temperature": 1.0,
                 "routed_experts_prompt_start": 0,
+                "prompt_logprobs": 0,
             },
             "session_ids": None,
             "mm_features": None,
@@ -139,7 +140,17 @@ async def capture_routes(client, sequences, model):
     for tokens, route in zip(sequences, routes, strict=True):
         if route.ndim != 3 or len(route) != len(tokens):
             raise ValueError("Captured routes must cover every fixed probe token")
-    return routes
+    scores = []
+    prompt_scores = result["prompt_logprobs"]
+    if prompt_scores is None or len(prompt_scores) != len(sequences):
+        raise ValueError("Missing prompt scores paired with captured routes")
+    for tokens, values in zip(sequences, prompt_scores, strict=True):
+        if len(values) != len(tokens) or values[0] is not None:
+            raise ValueError("Prompt scores must cover every fixed probe token")
+        if any(value is None or not math.isfinite(value) for value in values[1:]):
+            raise ValueError("Missing or nonfinite paired prompt score")
+        scores.extend(values[1:])
+    return scores, routes
 
 
 async def score_sampler(client, sequences, model):
