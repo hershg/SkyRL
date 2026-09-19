@@ -157,7 +157,7 @@ def test_cli_rejects_invalid_stimulus_before_creating_output(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("wrong_publication", [False, True])
-@pytest.mark.parametrize("updated_repeat_shift", [0.0, 2e-6])
+@pytest.mark.parametrize("updated_repeat_shift", [0.0, 2e-6, None])
 @pytest.mark.parametrize("update_size", [0.2, 0.01])
 async def test_run_checks_the_actual_published_update_and_cleans_up(
     monkeypatch, tmp_path, wrong_publication, update_size, updated_repeat_shift
@@ -213,9 +213,11 @@ async def test_run_checks_the_actual_published_update_and_cleans_up(
         calls.append(f"score_{model}")
         if publications < 2:
             return [-2.0, -3.0]
-        if wrong_publication:
-            return [-2.2, -3.2]
+        if calls.count("score_adapter") == 5 and updated_repeat_shift is None:
+            raise RuntimeError("updated repeat failed")
         shift = updated_repeat_shift if calls.count("score_adapter") == 5 else 0
+        if wrong_publication:
+            return [-2.2 + shift, -3.2]
         return [-1.8 + shift, -2.8]
 
     for name, function in [
@@ -233,14 +235,21 @@ async def test_run_checks_the_actual_published_update_and_cleans_up(
         max_atol=0.5,
         lora_b_multiplier=32,
     )
-    report = {}
+    report = {"passed": False}
     if update_size < 0.05:
         with pytest.raises(AssertionError, match="insufficient test stimulus"):
             await run_lora_logprobs.run(args, report)
         assert publications == 1
-    elif wrong_publication:
-        with pytest.raises(AssertionError):
+    elif updated_repeat_shift is None:
+        with pytest.raises(RuntimeError, match="updated repeat failed") as error:
             await run_lora_logprobs.run(args, report)
+        if wrong_publication:
+            assert isinstance(error.value.__context__, AssertionError)
+    elif wrong_publication:
+        with pytest.raises(AssertionError) as error:
+            await run_lora_logprobs.run(args, report)
+        if updated_repeat_shift:
+            assert isinstance(error.value.__context__, AssertionError)
     elif updated_repeat_shift:
         with pytest.raises(AssertionError, match="updated_repeat_noise exceeds"):
             await run_lora_logprobs.run(args, report)
@@ -261,9 +270,16 @@ async def test_run_checks_the_actual_published_update_and_cleans_up(
         "score_adapter",
     ]
     if update_size >= 0.05:
-        expected += ["publish", "score_adapter"]
-        if not wrong_publication:
-            expected += ["score_adapter"]
+        expected += ["publish", "score_adapter", "score_adapter"]
+        saved = json.loads((tmp_path / "logprobs.json").read_text())
+        assert saved["passed"] is False
+        assert saved["updated"] == ([-2.2, -3.2] if wrong_publication else [-1.8, -2.8])
+        assert saved["trainer_updated"] == [-2.0 + update_size, -3.0 + update_size]
+        assert saved["updated_parity"]["mean_abs"] == pytest.approx(0.4 if wrong_publication else 0)
+        if updated_repeat_shift is None:
+            assert "updated_repeat" not in saved
+        else:
+            assert saved["updated_repeat_noise"]["max_abs"] == pytest.approx(updated_repeat_shift)
     assert calls == expected + ["cleanup"]
 
 

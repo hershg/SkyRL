@@ -143,9 +143,11 @@ async def check_replayed_policy(
     for target, result in targets:
         updated_batch = await score_phase(target, result, "updated", adapter)
         result["trainer_updated"] = score_trainer(policy, updated_batch)
-        check_updated_adapter(result, args.mean_atol, args.max_atol)
-        await score_phase(target, result, "updated_repeat", adapter)
-        check_updated_repeat(result)
+        try:
+            check_updated_adapter(result, args.mean_atol, args.max_atol)
+        finally:
+            await score_phase(target, result, "updated_repeat", adapter)
+            check_updated_repeat(result)
         if result is not report:
             result["passed"] = True
 
@@ -179,9 +181,11 @@ async def check_unpublished_sampler(client, sequences, adapter, report):
 
 async def check_published_update(client, sequences, adapter, report, mean_atol, max_atol):
     report["updated"] = await score_sampler(client, sequences, adapter)
-    check_updated_adapter(report, mean_atol, max_atol)
-    report["updated_repeat"] = await score_sampler(client, sequences, adapter)
-    check_updated_repeat(report)
+    try:
+        check_updated_adapter(report, mean_atol, max_atol)
+    finally:
+        report["updated_repeat"] = await score_sampler(client, sequences, adapter)
+        check_updated_repeat(report)
 
 
 def check_updated_repeat(report):

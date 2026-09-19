@@ -2,6 +2,8 @@
 
 import base64
 import io
+import json
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -193,8 +195,21 @@ def test_capture_and_replay_must_be_enabled_together(selector):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", [None, "missing", "duplicate", "wrong_routes", "updated", "updated_repeat"])
-async def test_all_engines_use_own_routes_and_one_shared_publication_lifecycle(monkeypatch, fault):
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "missing",
+        "duplicate",
+        "wrong_routes",
+        "updated",
+        "updated_repeat",
+        "updated_and_repeat",
+        "updated_rpc",
+        "repeat_rpc",
+    ],
+)
+async def test_all_engines_use_own_routes_and_one_shared_publication_lifecycle(monkeypatch, tmp_path, fault):
     urls = [f"http://engine-{index}" for index in range(3)]
     if fault == "missing":
         urls.pop()
@@ -207,7 +222,14 @@ async def test_all_engines_use_own_routes_and_one_shared_publication_lifecycle(m
         uses_lora_weight_sync=True,
         tokenizer=None,
     )
-    cfg = SimpleNamespace(generator=SimpleNamespace(inference_engine=SimpleNamespace(num_engines=3)))
+    cfg = SimpleNamespace(
+        generator=SimpleNamespace(inference_engine=SimpleNamespace(num_engines=3)),
+        trainer=SimpleNamespace(
+            policy=SimpleNamespace(
+                model=SimpleNamespace(path="model"), megatron_config=SimpleNamespace(moe_enable_routing_replay=True)
+            )
+        ),
+    )
     counts, closed, trainer_calls = {}, [], []
     publications, perturbations = 0, 0
 
@@ -225,9 +247,11 @@ async def test_all_engines_use_own_routes_and_one_shared_publication_lifecycle(m
         counts[index] = phase + 1
         assert len(sequences) == 2 and [len(tokens) for tokens in sequences] == [65, 129]
         value = -2.0 - index + (0.2 if phase >= 4 else 0)
-        if index == 2 and phase == 4 and fault == "updated":
+        if index == 2 and phase >= 4 and fault in {"updated", "updated_and_repeat", "updated_rpc"}:
             value += 0.7
-        if index == 2 and phase == 5 and fault == "updated_repeat":
+        if index == 2 and phase == 5 and fault in {"updated_rpc", "repeat_rpc"}:
+            raise RuntimeError("updated repeat failed")
+        if index == 2 and phase == 5 and fault in {"updated_repeat", "updated_and_repeat"}:
             value += 2e-6
         route_index = 0 if index == 2 and fault == "wrong_routes" else index
         return [value] * 192, [np.full((n, 78, 8), route_index * 10 + phase, dtype=np.int32) for n in [65, 129]]
@@ -248,27 +272,45 @@ async def test_all_engines_use_own_routes_and_one_shared_publication_lifecycle(m
         perturbations += 1
         return [{"multiplier": multiplier}]
 
+    @asynccontextmanager
+    async def open_runtime(*args):
+        try:
+            yield None, client
+        finally:
+            assert json.loads((tmp_path / "logprobs.json").read_text()) == report
+
+    monkeypatch.setattr(run_lora_logprobs, "open_runtime", open_runtime)
+    monkeypatch.setattr(run_lora_logprobs, "load_config", lambda *args: cfg)
+    monkeypatch.setattr(run_lora_logprobs, "get_tokenizer", lambda *args: SimpleNamespace(pad_token_id=0))
+    monkeypatch.setattr(run_lora_logprobs, "build_sequences", lambda *args: [list(range(65)), list(range(129))])
     monkeypatch.setattr(run_lora_logprobs, "RemoteInferenceClient", make_client)
     monkeypatch.setattr(run_lora_logprobs, "score_with_routes", score)
     monkeypatch.setattr(run_lora_logprobs, "score_trainer", trainer)
-    monkeypatch.setattr(run_lora_logprobs, "build_batch", lambda sequences, pad, routes: int(routes[0][0, 0, 0]))
+    monkeypatch.setattr(
+        run_lora_logprobs,
+        "build_batch",
+        lambda sequences, pad, routes=None: "unreplayed" if routes is None else int(routes[0][0, 0, 0]),
+    )
     monkeypatch.setattr(run_lora_logprobs, "publish", publish)
     monkeypatch.setattr(run_lora_logprobs, "perturb_trainer", perturb)
     monkeypatch.setattr(run_lora_logprobs, "resolve_policy_model_name", lambda cfg: "adapter")
     report = {"passed": False}
-    args = SimpleNamespace(mean_atol=0.05, max_atol=0.5, lora_b_multiplier=10)
-    task = run_lora_logprobs.check_all_replayed_engines(
-        None, client, cfg, "unreplayed", [list(range(65)), list(range(129))], 0, report, args
+    args = SimpleNamespace(
+        mean_atol=0.05, max_atol=0.5, lora_b_multiplier=10, backend_config="config.json", output_dir=tmp_path
     )
+    task = run_lora_logprobs.run(args, report)
     if fault in {"missing", "duplicate"}:
         with pytest.raises(ValueError, match="distinct server URL"):
             await task
         assert publications == perturbations == 0
         return
     if fault:
-        with pytest.raises(AssertionError):
+        expected_error = RuntimeError if fault in {"updated_rpc", "repeat_rpc"} else AssertionError
+        with pytest.raises(expected_error) as error:
             await task
         assert not all(engine["passed"] for engine in report["engines"])
+        if fault in {"updated_rpc", "updated_and_repeat"}:
+            assert isinstance(error.value.__context__, AssertionError)
     else:
         await task
         assert publications == 2 and perturbations == 1
@@ -279,4 +321,19 @@ async def test_all_engines_use_own_routes_and_one_shared_publication_lifecycle(m
             assert engine["updated_repeat_noise"]["max_abs"] == 0
             assert index * 10 + 4 in trainer_calls
             assert engine["updated_routes"][0][0][0][0] == index * 10 + 4
+    if fault in {"updated", "updated_repeat", "updated_and_repeat", "updated_rpc", "repeat_rpc"}:
+        saved = json.loads((tmp_path / "logprobs.json").read_text())
+        assert saved["passed"] is False
+        engine = saved["engines"][2]
+        assert engine["passed"] is False
+        assert engine["trainer_updated"] == [-3.8] * 192
+        assert engine["updated_routes"][0][0][0][0] == 24
+        bad_parity = fault in {"updated", "updated_and_repeat", "updated_rpc"}
+        assert engine["updated_parity"]["max_abs"] == pytest.approx(0.7 if bad_parity else 0)
+        assert counts[2] == 6
+        if fault in {"updated_rpc", "repeat_rpc"}:
+            assert "updated_repeat" not in engine
+        else:
+            assert engine["updated_repeat_routes"][0][0][0][0] == 25
+            assert engine["updated_repeat_noise"]["max_abs"] == pytest.approx(0 if fault == "updated" else 2e-6)
     assert sorted(closed) == sorted(urls)
