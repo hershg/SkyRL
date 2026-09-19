@@ -121,15 +121,19 @@ def test_replay_batch_keeps_full_prompt_routes_and_masks_only_padding():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("repeat_shift", [0.0, 2e-6])
-async def test_replayed_phases_preserve_prepublication_evidence_and_use_fresh_routes(monkeypatch, repeat_shift):
+@pytest.mark.parametrize("repeat_shift,updated_repeat_shift", [(0.0, 0.0), (2e-6, 0.0), (0.0, 2e-6)])
+async def test_replayed_phases_preserve_prepublication_evidence_and_use_fresh_routes(
+    monkeypatch, repeat_shift, updated_repeat_shift
+):
     calls = []
-    route_ids = iter(range(5))
+    route_ids = iter(range(6))
 
     async def paired(client, sequences, model):
         phase = next(route_ids)
         calls.append(("score", phase, model))
         scores = [-2.0 + (repeat_shift if phase == 2 else 0.0)] if phase < 4 else [-1.8]
+        if phase == 5:
+            scores[0] += updated_repeat_shift
         return scores, [np.full((2, 78, 8), phase, dtype=np.int32)]
 
     def build(sequences, pad, routes):
@@ -160,14 +164,20 @@ async def test_replayed_phases_preserve_prepublication_evidence_and_use_fresh_ro
             await coroutine
         assert calls.count(("publish",)) == 1
         return
+    if updated_repeat_shift:
+        with pytest.raises(AssertionError, match="updated_repeat_noise exceeds"):
+            await coroutine
+        assert report["updated_repeat_routes"][0][0][0][0] == 5
+        return
     await coroutine
+    assert report["updated_repeat_noise"]["max_abs"] == 0
     assert trainer_calls == ["unreplayed", 1, 2, 1, 4]
     assert report["trainer_updated_before_publication"] == [-1.7]
     assert report["trainer_updated"] == [-1.8]
     assert report["stale_parity_before_publication"]["mean_abs"] == pytest.approx(0.3)
     assert report["zero_parity_unreplayed"]["mean_abs"] == pytest.approx(0.3)
     assert report["updated_parity"]["max_abs"] == 0
-    assert [call[0] for call in calls] == ["score", "publish", "score", "score", "score", "publish", "score"]
+    assert [call[0] for call in calls] == ["score", "publish", "score", "score", "score", "publish", "score", "score"]
 
 
 @pytest.mark.parametrize(
@@ -180,3 +190,93 @@ async def test_replayed_phases_preserve_prepublication_evidence_and_use_fresh_ro
 def test_capture_and_replay_must_be_enabled_together(selector):
     with pytest.raises(ValueError, match="enabled together"):
         run_lora_logprobs.validate_config({selector: True})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [None, "missing", "duplicate", "wrong_routes", "updated", "updated_repeat"])
+async def test_all_engines_use_own_routes_and_one_shared_publication_lifecycle(monkeypatch, fault):
+    urls = [f"http://engine-{index}" for index in range(3)]
+    if fault == "missing":
+        urls.pop()
+    elif fault == "duplicate":
+        urls[-1] = urls[0]
+    client = SimpleNamespace(
+        server_urls=urls,
+        model_name="base",
+        enable_return_routed_experts=True,
+        uses_lora_weight_sync=True,
+        tokenizer=None,
+    )
+    cfg = SimpleNamespace(generator=SimpleNamespace(inference_engine=SimpleNamespace(num_engines=3)))
+    counts, closed, trainer_calls = {}, [], []
+    publications, perturbations = 0, 0
+
+    def make_client(**kwargs):
+        assert kwargs["server_urls"] == [kwargs["proxy_url"]]
+
+        async def close():
+            closed.append(kwargs["proxy_url"])
+
+        return SimpleNamespace(**kwargs, aclose=close)
+
+    async def score(target, sequences, model):
+        index = int(target.proxy_url[-1])
+        phase = counts.get(index, 0)
+        counts[index] = phase + 1
+        assert len(sequences) == 2 and [len(tokens) for tokens in sequences] == [65, 129]
+        value = -2.0 - index + (0.2 if phase >= 4 else 0)
+        if index == 2 and phase == 4 and fault == "updated":
+            value += 0.7
+        if index == 2 and phase == 5 and fault == "updated_repeat":
+            value += 2e-6
+        route_index = 0 if index == 2 and fault == "wrong_routes" else index
+        return [value] * 192, [np.full((n, 78, 8), route_index * 10 + phase, dtype=np.int32) for n in [65, 129]]
+
+    def trainer(policy, batch):
+        trainer_calls.append(batch)
+        index = 0 if batch == "unreplayed" else batch // 10
+        return [-2.0 - index + (0.2 if perturbations else 0)] * 192
+
+    async def publish(policy, target, config):
+        nonlocal publications
+        assert target is client
+        publications += 1
+
+    def perturb(policy, multiplier):
+        nonlocal perturbations
+        assert multiplier == 10
+        perturbations += 1
+        return [{"multiplier": multiplier}]
+
+    monkeypatch.setattr(run_lora_logprobs, "RemoteInferenceClient", make_client)
+    monkeypatch.setattr(run_lora_logprobs, "score_with_routes", score)
+    monkeypatch.setattr(run_lora_logprobs, "score_trainer", trainer)
+    monkeypatch.setattr(run_lora_logprobs, "build_batch", lambda sequences, pad, routes: int(routes[0][0, 0, 0]))
+    monkeypatch.setattr(run_lora_logprobs, "publish", publish)
+    monkeypatch.setattr(run_lora_logprobs, "perturb_trainer", perturb)
+    monkeypatch.setattr(run_lora_logprobs, "resolve_policy_model_name", lambda cfg: "adapter")
+    report = {"passed": False}
+    args = SimpleNamespace(mean_atol=0.05, max_atol=0.5, lora_b_multiplier=10)
+    task = run_lora_logprobs.check_all_replayed_engines(
+        None, client, cfg, "unreplayed", [list(range(65)), list(range(129))], 0, report, args
+    )
+    if fault in {"missing", "duplicate"}:
+        with pytest.raises(ValueError, match="distinct server URL"):
+            await task
+        assert publications == perturbations == 0
+        return
+    if fault:
+        with pytest.raises(AssertionError):
+            await task
+        assert not all(engine["passed"] for engine in report["engines"])
+    else:
+        await task
+        assert publications == 2 and perturbations == 1
+        assert counts == {0: 6, 1: 6, 2: 6}
+        for index, engine in enumerate(report["engines"]):
+            assert engine["passed"] and engine["server_url"] == urls[index]
+            assert engine["updated_parity"]["tokens"] == 192
+            assert engine["updated_repeat_noise"]["max_abs"] == 0
+            assert index * 10 + 4 in trainer_calls
+            assert engine["updated_routes"][0][0][0][0] == index * 10 + 4
+    assert sorted(closed) == sorted(urls)

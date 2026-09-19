@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import math
+from contextlib import AsyncExitStack
 from pathlib import Path
 from time import perf_counter
 
@@ -16,6 +17,7 @@ from examples.model_checks.megatron_lora import (
     score_trainer,
 )
 from examples.model_checks.paired_completion import score_with_routes
+from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import RemoteInferenceClient
 from skyrl.backends.skyrl_train.inference_servers.utils import resolve_policy_model_name
 from skyrl.tinker.logprob_checks import build_probe_sequences as build_sequences
 from skyrl.tinker.logprob_checks import (
@@ -49,7 +51,7 @@ async def run(args, report):
         try:
             replay = cfg.trainer.policy.megatron_config.moe_enable_routing_replay
             if replay:
-                await check_replayed_policy(policy, client, cfg, batch, sequences, pad_token_id, report, args)
+                await check_all_replayed_engines(policy, client, cfg, batch, sequences, pad_token_id, report, args)
                 return
             await check_zero_initialized_policy(
                 policy,
@@ -71,39 +73,81 @@ async def run(args, report):
             write_report(args.output_dir, report)
 
 
-async def check_replayed_policy(policy, client, cfg, unreplayed_batch, sequences, pad_token_id, report, args):
-    async def score_phase(phase, model):
-        scores, routes = await score_with_routes(client, sequences, model)
-        report[phase] = scores
-        report[f"{phase}_routes"] = [route.tolist() for route in routes]
+async def check_all_replayed_engines(policy, client, cfg, batch, sequences, pad_token_id, report, args):
+    count = cfg.generator.inference_engine.num_engines
+    if count == 1:
+        await check_replayed_policy(policy, client, cfg, batch, sequences, pad_token_id, report, args)
+        return
+    urls = client.server_urls
+    if len(urls) != count or len(set(urls)) != count:
+        raise ValueError("Expected one distinct server URL per inference engine")
+    report["engines"] = [{"server_url": url, "passed": False} for url in urls]
+    async with AsyncExitStack() as stack:
+        targets = []
+        for url, engine_report in zip(urls, report["engines"], strict=True):
+            direct = RemoteInferenceClient(
+                proxy_url=url,
+                server_urls=[url],
+                data_parallel_size=1,
+                model_name=client.model_name,
+                enable_return_routed_experts=client.enable_return_routed_experts,
+                uses_lora_weight_sync=client.uses_lora_weight_sync,
+                tokenizer=client.tokenizer,
+            )
+            stack.push_async_callback(direct.aclose)
+            targets.append((direct, engine_report))
+        await check_replayed_policy(policy, client, cfg, batch, sequences, pad_token_id, report, args, targets)
+
+
+async def check_replayed_policy(
+    policy, client, cfg, unreplayed_batch, sequences, pad_token_id, report, args, targets=None
+):
+    targets = [(client, report)] if targets is None else targets
+
+    async def score_phase(target, result, phase, model):
+        scores, routes = await score_with_routes(target, sequences, model)
+        result[phase] = scores
+        result[f"{phase}_routes"] = [route.tolist() for route in routes]
         return build_batch(sequences, pad_token_id, routes)
 
-    await score_phase("base", client.model_name)
+    for target, result in targets:
+        await score_phase(target, result, "base", client.model_name)
     await publish(policy, client, cfg)
     adapter = resolve_policy_model_name(cfg)
-    zero_batch = await score_phase("zero", adapter)
-    report["trainer_zero_unreplayed"] = score_trainer(policy, unreplayed_batch)
-    report["zero_parity_unreplayed"] = compare_logprobs(report["trainer_zero_unreplayed"], report["zero"])
-    report["trainer_zero"] = score_trainer(policy, zero_batch)
-    repeat_batch = await score_phase("repeat", adapter)
-    report["trainer_repeat"] = score_trainer(policy, repeat_batch)
-    report["repeat_noise"] = compare_logprobs(report["zero"], report["repeat"])
-    report["trainer_repeat_noise"] = compare_logprobs(report["trainer_zero"], report["trainer_repeat"])
-    for field in ("repeat_noise", "trainer_repeat_noise"):
-        if report[field]["max_abs"] > 1e-6:
-            raise AssertionError(f"{field} exceeds 1e-6: {report[field]}")
-    check_initial_adapter(report, args.mean_atol, args.max_atol)
+    zero_batches = []
+    for target, result in targets:
+        zero_batch = await score_phase(target, result, "zero", adapter)
+        zero_batches.append(zero_batch)
+        result["trainer_zero_unreplayed"] = score_trainer(policy, unreplayed_batch)
+        result["zero_parity_unreplayed"] = compare_logprobs(result["trainer_zero_unreplayed"], result["zero"])
+        result["trainer_zero"] = score_trainer(policy, zero_batch)
+        repeat_batch = await score_phase(target, result, "repeat", adapter)
+        result["trainer_repeat"] = score_trainer(policy, repeat_batch)
+        result["repeat_noise"] = compare_logprobs(result["zero"], result["repeat"])
+        result["trainer_repeat_noise"] = compare_logprobs(result["trainer_zero"], result["trainer_repeat"])
+        for field in ("repeat_noise", "trainer_repeat_noise"):
+            if result[field]["max_abs"] > 1e-6:
+                raise AssertionError(f"{field} exceeds 1e-6: {result[field]}")
+        check_initial_adapter(result, args.mean_atol, args.max_atol)
 
-    apply_trainer_update(policy, zero_batch, report, args.lora_b_multiplier)
-    report["trainer_updated_before_publication"] = report["trainer_updated"]
-    await score_phase("stale", adapter)
-    check_withheld_publication(report)
-    check_update_stimulus(report, args.mean_atol)
-    report["stale_parity_before_publication"] = report["stale_parity"]
+    perturbation = perturb_trainer(policy, args.lora_b_multiplier)
+    for (target, result), zero_batch in zip(targets, zero_batches, strict=True):
+        result["perturbation"] = perturbation
+        result["trainer_updated"] = score_trainer(policy, zero_batch)
+        result["trainer_updated_before_publication"] = result["trainer_updated"]
+        await score_phase(target, result, "stale", adapter)
+        check_withheld_publication(result)
+        check_update_stimulus(result, args.mean_atol)
+        result["stale_parity_before_publication"] = result["stale_parity"]
     await publish(policy, client, cfg)
-    updated_batch = await score_phase("updated", adapter)
-    report["trainer_updated"] = score_trainer(policy, updated_batch)
-    check_updated_adapter(report, args.mean_atol, args.max_atol)
+    for target, result in targets:
+        updated_batch = await score_phase(target, result, "updated", adapter)
+        result["trainer_updated"] = score_trainer(policy, updated_batch)
+        check_updated_adapter(result, args.mean_atol, args.max_atol)
+        await score_phase(target, result, "updated_repeat", adapter)
+        check_updated_repeat(result)
+        if result is not report:
+            result["passed"] = True
 
 
 def write_report(output_dir, report):
@@ -136,6 +180,14 @@ async def check_unpublished_sampler(client, sequences, adapter, report):
 async def check_published_update(client, sequences, adapter, report, mean_atol, max_atol):
     report["updated"] = await score_sampler(client, sequences, adapter)
     check_updated_adapter(report, mean_atol, max_atol)
+    report["updated_repeat"] = await score_sampler(client, sequences, adapter)
+    check_updated_repeat(report)
+
+
+def check_updated_repeat(report):
+    report["updated_repeat_noise"] = compare_logprobs(report["updated"], report["updated_repeat"])
+    if report["updated_repeat_noise"]["max_abs"] > 1e-6:
+        raise AssertionError(f"updated_repeat_noise exceeds 1e-6: {report['updated_repeat_noise']}")
 
 
 def validate_config(overrides):
@@ -143,6 +195,9 @@ def validate_config(overrides):
     capture = overrides.get("generator.inference_engine.enable_return_routed_experts", False)
     if replay != capture:
         raise ValueError("Route replay and inference route capture must be enabled together")
+    if overrides.get("generator.inference_engine.num_engines", 1) > 1:
+        if not replay or overrides.get("generator.inference_engine.data_parallel_size", 1) != 1:
+            raise ValueError("Multi-engine checks require route replay and inference DP=1")
     if overrides["strategy"] != "megatron":
         raise ValueError("This diagnostic requires Megatron")
     if overrides["trainer.placement.colocate_all"]:
