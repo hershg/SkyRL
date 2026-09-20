@@ -130,7 +130,7 @@ class ExternalInferenceClient:
             "temperature": request.sampling_params.temperature,
             "top_p": request.sampling_params.top_p,
             "top_k": request.sampling_params.top_k,
-            "logprobs": True,
+            "logprobs": 1,
             "stream": False,
             "return_token_ids": True,
         }
