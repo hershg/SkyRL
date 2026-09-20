@@ -51,6 +51,7 @@ class ExternalInferenceClient:
         self.lora_base_dir = engine_config.external_inference_lora_base
         self.db_engine = db_engine
         self.external_future_store = external_future_store
+        self.timeout = httpx.Timeout(300.0, connect=10.0, read=engine_config.forwarding_inference_timeout_sec)
 
     async def call_and_store_result(
         self,
@@ -66,7 +67,7 @@ class ExternalInferenceClient:
             async with httpx.AsyncClient(
                 base_url=self.base_url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=httpx.Timeout(300.0, connect=10.0),  # 5 minutes for inference, 10s for connect
+                timeout=self.timeout,
             ) as http_client:
                 result = await self._forward_to_engine(
                     sample_req, model_id, checkpoint_id, http_client, base_model=base_model
