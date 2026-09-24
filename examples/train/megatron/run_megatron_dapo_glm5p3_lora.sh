@@ -62,6 +62,7 @@ exec "$PYTHON" -m examples.train.algorithms.dapo.main_dapo \
   generator.inference_engine.enforce_eager=false \
   generator.inference_engine.gpu_memory_utilization=0.8 \
   generator.inference_engine.max_num_seqs=32 \
+  'generator.inference_engine.router_init_kwargs={"request_timeout_secs":21600}' \
   generator.inference_engine.max_num_batched_tokens=32768 \
   generator.inference_engine.enable_prefix_caching=true \
   generator.inference_engine.enable_chunked_prefill=true \
