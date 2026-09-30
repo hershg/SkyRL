@@ -1,6 +1,9 @@
 import base64
+from unittest.mock import AsyncMock
 
+import httpx
 import pytest
+import tinker.types as sdk_types
 from pydantic import TypeAdapter, ValidationError
 
 from skyrl.tinker import api, types
@@ -178,3 +181,41 @@ class TestImageChunkBase64RoundTrip:
         json_dict = types_input.model_dump(mode="json")
         recovered = types.ModelInput.model_validate(json_dict)
         assert recovered.chunks[0].data == _RAW_PNG
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("num_samples", [1, 3])
+async def test_asample_http_returns_sequence_ids_for_sdk(monkeypatch, num_samples):
+    session = AsyncMock()
+
+    async def get_session():
+        yield session
+
+    monkeypatch.setitem(api.app.dependency_overrides, api.get_session, get_session)
+    monkeypatch.setattr(api.app.state, "external_future_store", None, raising=False)
+    monkeypatch.setattr(api, "create_future", AsyncMock(return_value=123))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app), base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/asample",
+            json={
+                "base_model": "test-model",
+                "prompt": {"chunks": [{"type": "encoded_text", "tokens": [1, 2]}]},
+                "sampling_params": {"max_tokens": 1},
+                "num_samples": num_samples,
+            },
+        )
+    assert response.status_code == 200
+    body = response.json()
+    ids = body["sample_sequence_ids"]
+    assert len(ids) == num_samples
+    assert len(set(ids)) == num_samples
+    promise = sdk_types.UntypedAPIFuture.model_validate(body)
+    assert promise.request_id == "123"
+    # SDK 0.25 ignores this field; 0.27 requires it when resolving samples.
+    if "sample_sequence_ids" in sdk_types.UntypedAPIFuture.model_fields:
+        assert promise.sample_sequence_ids == ids
+
+
+def test_non_sampling_future_omits_sample_sequence_ids():
+    response = api.FutureResponse(future_id="123", request_id="123")
+    assert response.model_dump() == {"future_id": "123", "request_id": "123", "status": "pending"}

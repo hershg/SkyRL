@@ -865,7 +865,10 @@ class FutureResponse(BaseModel):
     future_id: str
     status: str = "pending"
     request_id: str
-    sample_sequence_ids: list[str] | None = None
+
+
+class SampleFutureResponse(FutureResponse):
+    sample_sequence_ids: list[str]
 
 
 class TelemetryEvent(BaseModel):
@@ -1675,7 +1678,7 @@ async def validate_sampler_checkpoint_once(
         validated.add(key)
 
 
-@app.post("/api/v1/asample", response_model=FutureResponse)
+@app.post("/api/v1/asample", response_model=SampleFutureResponse)
 async def asample(request: SampleRequest, req: Request, session: AsyncSession = Depends(get_session)):
     """Generates samples from the model (async version)."""
     if request.sampling_session_id is not None and ":" in request.sampling_session_id:
@@ -1736,7 +1739,7 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         )
         await session.commit()
 
-    return FutureResponse(
+    return SampleFutureResponse(
         future_id=str(request_id),
         status="pending",
         request_id=str(request_id),
