@@ -180,6 +180,19 @@ def _mean_abs_diff(reference: torch.Tensor, actual: torch.Tensor, mask: torch.Te
     return diff.mean().item()
 
 
+def _save_comparison(path, training_input, inference_logprobs, trainer_logprobs):
+    """Keep scores and replay inputs available when the parity assertion fails."""
+    tensors = {key: value.detach().cpu() for key, value in training_input.items() if isinstance(value, torch.Tensor)}
+    routes = training_input.get("rollout_expert_indices")
+    if routes is not None:
+        tensors["route_values"] = routes.values.cpu()
+        tensors["route_offsets"] = routes.cu_seqlens.cpu()
+    tensors["inference_logprobs"] = inference_logprobs.detach().cpu()
+    tensors["trainer_logprobs"] = trainer_logprobs.detach().cpu()
+    torch.save(tensors, path)
+    print(f"COMPARISON_ARTIFACT {path}", flush=True)
+
+
 async def _sync_weights(policy, client, cfg, label: str):
     """Offload the optimizer, publish the policy to the engines, then offload the model."""
     if cfg.trainer.placement.colocate_all:
@@ -366,6 +379,7 @@ async def test_lora_logprobs_matching_roundtrip(
 
                 mask = response_mask.bool()
                 logprobs_megatron = _trainer_logprobs(policy, training_input)
+                _save_comparison(tmp_path / "zero.pt", training_input, logprobs_t, logprobs_megatron)
                 zero_diff = _mean_abs_diff(logprobs_t, logprobs_megatron, mask, "zero adapter: vLLM vs Megatron")
                 assert zero_diff < threshold, f"Logprob diff should be less than {threshold}, but is {zero_diff:.6f}"
 
@@ -377,6 +391,7 @@ async def test_lora_logprobs_matching_roundtrip(
                 _mean_abs_diff(
                     logprobs_megatron, logprobs_megatron_perturbed, mask, "perturbation: Megatron before vs after"
                 )
+                _save_comparison(tmp_path / "stale.pt", training_input, logprobs_t, logprobs_megatron_perturbed)
                 stale_diff = _mean_abs_diff(
                     logprobs_t, logprobs_megatron_perturbed, mask, "stale sampler: vLLM vs perturbed Megatron"
                 )
@@ -395,6 +410,7 @@ async def test_lora_logprobs_matching_roundtrip(
                     policy.backload_to_gpu(backload_optimizer=False, backload_model=True)
 
                 logprobs_megatron_2 = _trainer_logprobs(policy, training_input_2)
+                _save_comparison(tmp_path / "updated.pt", training_input_2, logprobs_t_2, logprobs_megatron_2)
                 updated_diff = _mean_abs_diff(
                     logprobs_t_2, logprobs_megatron_2, response_mask_2.bool(), "updated adapter: vLLM vs Megatron"
                 )
